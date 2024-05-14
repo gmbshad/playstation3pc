@@ -1,0 +1,11 @@
+\\REDDMACBOOKPRO\redd\Downloads\playstation3pc\3rdparty\libusb\libusb\libusb\core.c;\\REDDMACBOOKPRO\redd\Downloads\playstation3pc\tmp\libusb-1.0 (static)-Release-x64\core.obj
+\\REDDMACBOOKPRO\redd\Downloads\playstation3pc\3rdparty\libusb\libusb\libusb\descriptor.c;\\REDDMACBOOKPRO\redd\Downloads\playstation3pc\tmp\libusb-1.0 (static)-Release-x64\descriptor.obj
+\\REDDMACBOOKPRO\redd\Downloads\playstation3pc\3rdparty\libusb\libusb\libusb\hotplug.c;\\REDDMACBOOKPRO\redd\Downloads\playstation3pc\tmp\libusb-1.0 (static)-Release-x64\hotplug.obj
+\\REDDMACBOOKPRO\redd\Downloads\playstation3pc\3rdparty\libusb\libusb\libusb\io.c;\\REDDMACBOOKPRO\redd\Downloads\playstation3pc\tmp\libusb-1.0 (static)-Release-x64\io.obj
+\\REDDMACBOOKPRO\redd\Downloads\playstation3pc\3rdparty\libusb\libusb\libusb\os\events_windows.c;\\REDDMACBOOKPRO\redd\Downloads\playstation3pc\tmp\libusb-1.0 (static)-Release-x64\events_windows.obj
+\\REDDMACBOOKPRO\redd\Downloads\playstation3pc\3rdparty\libusb\libusb\libusb\strerror.c;\\REDDMACBOOKPRO\redd\Downloads\playstation3pc\tmp\libusb-1.0 (static)-Release-x64\strerror.obj
+\\REDDMACBOOKPRO\redd\Downloads\playstation3pc\3rdparty\libusb\libusb\libusb\sync.c;\\REDDMACBOOKPRO\redd\Downloads\playstation3pc\tmp\libusb-1.0 (static)-Release-x64\sync.obj
+\\REDDMACBOOKPRO\redd\Downloads\playstation3pc\3rdparty\libusb\libusb\libusb\os\threads_windows.c;\\REDDMACBOOKPRO\redd\Downloads\playstation3pc\tmp\libusb-1.0 (static)-Release-x64\threads_windows.obj
+\\REDDMACBOOKPRO\redd\Downloads\playstation3pc\3rdparty\libusb\libusb\libusb\os\windows_common.c;\\REDDMACBOOKPRO\redd\Downloads\playstation3pc\tmp\libusb-1.0 (static)-Release-x64\windows_common.obj
+\\REDDMACBOOKPRO\redd\Downloads\playstation3pc\3rdparty\libusb\libusb\libusb\os\windows_usbdk.c;\\REDDMACBOOKPRO\redd\Downloads\playstation3pc\tmp\libusb-1.0 (static)-Release-x64\windows_usbdk.obj
+\\REDDMACBOOKPRO\redd\Downloads\playstation3pc\3rdparty\libusb\libusb\libusb\os\windows_winusb.c;\\REDDMACBOOKPRO\redd\Downloads\playstation3pc\tmp\libusb-1.0 (static)-Release-x64\windows_winusb.obj

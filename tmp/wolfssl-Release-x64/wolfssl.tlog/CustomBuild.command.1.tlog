@@ -1,0 +1,2 @@
+^\\REDDMACBOOKPRO\REDD\DOWNLOADS\PLAYSTATION3PC\3RDPARTY\WOLFSSL\WOLFSSL\WOLFCRYPT\SRC\AES_ASM.ASM
+ml64.exe /c /Zi /Fo"\\REDDMACBOOKPRO\redd\Downloads\playstation3pc\lib\Release-x64\aes_asm.obj" wolfssl\wolfcrypt\src\aes_asm.asm
