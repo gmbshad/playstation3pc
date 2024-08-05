@@ -743,7 +743,7 @@ VKGSRender::VKGSRender(utils::serial* ar) noexcept : GSRender(ar)
 
 	// NVIDIA has broken attribute interpolation
 	backend_config.supports_normalized_barycentrics = (
-		vk::get_driver_vendor() != vk::driver_vendor::NVIDIA ||
+		!vk::is_NVIDIA(vk::get_driver_vendor()) ||
 		!m_device->get_barycoords_support() ||
 		g_cfg.video.shader_precision == gpu_preset_level::low);
 
@@ -758,7 +758,7 @@ VKGSRender::VKGSRender(utils::serial* ar) noexcept : GSRender(ar)
 
 	// NOTE: On NVIDIA cards going back decades (including the PS3) there is a slight normalization inaccuracy in compressed formats.
 	// Confirmed in BLES01916 (The Evil Within) which uses RGB565 for some virtual texturing data.
-	backend_config.supports_hw_renormalization = (vk::get_driver_vendor() == vk::driver_vendor::NVIDIA);
+	backend_config.supports_hw_renormalization = vk::is_NVIDIA(vk::get_driver_vendor());
 
 	// Conditional rendering support
 	// Do not use on MVK due to a speedhack we rely on (streaming results without stopping the current renderpass)
@@ -799,6 +799,10 @@ VKGSRender::VKGSRender(utils::serial* ar) noexcept : GSRender(ar)
 			rsx_log.notice("Forcing safe async compute for NVIDIA device to avoid crashing.");
 			g_cfg.video.vk.asynchronous_scheduler.set(vk_gpu_scheduler_mode::safe);
 		}
+		break;
+	case vk::driver_vendor::NVK:
+		// TODO: Verify if this driver crashes or not
+		rsx_log.warning("NVK behavior with passthrough DMA is unknown. Proceed with caution.");
 		break;
 #if !defined(_WIN32)
 		// Anything running on AMDGPU kernel driver will not work due to the check for fd-backed memory allocations
@@ -1482,6 +1486,7 @@ void VKGSRender::on_init_thread()
 void VKGSRender::on_exit()
 {
 	GSRender::on_exit();
+	vk::destroy_pipe_compiler(); // Ensure no pending shaders being compiled
 	zcull_ctrl.release();
 }
 
@@ -2399,6 +2404,20 @@ void VKGSRender::patch_transform_constants(rsx::context* ctx, u32 index, u32 cou
 		data_source = iobuf.data();
 	}
 
+	// Preserving an active renderpass across a transfer operation is illegal vulkan. However, splitting up the CB into thousands of renderpasses incurs an overhead.
+	// We cheat here for specific cases where we already know the driver can let us get away with this.
+	static const std::set<vk::driver_vendor> s_allowed_vendors =
+	{
+		vk::driver_vendor::AMD,
+		vk::driver_vendor::RADV,
+		vk::driver_vendor::LAVAPIPE,
+		vk::driver_vendor::NVIDIA,
+		vk::driver_vendor::NVK
+	};
+
+	const auto driver_vendor = vk::get_driver_vendor();
+	const bool preserve_renderpass = !g_cfg.video.strict_rendering_mode && s_allowed_vendors.contains(driver_vendor);
+
 	vk::insert_buffer_memory_barrier(
 		*m_current_command_buffer,
 		m_vertex_constants_buffer_info.buffer,
@@ -2406,7 +2425,7 @@ void VKGSRender::patch_transform_constants(rsx::context* ctx, u32 index, u32 cou
 		data_range.second,
 		VK_PIPELINE_STAGE_VERTEX_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
 		VK_ACCESS_UNIFORM_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
-		true);
+		preserve_renderpass);
 
 	// FIXME: This is illegal during a renderpass
 	vkCmdUpdateBuffer(
@@ -2423,7 +2442,7 @@ void VKGSRender::patch_transform_constants(rsx::context* ctx, u32 index, u32 cou
 		data_range.second,
 		VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_VERTEX_SHADER_BIT,
 		VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_UNIFORM_READ_BIT,
-		true);
+		preserve_renderpass);
 }
 
 void VKGSRender::init_buffers(rsx::framebuffer_creation_context context, bool)

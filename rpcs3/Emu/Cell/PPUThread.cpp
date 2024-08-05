@@ -2246,6 +2246,19 @@ void ppu_thread::cpu_on_stop()
 		dump_all(ret);
 		ppu_log.notice("thread context: %s", ret);
 	}
+
+	if (is_stopped())
+	{
+		if (last_succ == 0 && last_fail == 0 && exec_bytes == 0)
+		{
+			perf_log.notice("PPU thread perf stats are not available.");
+		}
+		else
+		{
+			perf_log.notice("Perf stats for STCX reload: success %u, failure %u", last_succ, last_fail);
+			perf_log.notice("Perf stats for instructions: total %u", exec_bytes / 4);
+		}
+	}
 }
 
 void ppu_thread::exec_task()
@@ -2287,8 +2300,6 @@ void ppu_thread::exec_task()
 
 ppu_thread::~ppu_thread()
 {
-	perf_log.notice("Perf stats for STCX reload: success %u, failure %u", last_succ, last_fail);
-	perf_log.notice("Perf stats for instructions: total %u", exec_bytes / 4);
 }
 
 ppu_thread::ppu_thread(const ppu_thread_params& param, std::string_view name, u32 _prio, int detached)
@@ -2749,7 +2760,7 @@ void ppu_thread::fast_call(u32 addr, u64 rtoc, bool is_thread_entry)
 
 		const auto cia = _this->cia;
 
-		if (_this->current_function && vm::read32(cia) != ppu_instructions::SC(0))
+		if (_this->current_function && g_fxo->get<ppu_function_manager>().is_func(cia))
 		{
 			return fmt::format("PPU[0x%x] Thread (%s) [HLE:0x%08x, LR:0x%08x]", _this->id, *name_cache.get(), cia, _this->lr);
 		}
@@ -3245,6 +3256,8 @@ const auto ppu_stcx_accurate_tx = build_function_asm<u64(*)(u32 raddr, u64 rtime
 #endif
 });
 
+extern atomic_t<u8>& get_resrv_waiters_count(u32 raddr);
+
 template <typename T>
 static bool ppu_store_reservation(ppu_thread& ppu, u32 addr, u64 reg_value)
 {
@@ -3489,19 +3502,44 @@ static bool ppu_store_reservation(ppu_thread& ppu, u32 addr, u64 reg_value)
 
 			if (notify)
 			{
-				vm::reservation_notifier(notify).notify_all();
-				ppu.res_notify = 0;
-			}
+				bool notified = false;
 
-			if (!notify)
+				if (ppu.res_notify_time == (vm::reservation_acquire(notify) & -128))
+				{
+					ppu.state += cpu_flag::wait;
+					vm::reservation_notifier(notify).notify_all();
+					notified = true;
+				}
+
+				if (get_resrv_waiters_count(addr))
+				{
+					if (!notified)
+					{
+						ppu.res_notify = addr;
+						ppu.res_notify_time = rtime + 128;
+					}
+					else if ((addr ^ notify) & -128)
+					{
+						res.notify_all();
+						ppu.res_notify = 0;
+					}
+				}
+				else
+				{
+					ppu.res_notify = 0;
+				}
+
+				static_cast<void>(ppu.test_stopped());
+			}
+			else
 			{
 				// Try to postpone notification to when PPU is asleep or join notifications on the same address
 				// This also optimizes a mutex - won't notify after lock is aqcuired (prolonging the critical section duration), only notifies on unlock
-				ppu.res_notify = addr;
-			}
-			else if ((addr ^ notify) & -128)
-			{
-				res.notify_all();
+				if (get_resrv_waiters_count(addr))
+				{
+					ppu.res_notify = addr;
+					ppu.res_notify_time = rtime + 128;
+				}
 			}
 		}
 
@@ -3520,7 +3558,13 @@ static bool ppu_store_reservation(ppu_thread& ppu, u32 addr, u64 reg_value)
 	// And on failure it has some time to do something else
 	if (notify && ((addr ^ notify) & -128))
 	{
-		vm::reservation_notifier(notify).notify_all();
+		if (ppu.res_notify_time == (vm::reservation_acquire(notify) & -128))
+		{
+			ppu.state += cpu_flag::wait;
+			vm::reservation_notifier(notify).notify_all();
+			static_cast<void>(ppu.test_stopped());
+		}
+
 		ppu.res_notify = 0;
 	}
 
@@ -4137,7 +4181,7 @@ extern void ppu_precompile(std::vector<std::string>& dir_queue, std::vector<ppu_
 					}
 
 					// Participate in thread execution limitation (takes a long time)
-					if (std::lock_guard lock(g_fxo->get<jit_core_allocator>().sem); !ovlm->analyse(0, ovlm->entry, ovlm->seg0_code_end, ovlm->applied_patches, []()
+					if (std::lock_guard lock(g_fxo->get<jit_core_allocator>().sem); !ovlm->analyse(0, ovlm->entry, ovlm->seg0_code_end, ovlm->applied_patches, std::vector<u32>{}, []()
 					{
 						return Emu.IsStopped();
 					}))
@@ -4245,7 +4289,7 @@ extern void ppu_precompile(std::vector<std::string>& dir_queue, std::vector<ppu_
 						break;
 					}
 
-					if (!_main.analyse(0, _main.elf_entry, _main.seg0_code_end, _main.applied_patches, [](){ return Emu.IsStopped(); }))
+					if (!_main.analyse(0, _main.elf_entry, _main.seg0_code_end, _main.applied_patches, std::vector<u32>{}, [](){ return Emu.IsStopped(); }))
 					{
 						g_fxo->get<spu_cache>() = std::move(current_cache);
 						break;
@@ -4297,7 +4341,7 @@ extern void ppu_initialize()
 	std::optional<scoped_progress_dialog> progr(std::in_place, "Analyzing PPU Executable...");
 
 	// Analyse executable
-	if (!_main.analyse(0, _main.elf_entry, _main.seg0_code_end, _main.applied_patches, [](){ return Emu.IsStopped(); }))
+	if (!_main.analyse(0, _main.elf_entry, _main.seg0_code_end, _main.applied_patches, std::vector<u32>{}, [](){ return Emu.IsStopped(); }))
 	{
 		return;
 	}
@@ -5000,6 +5044,7 @@ bool ppu_initialize(const ppu_module& info, bool check_only, u64 file_size)
 		g_watchdog_hold_ctr--;
 	}
 
+	bool failed_to_load = false;
 	{
 		if (!is_being_used_in_emulation || (cpu ? cpu->state.all_of(cpu_flag::exit) : Emu.IsStopped()))
 		{
@@ -5019,7 +5064,21 @@ bool ppu_initialize(const ppu_module& info, bool check_only, u64 file_size)
 				break;
 			}
 
-			jit->add(cache_path + obj_name);
+			if (!failed_to_load && !jit->add(cache_path + obj_name))
+			{
+				ppu_log.error("LLVM: Failed to load module %s", obj_name);
+				failed_to_load = true;
+			}
+
+			if (failed_to_load)
+			{
+				if (!is_compiled)
+				{
+					g_progr_pdone++;
+				}
+
+				continue;
+			}
 
 			if (!is_compiled)
 			{
@@ -5029,7 +5088,7 @@ bool ppu_initialize(const ppu_module& info, bool check_only, u64 file_size)
 		}
 	}
 
-	if (!is_being_used_in_emulation || (cpu ? cpu->state.all_of(cpu_flag::exit) : Emu.IsStopped()))
+	if (failed_to_load || !is_being_used_in_emulation || (cpu ? cpu->state.all_of(cpu_flag::exit) : Emu.IsStopped()))
 	{
 		return compiled_new;
 	}
@@ -5062,6 +5121,7 @@ bool ppu_initialize(const ppu_module& info, bool check_only, u64 file_size)
 	if (is_first)
 	{
 		jit_mod.symbol_resolver = reinterpret_cast<void(*)(u8*, u64)>(jit->get("__resolve_symbols"));
+		ensure(jit_mod.symbol_resolver);
 	}
 	else
 	{
@@ -5265,7 +5325,7 @@ static void ppu_initialize2(jit_compiler& jit, const ppu_module& module_part, co
 		if (g_cfg.core.llvm_logs)
 		{
 			out << *_module; // print IR
-			fs::file(cache_path + obj_name + ".log", fs::rewrite).write(out.str());
+			fs::write_file(cache_path + obj_name + ".log", fs::rewrite, out.str());
 			result.clear();
 		}
 

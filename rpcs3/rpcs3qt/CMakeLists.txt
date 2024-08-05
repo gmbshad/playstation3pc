@@ -1,6 +1,7 @@
 add_library(rpcs3_ui STATIC
     about_dialog.cpp
     auto_pause_settings_dialog.cpp
+    basic_mouse_settings_dialog.cpp
     breakpoint_handler.cpp
     breakpoint_list.cpp
     call_stack_list.cpp
@@ -15,6 +16,7 @@ add_library(rpcs3_ui STATIC
     debugger_frame.cpp
     debugger_list.cpp
     downloader.cpp
+    dimensions_dialog.cpp
     _discord_utils.cpp
     emu_settings.cpp
     elf_memory_dumping_dialog.cpp
@@ -67,6 +69,7 @@ add_library(rpcs3_ui STATIC
     qt_camera_video_sink.cpp
     qt_music_handler.cpp
     qt_utils.cpp
+    raw_mouse_settings_dialog.cpp
     register_editor_dialog.cpp
     recvmessage_dialog_frame.cpp
     render_creator.cpp
@@ -148,7 +151,7 @@ target_link_libraries(rpcs3_ui
         3rdparty::hidapi
         3rdparty::libusb
         3rdparty::libpng
-        3rdparty::7z
+        3rdparty::7zip
         3rdparty::wolfssl
         3rdparty::libcurl
         3rdparty::rtmidi)

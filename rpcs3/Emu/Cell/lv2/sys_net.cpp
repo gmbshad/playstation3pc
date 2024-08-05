@@ -1412,14 +1412,8 @@ error_code sys_net_bnet_poll(ppu_thread& ppu, vm::ptr<sys_net_pollfd> fds, s32 n
 					return {};
 				}
 
-				std::lock_guard nw_lock(g_fxo->get<network_context>().mutex_thread_loop);
-
-				if (signaled)
-				{
-					break;
-				}
-
 				has_timedout = network_clear_queue(ppu);
+				ppu.state -= cpu_flag::signal;
 				break;
 			}
 		}
@@ -1651,14 +1645,8 @@ error_code sys_net_bnet_select(ppu_thread& ppu, s32 nfds, vm::ptr<sys_net_fd_set
 					return {};
 				}
 
-				std::lock_guard nw_lock(g_fxo->get<network_context>().mutex_thread_loop);
-
-				if (signaled)
-				{
-					break;
-				}
-
 				has_timedout = network_clear_queue(ppu);
+				ppu.state -= cpu_flag::signal;
 				break;
 			}
 		}
@@ -1748,7 +1736,7 @@ error_code lv2_socket::abort_socket(s32 flags)
 		lv2_obj::append(ppu.get());
 	}
 
-	const u32 num_waiters = qcopy.size();
+	const u32 num_waiters = ::size32(qcopy);
 	if (num_waiters && (type == SYS_NET_SOCK_STREAM || type == SYS_NET_SOCK_DGRAM))
 	{
 		auto& nc = g_fxo->get<network_context>();

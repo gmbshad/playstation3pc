@@ -8,6 +8,8 @@
 #include <Emu/IdManager.h>
 #include <Emu/Cell/lv2/sys_event.h>
 
+#include <numeric>
+
 LOG_CHANNEL(cellMic);
 
 template<>
@@ -73,14 +75,13 @@ void mic_context::operator()()
 	// Timestep in microseconds
 	constexpr u64 TIMESTEP = 256ull * 1'000'000ull / 48000ull;
 	u64 timeout = 0;
-	u32 oldvalue = 0;
 
 	while (thread_ctrl::state() != thread_state::aborting)
 	{
 		if (timeout != 0)
 		{
-			thread_ctrl::wait_on(wakey, oldvalue, timeout);
-			oldvalue = wakey;
+			thread_ctrl::wait_on(wakey, 0, timeout);
+			wakey.store(0);
 		}
 
 		std::lock_guard lock(mutex);
@@ -124,7 +125,7 @@ void mic_context::operator()()
 
 void mic_context::wake_up()
 {
-	wakey++;
+	wakey.store(1);
 	wakey.notify_one();
 }
 
@@ -149,6 +150,8 @@ void mic_context::load_config_and_init()
 			{
 				device.add_device(device_list[1]);
 			}
+
+			wake_up();
 		}
 		else
 		{
@@ -864,7 +867,17 @@ error_code cellMicGetDeviceAttr(s32 dev_num, CellMicDeviceAttr deviceAttributes,
 		case CELLMIC_DEVATTR_CHANVOL:
 			if (*arg1 > 2 || !arg2)
 				return CELL_MICIN_ERROR_PARAM;
-			*arg2 = ::at32(device.attr_chanvol, *arg1);
+
+			if (*arg1 == 0)
+			{
+				// Calculate average volume of the channels
+				*arg2 = std::accumulate(device.attr_chanvol.begin(), device.attr_chanvol.end(), 0) / device.attr_chanvol.size();
+			}
+			else
+			{
+				*arg2 = ::at32(device.attr_chanvol, *arg1 - 1);
+			}
+
 			break;
 		case CELLMIC_DEVATTR_LED: *arg1 = device.attr_led; break;
 		case CELLMIC_DEVATTR_GAIN: *arg1 = device.attr_gain; break;
@@ -898,7 +911,16 @@ error_code cellMicSetDeviceAttr(s32 dev_num, CellMicDeviceAttr deviceAttributes,
 		// Used by SingStar to set the volume of each mic
 		if (arg1 > 2)
 			return CELL_MICIN_ERROR_PARAM;
-		::at32(device.attr_chanvol, arg1) = arg2;
+
+		if (arg1 == 0)
+		{
+			device.attr_chanvol.fill(arg2);
+		}
+		else
+		{
+			::at32(device.attr_chanvol, arg1 - 1) = arg2;
+		}
+
 		break;
 	case CELLMIC_DEVATTR_LED: device.attr_led = arg1; break;
 	case CELLMIC_DEVATTR_GAIN: device.attr_gain = arg1; break;

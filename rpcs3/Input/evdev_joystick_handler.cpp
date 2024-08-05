@@ -19,8 +19,8 @@
 
 LOG_CHANNEL(evdev_log, "evdev");
 
-evdev_joystick_handler::evdev_joystick_handler(bool emulation)
-    : PadHandlerBase(pad_handler::evdev, emulation)
+evdev_joystick_handler::evdev_joystick_handler()
+    : PadHandlerBase(pad_handler::evdev)
 {
 	init_configs();
 
@@ -85,6 +85,8 @@ void evdev_joystick_handler::init_config(cfg_pad* cfg)
 	cfg->pressure_intensity_button.def = ::at32(button_list, NO_BUTTON);
 
 	// Set default misc variables
+	cfg->lstick_anti_deadzone.def = static_cast<u32>(0.13 * thumb_max); // 13%
+	cfg->rstick_anti_deadzone.def = static_cast<u32>(0.13 * thumb_max); // 13%
 	cfg->lstickdeadzone.def    = 30; // between 0 and 255
 	cfg->rstickdeadzone.def    = 30; // between 0 and 255
 	cfg->ltriggerthreshold.def = 0;  // between 0 and 255
@@ -1082,7 +1084,7 @@ void evdev_joystick_handler::apply_input_events(const std::shared_ptr<Pad>& pad)
 
 	// Find out if special buttons are pressed (introduced by RPCS3).
 	// These buttons will have a delay of one cycle, but whatever.
-	const bool adjust_pressure = pad->get_pressure_intensity_button_active(cfg->pressure_intensity_toggle_mode.get());
+	const bool adjust_pressure = pad->get_pressure_intensity_button_active(cfg->pressure_intensity_toggle_mode.get(), pad->m_player_id);
 	const u32 pressure_intensity_deadzone = cfg->pressure_intensity_deadzone.get();
 
 	const auto update_values = [&](bool& pressed, u16& final_value, bool is_stick_value, u32 code, u16 val)
@@ -1210,8 +1212,8 @@ void evdev_joystick_handler::apply_input_events(const std::shared_ptr<Pad>& pad)
 	u16 lx, ly, rx, ry;
 
 	// Normalize and apply pad squircling
-	convert_stick_values(lx, ly, stick_val[0], stick_val[1], cfg->lstickdeadzone, cfg->lpadsquircling);
-	convert_stick_values(rx, ry, stick_val[2], stick_val[3], cfg->rstickdeadzone, cfg->rpadsquircling);
+	convert_stick_values(lx, ly, stick_val[0], stick_val[1], cfg->lstickdeadzone, cfg->lstick_anti_deadzone, cfg->lpadsquircling);
+	convert_stick_values(rx, ry, stick_val[2], stick_val[3], cfg->rstickdeadzone, cfg->rstick_anti_deadzone, cfg->rpadsquircling);
 
 	pad->m_sticks[0].m_value = lx;
 	pad->m_sticks[1].m_value = 255 - ly;
@@ -1240,12 +1242,12 @@ void evdev_joystick_handler::apply_pad_data(const pad_ensemble& binding)
 	SetRumble(evdev_device, force_large, force_small);
 }
 
-bool evdev_joystick_handler::bindPadToDevice(std::shared_ptr<Pad> pad, u8 player_id)
+bool evdev_joystick_handler::bindPadToDevice(std::shared_ptr<Pad> pad)
 {
-	if (!pad || player_id >= g_cfg_input.player.size())
+	if (!pad || pad->m_player_id >= g_cfg_input.player.size())
 		return false;
 
-	const cfg_player* player_config = g_cfg_input.player[player_id];
+	const cfg_player* player_config = g_cfg_input.player[pad->m_player_id];
 	if (!pad)
 		return false;
 
@@ -1253,9 +1255,9 @@ bool evdev_joystick_handler::bindPadToDevice(std::shared_ptr<Pad> pad, u8 player
 
 	m_dev = std::make_shared<EvdevDevice>();
 
-	m_pad_configs[player_id].from_string(player_config->config.to_string());
-	m_dev->config = &m_pad_configs[player_id];
-	m_dev->player_id = player_id;
+	m_pad_configs[pad->m_player_id].from_string(player_config->config.to_string());
+	m_dev->config = &m_pad_configs[pad->m_player_id];
+	m_dev->player_id = pad->m_player_id;
 	cfg_pad* cfg = m_dev->config;
 	if (!cfg)
 		return false;

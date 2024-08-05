@@ -1,3 +1,4 @@
+#include "stdafx.h"
 #include "gui_application.h"
 
 #include "qt_utils.h"
@@ -22,7 +23,6 @@
 #include "Emu/vfs_config.h"
 #include "util/init_mutex.hpp"
 #include "util/console.h"
-#include "Input/raw_mouse_handler.h"
 #include "trophy_notification_helper.h"
 #include "save_data_dialog.h"
 #include "msg_dialog_frame.h"
@@ -58,10 +58,13 @@
 
 LOG_CHANNEL(gui_log, "GUI");
 
+std::unique_ptr<raw_mouse_handler> g_raw_mouse_handler;
+
 [[noreturn]] void report_fatal_error(std::string_view text, bool is_html = false, bool include_help_text = true);
 
 gui_application::gui_application(int& argc, char** argv) : QApplication(argc, argv)
 {
+	std::setlocale(LC_NUMERIC, "C"); // On linux Qt changes to system locale while initializing QCoreApplication
 }
 
 gui_application::~gui_application()
@@ -1111,7 +1114,7 @@ void gui_application::OnAppStateChanged(Qt::ApplicationState state)
 bool gui_application::native_event_filter::nativeEventFilter([[maybe_unused]] const QByteArray& eventType, [[maybe_unused]] void* message, [[maybe_unused]] qintptr* result)
 {
 #ifdef _WIN32
-	if (!Emu.IsRunning())
+	if (!Emu.IsRunning() && !g_raw_mouse_handler)
 	{
 		return false;
 	}
@@ -1123,6 +1126,11 @@ bool gui_application::native_event_filter::nativeEventFilter([[maybe_unused]] co
 			if (auto* handler = g_fxo->try_get<MouseHandlerBase>(); handler && handler->type == mouse_handler::raw)
 			{
 				static_cast<raw_mouse_handler*>(handler)->handle_native_event(*msg);
+			}
+
+			if (g_raw_mouse_handler)
+			{
+				g_raw_mouse_handler->handle_native_event(*msg);
 			}
 		}
 	}

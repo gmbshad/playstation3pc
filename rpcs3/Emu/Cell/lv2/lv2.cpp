@@ -976,6 +976,7 @@ enum CellSpursCoreError : u32;
 enum CellSpursPolicyModuleError : u32;
 enum CellSpursTaskError : u32;
 enum CellSpursJobError : u32;
+enum CellSyncError : u32;
 
 enum CellGameError : u32;
 enum CellGameDataError : u32;
@@ -999,6 +1000,7 @@ const std::map<u64, void(*)(std::string&, u64)> s_error_codes_formatting_by_type
 	formatter_of<0x8002b260, CellAudioInError>,
 	formatter_of<0x8002b220, CellVideoOutError>,
 
+	formatter_of<0x80410100, CellSyncError>,
 	formatter_of<0x80410700, CellSpursCoreError>,
 	formatter_of<0x80410800, CellSpursPolicyModuleError>,
 	formatter_of<0x80410900, CellSpursTaskError>,
@@ -1325,15 +1327,18 @@ bool lv2_obj::sleep(cpu_thread& cpu, const u64 timeout)
 		prepare_for_sleep(cpu);
 	}
 
-	if (cpu.id_type() == 1)
+	if (cpu.get_class() == thread_class::ppu)
 	{
 		if (u32 addr = static_cast<ppu_thread&>(cpu).res_notify)
 		{
 			static_cast<ppu_thread&>(cpu).res_notify = 0;
 
-			const usz notify_later_idx = std::basic_string_view<const void*>{g_to_notify, std::size(g_to_notify)}.find_first_of(std::add_pointer_t<const void>{});
-
-			if (notify_later_idx != umax)
+			if (static_cast<ppu_thread&>(cpu).res_notify_time != (vm::reservation_acquire(addr) & -128))
+			{
+				// Ignore outdated notification request
+			}
+			else if (usz notify_later_idx = std::basic_string_view<const void*>{g_to_notify, std::size(g_to_notify)}.find_first_of(std::add_pointer_t<const void>{});
+				notify_later_idx != umax)
 			{
 				g_to_notify[notify_later_idx] = &vm::reservation_notifier(addr);
 
@@ -1382,9 +1387,12 @@ bool lv2_obj::awake(cpu_thread* thread, s32 prio)
 		{
 			ppu->res_notify = 0;
 
-			const usz notify_later_idx = std::basic_string_view<const void*>{g_to_notify, std::size(g_to_notify)}.find_first_of(std::add_pointer_t<const void>{});
-
-			if (notify_later_idx != umax)
+			if (ppu->res_notify_time != (vm::reservation_acquire(addr) & -128))
+			{
+				// Ignore outdated notification request
+			}
+			else if (usz notify_later_idx = std::basic_string_view<const void*>{g_to_notify, std::size(g_to_notify)}.find_first_of(std::add_pointer_t<const void>{});
+				notify_later_idx != umax)
 			{
 				g_to_notify[notify_later_idx] = &vm::reservation_notifier(addr);
 
@@ -1571,7 +1579,7 @@ bool lv2_obj::sleep_unlocked(cpu_thread& thread, u64 timeout, u64 current_time)
 bool lv2_obj::awake_unlocked(cpu_thread* cpu, s32 prio)
 {
 	// Check thread type
-	AUDIT(!cpu || cpu->id_type() == 1);
+	AUDIT(!cpu || cpu->get_class() == thread_class::ppu);
 
 	bool push_first = false;
 
@@ -1984,8 +1992,8 @@ std::pair<ppu_thread_status, u32> lv2_obj::ppu_state(ppu_thread* ppu, bool lock_
 		opt_lock[1].emplace(lv2_obj::g_mutex);
 	}
 
-	usz pos = umax;
-	usz i = 0;
+	u32 pos = umax;
+	u32 i = 0;
 
 	for (auto target = +g_ppu; target; target = target->next_ppu, i++)
 	{
