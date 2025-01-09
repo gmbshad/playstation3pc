@@ -88,7 +88,7 @@ public:
 	~main_window();
 	bool Init(bool with_cli_boot);
 	QIcon GetAppIcon() const;
-	bool OnMissingFw();
+	void OnMissingFw();
 	bool InstallPackages(QStringList file_paths = {}, bool from_boot = false);
 	void InstallPup(QString file_path = "");
 
@@ -98,6 +98,7 @@ Q_SIGNALS:
 	void RequestDialogRepaint();
 	void NotifyEmuSettingsChange();
 	void NotifyWindowCloseEvent(bool closed);
+	void NotifyShortcutHandlers();
 
 public Q_SLOTS:
 	void OnEmuStop();
@@ -122,13 +123,17 @@ private Q_SLOTS:
 	void BootSavestate();
 	void BootRsxCapture(std::string path = "");
 	void DecryptSPRXLibraries();
-	static void show_boot_error(game_boot_result status);
+	void show_boot_error(game_boot_result status);
 
 	void SaveWindowState() const;
 	void SetIconSizeActions(int idx) const;
 	void ResizeIcons(int index);
 
-	void RemoveDiskCache();
+	void RemoveHDD1Caches();
+	void RemoveAllCaches();
+	void RemoveSavestates();
+	void CleanUpGameList();
+
 	void RemoveFirmwareCache();
 	void CreateFirmwareCache();
 

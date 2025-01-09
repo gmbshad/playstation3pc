@@ -25,7 +25,7 @@ public:
 	void operator()();
 
 	PadInfo& GetInfo() { return m_info; }
-	auto& GetPads() { return m_pads; }
+	std::array<std::shared_ptr<Pad>, CELL_PAD_MAX_PORT_NUM>& GetPads() { return m_pads; }
 	void SetRumble(const u32 pad, u8 large_motor, bool small_motor);
 	void SetIntercepted(bool intercepted);
 
@@ -76,6 +76,7 @@ namespace pad
 	extern atomic_t<bool> g_enabled;
 	extern atomic_t<bool> g_reset;
 	extern atomic_t<bool> g_started;
+	extern atomic_t<bool> g_home_menu_requested;
 
 	static inline class pad_thread* get_current_handler(bool relaxed = false)
 	{

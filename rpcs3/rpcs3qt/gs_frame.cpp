@@ -10,12 +10,14 @@
 #include "Emu/system_config.h"
 #include "Emu/system_progress.hpp"
 #include "Emu/IdManager.h"
+#include "Emu/Audio/audio_utils.h"
 #include "Emu/Cell/Modules/cellScreenshot.h"
 #include "Emu/Cell/Modules/cellVideoOut.h"
 #include "Emu/Cell/Modules/cellAudio.h"
 #include "Emu/Cell/lv2/sys_rsxaudio.h"
 #include "Emu/RSX/rsx_utils.h"
 #include "Emu/RSX/Overlays/overlay_message.h"
+#include "Emu/Io/interception.h"
 #include "Emu/Io/recording_config.h"
 
 #include <QApplication>
@@ -56,18 +58,22 @@ extern atomic_t<recording_mode> g_recording_mode;
 
 atomic_t<bool> g_game_window_focused = false;
 
+namespace pad
+{
+	extern atomic_t<bool> g_home_menu_requested;
+}
+
 bool is_input_allowed()
 {
 	return g_game_window_focused || g_cfg.io.background_input_enabled;
 }
-
-constexpr auto qstr = QString::fromStdString;
 
 gs_frame::gs_frame(QScreen* screen, const QRect& geometry, const QIcon& appIcon, std::shared_ptr<gui_settings> gui_settings, bool force_fullscreen)
 	: QWindow()
 	, m_initial_geometry(geometry)
 	, m_gui_settings(std::move(gui_settings))
 	, m_start_games_fullscreen(force_fullscreen)
+	, m_renderer(g_cfg.video.renderer)
 {
 	load_gui_settings();
 
@@ -112,7 +118,7 @@ gs_frame::gs_frame(QScreen* screen, const QRect& geometry, const QIcon& appIcon,
 	setMinimumHeight(90);
 	setScreen(screen);
 	setGeometry(geometry);
-	setTitle(qstr(m_window_title));
+	setTitle(QString::fromStdString(m_window_title));
 
 	if (g_cfg.video.renderer != video_renderer::opengl)
 	{
@@ -122,9 +128,8 @@ gs_frame::gs_frame(QScreen* screen, const QRect& geometry, const QIcon& appIcon,
 		create();
 	}
 
-	// TODO: enable in Qt6
-	//m_shortcut_handler = new shortcut_handler(gui::shortcuts::shortcut_handler_id::game_window, this, m_gui_settings);
-	//connect(m_shortcut_handler, &shortcut_handler::shortcut_activated, this, &gs_frame::handle_shortcut);
+	m_shortcut_handler = new shortcut_handler(gui::shortcuts::shortcut_handler_id::game_window, this, m_gui_settings);
+	connect(m_shortcut_handler, &shortcut_handler::shortcut_activated, this, &gs_frame::handle_shortcut);
 
 	// Change cursor when in fullscreen.
 	connect(this, &QWindow::visibilityChanged, this, [this](QWindow::Visibility visibility)
@@ -149,6 +154,7 @@ gs_frame::gs_frame(QScreen* screen, const QRect& geometry, const QIcon& appIcon,
 gs_frame::~gs_frame()
 {
 	g_user_asked_for_screenshot = false;
+	pad::g_home_menu_requested = false;
 
 	// Save active screen to gui settings
 	const QScreen* current_screen = screen();
@@ -175,6 +181,14 @@ void gs_frame::load_gui_settings()
 	m_lock_mouse_in_fullscreen  = m_gui_settings->GetValue(gui::gs_lockMouseFs).toBool();
 	m_hide_mouse_after_idletime = m_gui_settings->GetValue(gui::gs_hideMouseIdle).toBool();
 	m_hide_mouse_idletime = m_gui_settings->GetValue(gui::gs_hideMouseIdleTime).toUInt();
+}
+
+void gs_frame::update_shortcuts()
+{
+	if (m_shortcut_handler)
+	{
+		m_shortcut_handler->update();
+	}
 }
 
 void gs_frame::paintEvent(QPaintEvent *event)
@@ -223,91 +237,6 @@ void gs_frame::showEvent(QShowEvent *event)
 	setFramePosition(pos);
 
 	QWindow::showEvent(event);
-}
-
-// TODO: remove when shortcuts are properly hooked up (also check keyboard_pad_handler::processKeyEvent)
-void gs_frame::keyPressEvent(QKeyEvent *keyEvent)
-{
-	if (keyEvent->isAutoRepeat())
-	{
-		keyEvent->ignore();
-		return;
-	}
-
-	// NOTE: needs to be updated with keyboard_pad_handler::processKeyEvent
-
-	switch (keyEvent->key())
-	{
-	case Qt::Key_L:
-	{
-		if (keyEvent->modifiers() == Qt::AltModifier)
-		{
-			handle_shortcut(gui::shortcuts::shortcut::gw_log_mark, {});
-			break;
-		}
-		else if (keyEvent->modifiers() == Qt::ControlModifier)
-		{
-			handle_shortcut(gui::shortcuts::shortcut::gw_mouse_lock, {});
-			break;
-		}
-		break;
-	}
-	case Qt::Key_Return:
-	{
-		if (keyEvent->modifiers() == Qt::AltModifier)
-			handle_shortcut(gui::shortcuts::shortcut::gw_toggle_fullscreen, {});
-		break;
-	}
-	case Qt::Key_Escape:
-	{
-		handle_shortcut(gui::shortcuts::shortcut::gw_exit_fullscreen, {});
-		break;
-	}
-	case Qt::Key_P:
-	{
-		if (keyEvent->modifiers() == Qt::ControlModifier)
-			handle_shortcut(gui::shortcuts::shortcut::gw_pause_play, {});
-		break;
-	}
-	case Qt::Key_S:
-	{
-		if (keyEvent->modifiers() == Qt::ControlModifier)
-			handle_shortcut(gui::shortcuts::shortcut::gw_savestate, {});
-		break;
-	}
-	case Qt::Key_R:
-	{
-		if (keyEvent->modifiers() == Qt::ControlModifier)
-			handle_shortcut(gui::shortcuts::shortcut::gw_restart, {});
-		break;
-	}
-	case Qt::Key_C:
-	{
-		if (keyEvent->modifiers() == Qt::AltModifier)
-			handle_shortcut(gui::shortcuts::shortcut::gw_rsx_capture, {});
-		break;
-	}
-	case Qt::Key_F10:
-	{
-		if (keyEvent->modifiers() == Qt::ControlModifier)
-			handle_shortcut(gui::shortcuts::shortcut::gw_frame_limit, {});
-		break;
-	}
-	case Qt::Key_F11:
-	{
-		handle_shortcut(gui::shortcuts::shortcut::gw_toggle_recording, {});
-		break;
-	}
-	case Qt::Key_F12:
-	{
-		handle_shortcut(gui::shortcuts::shortcut::gw_screenshot, {});
-		break;
-	}
-	default:
-	{
-		break;
-	}
-	}
 }
 
 void gs_frame::handle_shortcut(gui::shortcuts::shortcut shortcut_key, const QKeySequence& key_sequence)
@@ -400,6 +329,9 @@ void gs_frame::handle_shortcut(gui::shortcuts::shortcut shortcut_key, const QKey
 				{
 					Emu.Restart();
 				};
+
+				// Make sure we keep the game window opened
+				Emu.SetContinuousMode(true);
 			}
 
 			Emu.Kill(false, true);
@@ -419,6 +351,31 @@ void gs_frame::handle_shortcut(gui::shortcuts::shortcut shortcut_key, const QKey
 	{
 		g_disable_frame_limit = !g_disable_frame_limit;
 		gui_log.warning("%s boost mode", g_disable_frame_limit.load() ? "Enabled" : "Disabled");
+		break;
+	}
+	case gui::shortcuts::shortcut::gw_toggle_mouse_and_keyboard:
+	{
+		input::toggle_mouse_and_keyboard();
+		break;
+	}
+	case gui::shortcuts::shortcut::gw_home_menu:
+	{
+		pad::g_home_menu_requested = true;
+		break;
+	}
+	case gui::shortcuts::shortcut::gw_mute_unmute:
+	{
+		audio::toggle_mute();
+		break;
+	}
+	case gui::shortcuts::shortcut::gw_volume_up:
+	{
+		audio::change_volume(5);
+		break;
+	}
+	case gui::shortcuts::shortcut::gw_volume_down:
+	{
+		audio::change_volume(-5);
 		break;
 	}
 	default:
@@ -628,11 +585,10 @@ void gs_frame::hide_on_close()
 {
 	// Make sure not to save the hidden state, which is useless to us.
 	const Visibility current_visibility = visibility();
-	m_gui_settings->SetValue(gui::gs_visibility, current_visibility == Visibility::Hidden ? Visibility::AutomaticVisibility : current_visibility);
-	m_gui_settings->SetValue(gui::gs_geometry, geometry());
-	m_gui_settings->sync();
+	m_gui_settings->SetValue(gui::gs_visibility, current_visibility == Visibility::Hidden ? Visibility::AutomaticVisibility : current_visibility, false);
+	m_gui_settings->SetValue(gui::gs_geometry, geometry(), true);
 
-	if (!g_progr.load())
+	if (!g_progr_text)
 	{
 		// Hide the dialog before stopping if no progress bar is being shown.
 		// Otherwise users might think that the game softlocked if stopping takes too long.
@@ -649,6 +605,11 @@ void gs_frame::close()
 	}
 
 	gui_log.notice("Closing game window");
+
+	if (m_ignore_stop_events)
+	{
+		return;
+	}
 
 	Emu.CallFromMainThread([this]()
 	{
@@ -669,6 +630,10 @@ void gs_frame::close()
 			deleteLater();
 		}
 	});
+}
+
+void gs_frame::reset()
+{
 }
 
 bool gs_frame::shown()
@@ -773,6 +738,23 @@ int gs_frame::client_height()
 	return height() * devicePixelRatio();
 }
 
+f64 gs_frame::client_display_rate()
+{
+	f64 rate = 20.; // Minimum is 20
+
+	Emu.BlockingCallFromMainThread([this, &rate]()
+	{
+		const QList<QScreen*> screens = QGuiApplication::screens();
+
+		for (int i = 0; i < screens.count(); i++)
+		{
+			rate = std::fmax(rate, ::at32(screens, i)->refreshRate());
+		}
+	});
+
+	return rate;
+}
+
 void gs_frame::flip(draw_context_t, bool /*skip_frame*/)
 {
 	static Timer fps_t;
@@ -797,7 +779,7 @@ void gs_frame::flip(draw_context_t, bool /*skip_frame*/)
 
 			Emu.CallFromMainThread([this, title = std::move(new_title)]()
 			{
-				setTitle(qstr(title));
+				setTitle(QString::fromStdString(title));
 			});
 		}
 
@@ -986,7 +968,7 @@ void gs_frame::take_screenshot(std::vector<u8> data, u32 sshot_width, u32 sshot_
 
 					QImage overlay_img;
 
-					if (!overlay_img.load(qstr(cell_sshot_overlay_path)))
+					if (!overlay_img.load(QString::fromStdString(cell_sshot_overlay_path)))
 					{
 						screenshot_log.error("Failed to read cell screenshot overlay '%s' : %s", cell_sshot_overlay_path, fs::g_tls_error);
 						return;
@@ -1164,6 +1146,11 @@ bool gs_frame::event(QEvent* ev)
 		}
 
 		gui_log.notice("Game window close event issued");
+
+		if (m_ignore_stop_events)
+		{
+			return QWindow::event(ev);
+		}
 
 		if (Emu.IsStopped())
 		{

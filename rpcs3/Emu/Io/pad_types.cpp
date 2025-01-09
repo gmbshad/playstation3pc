@@ -159,6 +159,20 @@ u32 get_axis_keycode(u32 offset, u16 value)
 	}
 }
 
+void ps_move_data::reset_sensors()
+{
+	quaternion = default_quaternion;
+	accelerometer_x = 0.0f;
+	accelerometer_y = 0.0f;
+	accelerometer_z = 0.0f;
+	gyro_x = 0.0f;
+	gyro_y = 0.0f;
+	gyro_z = 0.0f;
+	magnetometer_x = 0.0f;
+	magnetometer_y = 0.0f;
+	magnetometer_z = 0.0f;
+}
+
 bool Pad::get_pressure_intensity_button_active(bool is_toggle_mode, u32 player_id)
 {
 	if (m_pressure_intensity_button_index < 0)
@@ -197,4 +211,54 @@ bool Pad::get_pressure_intensity_button_active(bool is_toggle_mode, u32 player_i
 	}
 
 	return pressure_intensity_button.m_pressed;
+}
+
+bool Pad::get_analog_limiter_button_active(bool is_toggle_mode, u32 player_id)
+{
+	if (m_analog_limiter_button_index < 0)
+	{
+		return false;
+	}
+
+	const Button& analog_limiter_button = m_buttons[m_analog_limiter_button_index];
+
+	if (is_toggle_mode)
+	{
+		const bool pressed = analog_limiter_button.m_pressed;
+
+		if (std::exchange(m_analog_limiter_button_pressed, pressed) != pressed)
+		{
+			if (pressed)
+			{
+				m_analog_limiter_toggled = !m_analog_limiter_toggled;
+
+				if (g_cfg.misc.show_analog_limiter_toggle_hint)
+				{
+					const std::string player_id_string = std::to_string(player_id + 1);
+					if (m_analog_limiter_toggled)
+					{
+						rsx::overlays::queue_message(get_localized_string(localized_string_id::RSX_OVERLAYS_ANALOG_LIMITER_TOGGLED_ON, player_id_string.c_str()), 3'000'000);
+					}
+					else
+					{
+						rsx::overlays::queue_message(get_localized_string(localized_string_id::RSX_OVERLAYS_ANALOG_LIMITER_TOGGLED_OFF, player_id_string.c_str()), 3'000'000);
+					}
+				}
+			}
+		}
+
+		return m_analog_limiter_toggled;
+	}
+
+	return analog_limiter_button.m_pressed;
+}
+
+bool Pad::get_orientation_reset_button_active()
+{
+	if (m_orientation_reset_button_index < 0)
+	{
+		return false;
+	}
+
+	return m_buttons[m_orientation_reset_button_index].m_pressed;
 }

@@ -46,8 +46,8 @@ public:
 		bool has_accel = false;
 		bool has_gyro = false;
 
-		float data_rate_accel = 0.0f;
-		float data_rate_gyro = 0.0f;
+		f32 data_rate_accel = 0.0f;
+		f32 data_rate_gyro = 0.0f;
 
 		std::set<SDL_GameControllerButton> button_ids;
 		std::set<SDL_GameControllerAxis> axis_ids;
@@ -57,16 +57,13 @@ public:
 
 	sdl_info sdl{};
 
-	std::array<float, 3> values_accel{};
-	std::array<float, 3> values_gyro{};
+	std::array<f32, 3> values_accel{};
+	std::array<f32, 3> values_gyro{};
 
 	bool led_needs_update = true;
 	bool led_is_on = true;
 	bool led_is_blinking = false;
 	steady_clock::time_point led_timestamp{};
-
-	bool has_new_rumble_data = true;
-	steady_clock::time_point last_vibration{};
 };
 
 class sdl_pad_handler : public PadHandlerBase
@@ -128,7 +125,7 @@ public:
 	void SetPadData(const std::string& padId, u8 player_id, u8 large_motor, u8 small_motor, s32 r, s32 g, s32 b, bool player_led, bool battery_led, u32 battery_led_brightness) override;
 	u32 get_battery_level(const std::string& padId) override;
 	void get_motion_sensors(const std::string& pad_id, const motion_callback& callback, const motion_fail_callback& fail_callback, motion_preview_values preview_values, const std::array<AnalogSensor, 4>& sensors) override;
-	connection get_next_button_press(const std::string& padId, const pad_callback& callback, const pad_fail_callback& fail_callback, bool get_blacklist, const std::vector<std::string>& buttons) override;
+	connection get_next_button_press(const std::string& padId, const pad_callback& callback, const pad_fail_callback& fail_callback, gui_call_type call_type, const std::vector<std::string>& buttons) override;
 
 private:
 	// pseudo 'controller id' to keep track of unique controllers

@@ -1054,9 +1054,9 @@ rpcn_friends_dialog::rpcn_friends_dialog(QWidget* parent)
 	rpcn::friend_data data;
 	m_rpcn->get_friends_and_register_cb(data, friend_callback, this);
 
-	for (const auto& fr : data.friends)
+	for (const auto& [username, data] : data.friends)
 	{
-		add_update_list(m_lst_friends, QString::fromStdString(fr.first), fr.second.online ? m_icon_online : m_icon_offline, fr.second.online);
+		add_update_list(m_lst_friends, QString::fromStdString(username), data.online ? m_icon_online : m_icon_offline, data.online);
 	}
 
 	for (const auto& fr_req : data.requests_sent)
@@ -1135,17 +1135,36 @@ rpcn_friends_dialog::rpcn_friends_dialog(QWidget* parent)
 			}
 
 			QListWidgetItem* selected_item = m_lst_requests->selectedItems().first();
+			std::string str_sel_friend = selected_item->text().toStdString();
 
-			// Only create context menu for incoming requests
+			QMenu* context_menu = new QMenu();
+
+			// Presents different context based on role
 			if (selected_item->data(Qt::UserRole) == false)
 			{
+				QAction* cancel_friend_request = context_menu->addAction(tr("&Cancel Request"));
+
+				connect(cancel_friend_request, &QAction::triggered, this, [this, str_sel_friend]()
+					{
+						if (!m_rpcn->remove_friend(str_sel_friend))
+						{
+							QMessageBox::critical(this, tr("Error cancelling friend request!"), tr("An error occurred while trying to cancel friend request!"), QMessageBox::Ok);
+						}
+						else
+						{
+							QMessageBox::information(this, tr("Friend request cancelled!"), tr("You've successfully cancelled the friend request!"), QMessageBox::Ok);
+						}
+					});
+
+				context_menu->exec(m_lst_requests->viewport()->mapToGlobal(pos));
+				context_menu->deleteLater();
+
 				return;
 			}
 
-			std::string str_sel_friend = selected_item->text().toStdString();
 
-			QMenu* context_menu           = new QMenu();
 			QAction* accept_request_action = context_menu->addAction(tr("&Accept Request"));
+			QAction* reject_friend_request = context_menu->addAction(tr("&Reject Request"));
 
 			connect(accept_request_action, &QAction::triggered, this, [this, str_sel_friend]()
 				{
@@ -1158,6 +1177,18 @@ rpcn_friends_dialog::rpcn_friends_dialog(QWidget* parent)
 						QMessageBox::information(this, tr("Friend added!"), tr("You've successfully added a friend!"), QMessageBox::Ok);
 					}
 				});
+
+			connect(reject_friend_request, &QAction::triggered, this, [this, str_sel_friend]()
+			{
+				if (!m_rpcn->remove_friend(str_sel_friend))
+				{
+					QMessageBox::critical(this, tr("Error rejecting friend request!"), tr("An error occurred while trying to reject the friend request!"), QMessageBox::Ok);
+				}
+				else
+				{
+					QMessageBox::information(this, tr("Friend request cancelled!"), tr("You've successfully rejected the friend request!"), QMessageBox::Ok);
+				}
+			});
 
 			context_menu->exec(m_lst_requests->viewport()->mapToGlobal(pos));
 			context_menu->deleteLater();
@@ -1266,27 +1297,27 @@ void rpcn_friends_dialog::remove_list(QListWidget* list, const QString& name)
 	}
 }
 
-void rpcn_friends_dialog::add_update_friend(QString name, bool status)
+void rpcn_friends_dialog::add_update_friend(const QString& name, bool status)
 {
 	add_update_list(m_lst_friends, name, status ? m_icon_online : m_icon_offline, status);
 	remove_list(m_lst_requests, name);
 }
 
-void rpcn_friends_dialog::remove_friend(QString name)
+void rpcn_friends_dialog::remove_friend(const QString& name)
 {
 	remove_list(m_lst_friends, name);
 	remove_list(m_lst_requests, name);
 }
 
-void rpcn_friends_dialog::add_query(QString name)
+void rpcn_friends_dialog::add_query(const QString& name)
 {
 	add_update_list(m_lst_requests, name, m_icon_request_received, QVariant(true));
 	remove_list(m_lst_history, name);
 }
 
-void rpcn_friends_dialog::callback_handler(rpcn::NotificationType ntype, std::string username, bool status)
+void rpcn_friends_dialog::callback_handler(rpcn::NotificationType ntype, const std::string& username, bool status)
 {
-	QString qtr_username = QString::fromStdString(username);
+	const QString qtr_username = QString::fromStdString(username);
 	switch (ntype)
 	{
 	case rpcn::NotificationType::FriendQuery: // Other user sent a friend request
@@ -1307,6 +1338,10 @@ void rpcn_friends_dialog::callback_handler(rpcn::NotificationType ntype, std::st
 	case rpcn::NotificationType::FriendStatus: // Set status of friend to Offline or Online
 	{
 		Q_EMIT signal_add_update_friend(qtr_username, status);
+		break;
+	}
+	case rpcn::NotificationType::FriendPresenceChanged:
+	{
 		break;
 	}
 	default:

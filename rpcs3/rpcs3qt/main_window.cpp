@@ -30,6 +30,7 @@
 #include "gui_settings.h"
 #include "input_dialog.h"
 #include "camera_settings_dialog.h"
+#include "ps_move_tracker_dialog.h"
 #include "ipc_settings_dialog.h"
 #include "shortcut_utils.h"
 #include "config_checker.h"
@@ -38,6 +39,7 @@
 #include "emulated_pad_settings_dialog.h"
 #include "basic_mouse_settings_dialog.h"
 #include "raw_mouse_settings_dialog.h"
+#include "vfs_tool_dialog.h"
 #include "welcome_dialog.h"
 
 #include <thread>
@@ -80,6 +82,14 @@
 
 #include "ui_main_window.h"
 
+#include <QEventLoop>
+#include <QTimer>
+
+#if QT_CONFIG(permissions)
+#include <QGuiApplication>
+#include <QPermissions>
+#endif
+
 LOG_CHANNEL(gui_log, "GUI");
 
 extern atomic_t<bool> g_user_asked_for_frame_capture;
@@ -89,16 +99,90 @@ std::shared_ptr<CPUDisAsm> make_basic_ppu_disasm();
 
 inline std::string sstr(const QString& _in) { return _in.toStdString(); }
 
-extern void process_qt_events()
+extern void qt_events_aware_op(int repeat_duration_ms, std::function<bool()> wrapped_op)
 {
+	ensure(wrapped_op);
+
 	if (thread_ctrl::is_main())
 	{
 		// NOTE:
 		// I noticed that calling this from an Emu callback can cause the
 		// caller to get stuck for a while during newly opened Qt dialogs.
 		// Adding a timeout here doesn't seem to do anything in that case.
-		QApplication::processEvents();
+		QEventLoop* event_loop = nullptr;
+
+		std::shared_ptr<std::function<void()>> check_iteration;
+		check_iteration = std::make_shared<std::function<void()>>([&]()
+		{
+			if (wrapped_op())
+			{
+				event_loop->exit(0);
+			}
+			else
+			{
+				QTimer::singleShot(repeat_duration_ms, *check_iteration);
+			}
+		});
+
+		while (!wrapped_op())
+		{
+			// Init event loop
+			event_loop = new QEventLoop();
+
+			// Queue event initially
+			QTimer::singleShot(0, *check_iteration);
+
+			// Event loop
+			event_loop->exec();
+
+			// Cleanup
+			event_loop->deleteLater();
+		}
 	}
+	else
+	{
+		while (!wrapped_op())
+		{
+			if (repeat_duration_ms == 0)
+			{
+				std::this_thread::yield();
+			}
+			else if (thread_ctrl::get_current())
+			{
+				thread_ctrl::wait_for(repeat_duration_ms * 1000);
+			}
+			else
+			{
+				std::this_thread::sleep_for(std::chrono::milliseconds(repeat_duration_ms));
+			}
+		}
+	}
+}
+
+extern void check_microphone_permissions()
+{
+#if QT_CONFIG(permissions)
+	Emu.BlockingCallFromMainThread([]()
+	{
+		const QMicrophonePermission permission;
+		switch (qApp->checkPermission(permission))
+		{
+		case Qt::PermissionStatus::Undetermined:
+			gui_log.notice("Requesting microphone permission");
+			qApp->requestPermission(permission, []()
+			{
+				check_microphone_permissions();
+			});
+			break;
+		case Qt::PermissionStatus::Denied:
+			gui_log.error("RPCS3 has no permissions to access microphones on this device.");
+			break;
+		case Qt::PermissionStatus::Granted:
+			gui_log.notice("Microphone permission granted");
+			break;
+		}
+	});
+#endif
 }
 
 main_window::main_window(std::shared_ptr<gui_settings> gui_settings, std::shared_ptr<emu_settings> emu_settings, std::shared_ptr<persistent_settings> persistent_settings, QWidget *parent)
@@ -246,7 +330,7 @@ bool main_window::Init([[maybe_unused]] bool with_cli_boot)
 		}
 	});
 
-#if !defined(ARCH_ARM64) && (defined(_WIN32) || defined(__linux__) || defined(__APPLE__))
+#if (!defined(ARCH_ARM64) || defined(__APPLE__)) && (defined(_WIN32) || defined(__linux__) || defined(__APPLE__))
 	if (const auto update_value = m_gui_settings->GetValue(gui::m_check_upd_start).toString(); update_value != gui::update_off)
 	{
 		const bool in_background = with_cli_boot || update_value == gui::update_bkg;
@@ -306,24 +390,23 @@ QIcon main_window::GetAppIcon() const
 	return m_app_icon;
 }
 
-bool main_window::OnMissingFw()
+void main_window::OnMissingFw()
 {
 	const QString title = tr("Missing Firmware Detected!");
 	const QString message = tr("Commercial games require the firmware (PS3UPDAT.PUP file) to be installed."
-				"\n<br>For information about how to obtain the required firmware read the <a %0 href=\"https://rpcs3.net/quickstart\">quickstart guide</a>.").arg(gui::utils::get_link_style());
+	                           "\n<br>For information about how to obtain the required firmware read the <a %0 href=\"https://rpcs3.net/quickstart\">quickstart guide</a>.").arg(gui::utils::get_link_style());
 
-	QMessageBox mb(QMessageBox::Question, title, message, QMessageBox::Ok | QMessageBox::Cancel, this, Qt::Dialog | Qt::MSWindowsFixedSizeDialogHint | Qt::WindowStaysOnTopHint);
-	mb.setTextFormat(Qt::RichText);
+	QMessageBox* mb = new QMessageBox(QMessageBox::Question, title, message, QMessageBox::Ok | QMessageBox::Cancel, this, Qt::Dialog | Qt::MSWindowsFixedSizeDialogHint | Qt::WindowStaysOnTopHint);
+	mb->setTextFormat(Qt::RichText);
 
-	mb.button(QMessageBox::Ok)->setText(tr("Locate PS3UPDAT.PUP"));
+	mb->button(QMessageBox::Ok)->setText(tr("Locate PS3UPDAT.PUP"));
+	mb->setAttribute(Qt::WA_DeleteOnClose);
+	mb->open();
 
-	if (mb.exec() == QMessageBox::Ok)
+	connect(mb, &QDialog::accepted, this, [this]()
 	{
-		InstallPup();
-		return true;
-	}
-
-	return false;
+		QTimer::singleShot(1, [this](){ InstallPup(); }); // singleShot to avoid a Qt bug that causes a deletion of the sender during long slots.
+	});
 }
 
 void main_window::ResizeIcons(int index)
@@ -479,6 +562,7 @@ void main_window::show_boot_error(game_boot_result status)
 		break;
 	case game_boot_result::firmware_missing: // Handled elsewhere
 	case game_boot_result::already_added: // Handled elsewhere
+	case game_boot_result::currently_restricted:
 	case game_boot_result::no_errors:
 		return;
 	case game_boot_result::generic_error:
@@ -487,17 +571,24 @@ void main_window::show_boot_error(game_boot_result status)
 	}
 	const QString link = tr("<br /><br />For information on setting up the emulator and dumping your PS3 games, read the <a %0 href=\"https://rpcs3.net/quickstart\">quickstart guide</a>.").arg(gui::utils::get_link_style());
 
-	QMessageBox msg;
-	msg.setWindowTitle(tr("Boot Failed"));
-	msg.setIcon(QMessageBox::Critical);
-	msg.setTextFormat(Qt::RichText);
-	msg.setStandardButtons(QMessageBox::Ok);
-	msg.setText(tr("Booting failed: %1 %2").arg(message).arg(link));
-	msg.exec();
+	QMessageBox* msg = new QMessageBox();
+	msg->setWindowTitle(tr("Boot Failed"));
+	msg->setIcon(QMessageBox::Critical);
+	msg->setTextFormat(Qt::RichText);
+	msg->setStandardButtons(QMessageBox::Ok);
+	msg->setText(tr("Booting failed: %1 %2").arg(message).arg(link));
+	msg->setParent(this);
+	msg->setAttribute(Qt::WA_DeleteOnClose);
+	msg->open();
 }
 
 void main_window::Boot(const std::string& path, const std::string& title_id, bool direct, bool refresh_list, cfg_mode config_mode, const std::string& config_path)
 {
+	if (Emu.IsBootingRestricted())
+	{
+		return;
+	}
+
 	if (!m_gui_settings->GetBootConfirmation(this, gui::ib_confirm_boot))
 	{
 		return;
@@ -1033,9 +1124,16 @@ bool main_window::HandlePackageInstallation(QStringList file_paths, bool from_bo
 	pdlg.show();
 
 	// Wait for the completion
-	for (usz i = 0, set_text = umax; i < readers.size() && result.error == package_install_result::error_type::no_error;)
+	int reader_it = 0;
+	int set_text = -1;
+
+	qt_events_aware_op(5, [&, readers_size = ::narrow<int>(readers.size())]()
 	{
-		std::this_thread::sleep_for(5ms);
+		if (reader_it == readers_size || result.error != package_install_result::error_type::no_error)
+		{
+			// Exit loop
+			return true;
+		}
 
 		if (pdlg.wasCanceled())
 		{
@@ -1046,26 +1144,28 @@ bool main_window::HandlePackageInstallation(QStringList file_paths, bool from_bo
 				reader.abort_extract();
 			}
 
-			break;
+			// Exit loop
+			return true;
 		}
 
 		// Update progress window
-		const int progress = readers[i].get_progress(pdlg.maximum());
+		const int progress = readers[reader_it].get_progress(pdlg.maximum());
 		pdlg.SetValue(progress);
 
-		if (set_text != i)
+		if (set_text != reader_it)
 		{
-			pdlg.setLabelText(tr("Installing package (%0/%1), please wait...\n\n%2").arg(i + 1).arg(readers.size()).arg(get_app_info(packages[i])));
-			set_text = i;
+			pdlg.setLabelText(tr("Installing package (%0/%1), please wait...\n\n%2").arg(reader_it + 1).arg(readers_size).arg(get_app_info(packages[reader_it])));
+			set_text = reader_it;
 		}
-
-		QCoreApplication::processEvents();
 
 		if (progress == pdlg.maximum())
 		{
-			i++;
+			reader_it++;
 		}
-	}
+
+		// Process events
+		return false;
+	});
 
 	const bool success = worker();
 
@@ -1143,7 +1243,7 @@ bool main_window::HandlePackageInstallation(QStringList file_paths, bool from_bo
 					}
 				}
 
-				ShowOptionalGamePreparations(tr("Success!"), tr("Successfully installed software from package(s)!"), paths);
+				ShowOptionalGamePreparations(tr("Success!"), tr("Successfully installed software from package(s)!"), std::move(paths));
 			});
 		}
 
@@ -1317,12 +1417,18 @@ void main_window::ExtractTar()
 
 	QString error;
 
-	for (const QString& file : files)
+	auto files_it = files.begin();
+	int pdlg_progress = 0;
+
+	qt_events_aware_op(0, [&]()
 	{
-		if (pdlg.wasCanceled())
+		if (pdlg.wasCanceled() || files_it == files.end())
 		{
-			break;
+			// Exit loop
+			return true;
 		}
+
+		const QString& file = *files_it;
 
 		// Do not abort on failure here, in case the user selected a wrong file in multi-selection while the rest are valid
 		if (!extract_tar(sstr(file), sstr(dir) + '/'))
@@ -1336,9 +1442,12 @@ void main_window::ExtractTar()
 			error += file;
 		}
 
-		pdlg.SetValue(pdlg.value() + 1);
-		QApplication::processEvents();
-	}
+		pdlg_progress++;
+		pdlg.SetValue(pdlg_progress);
+
+		files_it++;
+		return false;
+	});
 
 	if (!error.isEmpty())
 	{
@@ -1522,7 +1631,7 @@ void main_window::HandlePupInstallation(const QString& file_path, const QString&
 		return;
 	}
 
-	if (std::string installed = utils::get_firmware_version(); !installed.empty())
+	if (const std::string installed = utils::get_firmware_version(); !installed.empty())
 	{
 		gui_log.warning("Reinstalling firmware: old=%s, new=%s", installed, version_string);
 
@@ -1596,18 +1705,25 @@ void main_window::HandlePupInstallation(const QString& file_path, const QString&
 		});
 
 		// Wait for the completion
-		for (uint value = progress.load(); value < update_filenames.size(); std::this_thread::sleep_for(5ms), value = progress)
+		qt_events_aware_op(5, [&]()
 		{
+			const uint value = progress.load();
+
+			if (value >= update_filenames.size())
+			{
+				return true;
+			}
+
 			if (pdlg.wasCanceled())
 			{
 				progress = -1;
-				break;
+				return true;
 			}
 
 			// Update progress window
 			pdlg.SetValue(static_cast<int>(value));
-			QCoreApplication::processEvents();
-		}
+			return false;
+		});
 
 		// Join thread
 		worker();
@@ -1730,16 +1846,31 @@ void main_window::DecryptSPRXLibraries()
 void main_window::SaveWindowState() const
 {
 	// Save gui settings
-	m_gui_settings->SetValue(gui::mw_geometry, saveGeometry());
-	m_gui_settings->SetValue(gui::mw_windowState, saveState());
-	m_gui_settings->SetValue(gui::mw_mwState, m_mw->saveState());
+	m_gui_settings->SetValue(gui::mw_geometry, saveGeometry(), false);
+	m_gui_settings->SetValue(gui::mw_windowState, saveState(), false);
 
-	// Save column settings
-	m_game_list_frame->SaveSettings();
-	// Save splitter state
-	m_debugger_frame->SaveSettings();
+	// NOTE:
+	//
+	// This method is also invoked in case the gui_application::Init() method failed ("false" was returned)
+	// to initialize some modules leaving other modules uninitialized (NULL pointed).
+	// So, the following checks on NULL pointer are provided before accessing the related module's object
 
-	m_gui_settings->sync();
+	if (m_mw)
+	{
+		m_gui_settings->SetValue(gui::mw_mwState, m_mw->saveState(), true);
+	}
+
+	if (m_game_list_frame)
+	{
+		// Save column settings
+		m_game_list_frame->SaveSettings();
+	}
+
+	if (m_debugger_frame)
+	{
+		// Save splitter state
+		m_debugger_frame->SaveSettings();
+	}
 }
 
 void main_window::RepaintThumbnailIcons()
@@ -1950,13 +2081,17 @@ void main_window::OnEmuStop()
 #endif
 	}
 
+	ui->batchRemoveShaderCachesAct->setEnabled(true);
 	ui->batchRemovePPUCachesAct->setEnabled(true);
 	ui->batchRemoveSPUCachesAct->setEnabled(true);
-	ui->batchRemoveShaderCachesAct->setEnabled(true);
-	ui->removeDiskCacheAct->setEnabled(true);
+	ui->removeHDD1CachesAct->setEnabled(true);
+	ui->removeAllCachesAct->setEnabled(true);
+	ui->removeSavestatesAct->setEnabled(true);
+	ui->cleanUpGameListAct->setEnabled(true);
 
 	ui->actionManage_Users->setEnabled(true);
 	ui->confCamerasAct->setEnabled(true);
+	ui->actionPS_Move_Tracker->setEnabled(true);
 
 	// Refresh game list in order to update time played
 	if (m_game_list_frame && m_is_list_mode)
@@ -1999,11 +2134,15 @@ void main_window::OnEmuReady() const
 
 	ui->actionManage_Users->setEnabled(false);
 	ui->confCamerasAct->setEnabled(false);
+	ui->actionPS_Move_Tracker->setEnabled(false);
 
+	ui->batchRemoveShaderCachesAct->setEnabled(false);
 	ui->batchRemovePPUCachesAct->setEnabled(false);
 	ui->batchRemoveSPUCachesAct->setEnabled(false);
-	ui->batchRemoveShaderCachesAct->setEnabled(false);
-	ui->removeDiskCacheAct->setEnabled(false);
+	ui->removeHDD1CachesAct->setEnabled(false);
+	ui->removeAllCachesAct->setEnabled(false);
+	ui->removeSavestatesAct->setEnabled(false);
+	ui->cleanUpGameListAct->setEnabled(false);
 }
 
 void main_window::EnableMenus(bool enabled) const
@@ -2121,7 +2260,7 @@ QAction* main_window::CreateRecentAction(const q_string_pair& entry, const uint&
 	{
 		if (m_rg_entries.contains(entry))
 		{
-			gui_log.warning("Recent Game not valid, removing from Boot Recent list: %s", sstr(entry.first));
+			gui_log.warning("Recent Game not valid, removing from Boot Recent list: %s", entry.first);
 
 			const int idx = m_rg_entries.indexOf(entry);
 			m_rg_entries.removeAt(idx);
@@ -2252,6 +2391,7 @@ void main_window::UpdateFilterActions()
 	ui->showCatHomeAct->setChecked(m_gui_settings->GetCategoryVisibility(Category::Home, m_is_list_mode));
 	ui->showCatAudioVideoAct->setChecked(m_gui_settings->GetCategoryVisibility(Category::Media, m_is_list_mode));
 	ui->showCatGameDataAct->setChecked(m_gui_settings->GetCategoryVisibility(Category::Data, m_is_list_mode));
+	ui->showCatOSAct->setChecked(m_gui_settings->GetCategoryVisibility(Category::OS, m_is_list_mode));
 	ui->showCatUnknownAct->setChecked(m_gui_settings->GetCategoryVisibility(Category::Unknown_Cat, m_is_list_mode));
 	ui->showCatOtherAct->setChecked(m_gui_settings->GetCategoryVisibility(Category::Others, m_is_list_mode));
 }
@@ -2363,7 +2503,7 @@ void main_window::ShowOptionalGamePreparations(const QString& title, const QStri
 			locations.insert(gui::utils::shortcut_location::applications);
 		}
 
-		QList<game_info> game_data;
+		std::vector<game_info> game_data;
 
 		for (const auto& [boot_path, title_id] : paths)
 		{
@@ -2386,7 +2526,7 @@ void main_window::ShowOptionalGamePreparations(const QString& title, const QStri
 			}
 		}
 
-		if (!game_data.isEmpty())
+		if (!game_data.empty())
 		{
 			m_game_list_frame->BatchCreateCPUCaches(game_data);
 		}
@@ -2412,6 +2552,7 @@ void main_window::CreateActions()
 	m_category_visible_act_group->addAction(ui->showCatHomeAct);
 	m_category_visible_act_group->addAction(ui->showCatAudioVideoAct);
 	m_category_visible_act_group->addAction(ui->showCatGameDataAct);
+	m_category_visible_act_group->addAction(ui->showCatOSAct);
 	m_category_visible_act_group->addAction(ui->showCatUnknownAct);
 	m_category_visible_act_group->addAction(ui->showCatOtherAct);
 	m_category_visible_act_group->setExclusive(false);
@@ -2449,6 +2590,9 @@ void main_window::CreateConnects()
 			{
 				Emu.Restart();
 			};
+
+			// Make sure we keep the game window opened
+			Emu.SetContinuousMode(true);
 		}
 
 		Emu.Kill(false, true);
@@ -2650,13 +2794,15 @@ void main_window::CreateConnects()
 	connect(ui->exitAct, &QAction::triggered, this, &QWidget::close);
 
 	connect(ui->batchCreateCPUCachesAct, &QAction::triggered, m_game_list_frame, [list = m_game_list_frame]() { list->BatchCreateCPUCaches(); });
-	connect(ui->batchRemovePPUCachesAct, &QAction::triggered, m_game_list_frame, &game_list_frame::BatchRemovePPUCaches);
-	connect(ui->batchRemoveSPUCachesAct, &QAction::triggered, m_game_list_frame, &game_list_frame::BatchRemoveSPUCaches);
-	connect(ui->batchRemoveShaderCachesAct, &QAction::triggered, m_game_list_frame, &game_list_frame::BatchRemoveShaderCaches);
 	connect(ui->batchRemoveCustomConfigurationsAct, &QAction::triggered, m_game_list_frame, &game_list_frame::BatchRemoveCustomConfigurations);
 	connect(ui->batchRemoveCustomPadConfigurationsAct, &QAction::triggered, m_game_list_frame, &game_list_frame::BatchRemoveCustomPadConfigurations);
-
-	connect(ui->removeDiskCacheAct, &QAction::triggered, this, &main_window::RemoveDiskCache);
+	connect(ui->batchRemoveShaderCachesAct, &QAction::triggered, m_game_list_frame, &game_list_frame::BatchRemoveShaderCaches);
+	connect(ui->batchRemovePPUCachesAct, &QAction::triggered, m_game_list_frame, &game_list_frame::BatchRemovePPUCaches);
+	connect(ui->batchRemoveSPUCachesAct, &QAction::triggered, m_game_list_frame, &game_list_frame::BatchRemoveSPUCaches);
+	connect(ui->removeHDD1CachesAct, &QAction::triggered, this, &main_window::RemoveHDD1Caches);
+	connect(ui->removeAllCachesAct, &QAction::triggered, this, &main_window::RemoveAllCaches);
+	connect(ui->removeSavestatesAct, &QAction::triggered, this, &main_window::RemoveSavestates);
+	connect(ui->cleanUpGameListAct, &QAction::triggered, this, &main_window::CleanUpGameList);
 
 	connect(ui->removeFirmwareCacheAct, &QAction::triggered, this, &main_window::RemoveFirmwareCache);
 	connect(ui->createFirmwareCacheAct, &QAction::triggered, this, &main_window::CreateFirmwareCache);
@@ -2703,13 +2849,14 @@ void main_window::CreateConnects()
 
 	const auto open_settings = [this](int tabIndex)
 	{
-		settings_dialog dlg(m_gui_settings, m_emu_settings, tabIndex, this);
-		connect(&dlg, &settings_dialog::GuiStylesheetRequest, this, &main_window::RequestGlobalStylesheetChange);
-		connect(&dlg, &settings_dialog::GuiRepaintRequest, this, &main_window::RepaintGui);
-		connect(&dlg, &settings_dialog::EmuSettingsApplied, this, &main_window::NotifyEmuSettingsChange);
-		connect(&dlg, &settings_dialog::EmuSettingsApplied, this, &main_window::update_gui_pad_thread);
-		connect(&dlg, &settings_dialog::EmuSettingsApplied, m_log_frame, &log_frame::LoadSettings);
-		dlg.exec();
+		settings_dialog* dlg = new settings_dialog(m_gui_settings, m_emu_settings, tabIndex, this);
+		connect(dlg, &settings_dialog::GuiStylesheetRequest, this, &main_window::RequestGlobalStylesheetChange);
+		connect(dlg, &settings_dialog::GuiRepaintRequest, this, &main_window::RepaintGui);
+		connect(dlg, &settings_dialog::EmuSettingsApplied, this, &main_window::NotifyEmuSettingsChange);
+		connect(dlg, &settings_dialog::EmuSettingsApplied, this, &main_window::update_gui_pad_thread);
+		connect(dlg, &settings_dialog::EmuSettingsApplied, m_log_frame, &log_frame::LoadSettings);
+		dlg->setAttribute(Qt::WA_DeleteOnClose);
+		dlg->open();
 	};
 
 	connect(ui->confCPUAct,    &QAction::triggered, this, [open_settings]() { open_settings(0); });
@@ -2724,7 +2871,11 @@ void main_window::CreateConnects()
 	connect(ui->confShortcutsAct, &QAction::triggered, [this]()
 	{
 		shortcut_dialog dlg(m_gui_settings, this);
-		connect(&dlg, &shortcut_dialog::saved, m_shortcut_handler, &shortcut_handler::update);
+		connect(&dlg, &shortcut_dialog::saved, this, [this]()
+		{
+			m_shortcut_handler->update();
+			NotifyShortcutHandlers();
+		});
 		dlg.exec();
 	});
 
@@ -2763,6 +2914,12 @@ void main_window::CreateConnects()
 	connect(ui->confPSMoveDS3Act, &QAction::triggered, this, [this]
 	{
 		emulated_pad_settings_dialog* dlg = new emulated_pad_settings_dialog(emulated_pad_settings_dialog::pad_type::ds3gem, this);
+		dlg->show();
+	});
+
+	connect(ui->confPSMoveAct, &QAction::triggered, this, [this]
+	{
+		emulated_pad_settings_dialog* dlg = new emulated_pad_settings_dialog(emulated_pad_settings_dialog::pad_type::gem, this);
 		dlg->show();
 	});
 
@@ -2919,6 +3076,12 @@ void main_window::CreateConnects()
 		viewer->show_log();
 	});
 
+	connect(ui->actionPS_Move_Tracker, &QAction::triggered, this, [this]
+	{
+		ps_move_tracker_dialog* dlg = new ps_move_tracker_dialog(this);
+		dlg->open();
+	});
+
 	connect(ui->toolsCheckConfigAct, &QAction::triggered, this, [this]
 	{
 		const QString path_last_cfg = m_gui_settings->GetValue(gui::fd_cfg_check).toString();
@@ -3017,6 +3180,12 @@ void main_window::CreateConnects()
 
 	connect(ui->toolsExtractTARAct, &QAction::triggered, this, &main_window::ExtractTar);
 
+	connect(ui->toolsVfsDialogAct, &QAction::triggered, this, [this]()
+	{
+		vfs_tool_dialog* dlg = new vfs_tool_dialog(this);
+		dlg->show();
+	});
+
 	connect(ui->showDebuggerAct, &QAction::triggered, this, [this](bool checked)
 	{
 		checked ? m_debugger_frame->show() : m_debugger_frame->hide();
@@ -3064,16 +3233,17 @@ void main_window::CreateConnects()
 	const auto get_cats = [this](QAction* act, int& id) -> QStringList
 	{
 		QStringList categories;
-		if      (act == ui->showCatHDDGameAct)    { categories += cat::cat_hdd_game;  id = Category::HDD_Game;    }
-		else if (act == ui->showCatDiscGameAct)   { categories += cat::cat_disc_game; id = Category::Disc_Game;   }
-		else if (act == ui->showCatPS1GamesAct)   { categories += cat::cat_ps1_game;  id = Category::PS1_Game;    }
-		else if (act == ui->showCatPS2GamesAct)   { categories += cat::ps2_games;     id = Category::PS2_Game;    }
-		else if (act == ui->showCatPSPGamesAct)   { categories += cat::psp_games;     id = Category::PSP_Game;    }
-		else if (act == ui->showCatHomeAct)       { categories += cat::cat_home;      id = Category::Home;        }
-		else if (act == ui->showCatAudioVideoAct) { categories += cat::media;         id = Category::Media;       }
-		else if (act == ui->showCatGameDataAct)   { categories += cat::data;          id = Category::Data;        }
-		else if (act == ui->showCatUnknownAct)    { categories += cat::cat_unknown;   id = Category::Unknown_Cat; }
-		else if (act == ui->showCatOtherAct)      { categories += cat::others;        id = Category::Others;      }
+		if      (act == ui->showCatHDDGameAct)    { categories.append(cat::cat_hdd_game);  id = Category::HDD_Game;    }
+		else if (act == ui->showCatDiscGameAct)   { categories.append(cat::cat_disc_game); id = Category::Disc_Game;   }
+		else if (act == ui->showCatPS1GamesAct)   { categories.append(cat::cat_ps1_game);  id = Category::PS1_Game;    }
+		else if (act == ui->showCatPS2GamesAct)   { categories.append(cat::ps2_games);     id = Category::PS2_Game;    }
+		else if (act == ui->showCatPSPGamesAct)   { categories.append(cat::psp_games);     id = Category::PSP_Game;    }
+		else if (act == ui->showCatHomeAct)       { categories.append(cat::cat_home);      id = Category::Home;        }
+		else if (act == ui->showCatAudioVideoAct) { categories.append(cat::media);         id = Category::Media;       }
+		else if (act == ui->showCatGameDataAct)   { categories.append(cat::data);          id = Category::Data;        }
+		else if (act == ui->showCatOSAct)         { categories.append(cat::os);            id = Category::OS;          }
+		else if (act == ui->showCatUnknownAct)    { categories.append(cat::cat_unknown);   id = Category::Unknown_Cat; }
+		else if (act == ui->showCatOtherAct)      { categories.append(cat::others);        id = Category::Others;      }
 		else { gui_log.warning("categoryVisibleActGroup: category action not found"); }
 		return categories;
 	};
@@ -3113,13 +3283,14 @@ void main_window::CreateConnects()
 		set_cat_count(ui->showCatHomeAct, tr("Home"));
 		set_cat_count(ui->showCatAudioVideoAct, tr("Audio/Video"));
 		set_cat_count(ui->showCatGameDataAct, tr("Game Data"));
+		set_cat_count(ui->showCatOSAct, tr("Operating System"));
 		set_cat_count(ui->showCatUnknownAct, tr("Unknown"));
 		set_cat_count(ui->showCatOtherAct, tr("Other"));
 	});
 
 	connect(ui->updateAct, &QAction::triggered, this, [this]()
 	{
-#if (!defined(_WIN32) && !defined(__linux__) && !defined(__APPLE__)) || defined(ARCH_ARM64)
+#if (!defined(_WIN32) && !defined(__linux__) && !defined(__APPLE__)) || (defined(ARCH_ARM64) && !defined(__APPLE__))
 		QMessageBox::warning(this, tr("Auto-updater"), tr("The auto-updater isn't available for your OS currently."));
 		return;
 #endif
@@ -3139,8 +3310,8 @@ void main_window::CreateConnects()
 
 	connect(ui->aboutAct, &QAction::triggered, this, [this]
 	{
-		about_dialog dlg(this);
-		dlg.exec();
+		about_dialog* dlg = new about_dialog(this);
+		dlg->open();
 	});
 
 	connect(ui->aboutQtAct, &QAction::triggered, qApp, &QApplication::aboutQt);
@@ -3495,18 +3666,100 @@ void main_window::SetIconSizeActions(int idx) const
 		ui->setIconSizeLargeAct->setChecked(true);
 }
 
-void main_window::RemoveDiskCache()
+void main_window::RemoveHDD1Caches()
 {
-	const std::string cache_dir = rpcs3::utils::get_hdd1_dir() + "/caches";
-
-	if (fs::remove_all(cache_dir, false))
+	if (fs::remove_all(rpcs3::utils::get_hdd1_dir() + "caches", false))
 	{
-		QMessageBox::information(this, tr("Cache Cleared"), tr("Disk cache was cleared successfully"));
+		QMessageBox::information(this, tr("HDD1 Caches Removed"), tr("HDD1 caches successfully removed"));
 	}
 	else
 	{
-		QMessageBox::warning(this, tr("Error"), tr("Could not remove disk cache"));
+		QMessageBox::warning(this, tr("Error"), tr("Could not remove HDD1 caches"));
 	}
+}
+
+void main_window::RemoveAllCaches()
+{
+	if (QMessageBox::question(this, tr("Confirm Removal"), tr("Remove all caches?")) != QMessageBox::Yes)
+		return;
+
+	const std::string cache_base_dir = rpcs3::utils::get_cache_dir();
+	u64 caches_count = 0;
+	u64 caches_removed = 0;
+
+	for (const game_info& game : m_game_list_frame->GetGameInfo()) // Loop on detected games
+	{
+		if (game && qstr(game->info.category) != cat::cat_ps3_os && fs::exists(cache_base_dir + game->info.serial)) // If not OS category and cache exists
+		{
+			caches_count++;
+
+			if (fs::remove_all(cache_base_dir + game->info.serial))
+			{
+				caches_removed++;
+			}
+		}
+	}
+
+	if (caches_count == caches_removed)
+	{
+		QMessageBox::information(this, tr("Caches Removed"), tr("%0 cache(s) successfully removed").arg(caches_removed));
+	}
+	else
+	{
+		QMessageBox::warning(this, tr("Error"), tr("Could not remove %0 of %1 cache(s)").arg(caches_count - caches_removed).arg(caches_count));
+	}
+
+	RemoveHDD1Caches();
+}
+
+void main_window::RemoveSavestates()
+{
+	if (QMessageBox::question(this, tr("Confirm Removal"), tr("Remove savestates?")) != QMessageBox::Yes)
+		return;
+
+	if (fs::remove_all(fs::get_config_dir() + "savestates", false))
+	{
+		QMessageBox::information(this, tr("Savestates Removed"), tr("Savestates successfully removed"));
+	}
+	else
+	{
+		QMessageBox::warning(this, tr("Error"), tr("Could not remove savestates"));
+	}
+}
+
+void main_window::CleanUpGameList()
+{
+	if (QMessageBox::question(this, tr("Confirm Removal"), tr("Remove invalid game paths from game list?\n"
+		"Undetectable games (zombies) as well as corrupted games will be removed from the game list file (games.yml)")) != QMessageBox::Yes)
+	{
+		return;
+	}
+
+	// List of serials (title id) to remove in "games.yml" file (if any)
+	std::vector<std::string> serials_to_remove_from_yml{};
+
+	for (const auto& [serial, path] : Emu.GetGamesConfig().get_games()) // Loop on game list file
+	{
+		bool found = false;
+
+		for (const game_info& game : m_game_list_frame->GetGameInfo()) // Loop on detected games
+		{
+			// If Disc Game and its serial is found in game list file
+			if (game && qstr(game->info.category) == cat::cat_disc_game && game->info.serial == serial)
+			{
+				found = true;
+				break;
+			}
+		}
+
+		if (!found) // If serial not found, add it to the removal list
+		{
+			serials_to_remove_from_yml.push_back(serial);
+		}
+	}
+
+	// Remove the found serials (title id) in "games.yml" file (if any)
+	QMessageBox::information(this, tr("Summary"), tr("%0 game(s) removed from game list").arg(Emu.RemoveGames(serials_to_remove_from_yml)));
 }
 
 void main_window::RemoveFirmwareCache()
@@ -3555,6 +3808,11 @@ void main_window::RemoveFirmwareCache()
 
 void main_window::CreateFirmwareCache()
 {
+	if (Emu.IsBootingRestricted())
+	{
+		return;
+	}
+
 	if (!m_gui_settings->GetBootConfirmation(this))
 	{
 		return;
@@ -3663,7 +3921,7 @@ void main_window::AddGamesFromDirs(QStringList&& paths)
 				{
 					if (Emu.IsPathInsideDir(game->info.path, sstr(dir_path)))
 					{
-						// Try to claim operaion on directory path
+						// Try to claim operation on directory path
 
 						std::string resolved_path = Emu.GetCallbacks().resolve_path(game->info.path);
 
@@ -3685,7 +3943,7 @@ void main_window::AddGamesFromDirs(QStringList&& paths)
 		}
 		else
 		{
-			ShowOptionalGamePreparations(tr("Success!"), tr("Successfully added software to game list from path(s)!"), paths_added);
+			ShowOptionalGamePreparations(tr("Success!"), tr("Successfully added software to game list from path(s)!"), std::move(paths_added));
 		}
 	});
 
@@ -3871,6 +4129,11 @@ void main_window::dropEvent(QDropEvent* event)
 	}
 	case drop_type::drop_game: // import valid games to gamelist (games.yaml)
 	{
+		if (Emu.IsBootingRestricted())
+		{
+			return;
+		}
+
 		if (!m_gui_settings->GetBootConfirmation(this))
 		{
 			return;

@@ -94,7 +94,6 @@ private:
 	} m_native_event_filter;
 
 	QTranslator m_translator;
-	QTranslator m_translator_qt;
 	QString m_language_code;
 
 	QTimer m_timer;
@@ -121,6 +120,7 @@ private:
 
 private Q_SLOTS:
 	void OnChangeStyleSheetRequest();
+	void OnShortcutChange();
 	void OnAppStateChanged(Qt::ApplicationState state);
 
 Q_SIGNALS:

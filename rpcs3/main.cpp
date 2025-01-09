@@ -33,7 +33,7 @@
 #ifdef _WIN32
 #include "module_verifier.hpp"
 #include "util/dyn_lib.hpp"
-
+#include <shellapi.h>
 
 // TODO(cjj19970505@live.cn)
 // When compiling with WIN32_LEAN_AND_MEAN definition
@@ -61,6 +61,7 @@ DYNAMIC_IMPORT("ntdll.dll", NtSetTimerResolution, NTSTATUS(ULONG DesiredResoluti
 
 #if defined(__APPLE__)
 #include <dispatch/dispatch.h>
+#if defined (__x86_64__)
 // sysinfo_darwin.mm
 namespace Darwin_Version
 {
@@ -68,6 +69,7 @@ namespace Darwin_Version
 	extern int getNSminorVersion();
 	extern int getNSpatchVersion();
 }
+#endif
 #endif
 
 #include "Utilities/Config.h"
@@ -250,11 +252,12 @@ LOG_CHANNEL(q_debug, "QDEBUG");
 
 struct fatal_error_listener final : logs::listener
 {
+public:
 	~fatal_error_listener() override = default;
 
 	void log(u64 /*stamp*/, const logs::message& msg, const std::string& prefix, const std::string& text) override
 	{
-		if (msg <= logs::level::fatal)
+		if (msg == logs::level::fatal || (msg == logs::level::always && m_log_always))
 		{
 			std::string _msg = "RPCS3: ";
 
@@ -274,10 +277,17 @@ struct fatal_error_listener final : logs::listener
 			_msg += '\n';
 
 			// If launched from CMD
-			utils::attach_console(utils::console_stream::std_err, false);
+			utils::attach_console(msg == logs::level::fatal ? utils::console_stream::std_err : utils::console_stream::std_out, false);
 
 			// Output to error stream as is
-			utils::output_stderr(_msg);
+			if (msg == logs::level::fatal)
+			{
+				utils::output_stderr(_msg);
+			}
+			else
+			{
+				std::cout << _msg;
+			}
 
 #ifdef _WIN32
 			if (IsDebuggerPresent())
@@ -293,6 +303,14 @@ struct fatal_error_listener final : logs::listener
 			}
 		}
 	}
+
+	void log_always(bool enabled)
+	{
+		m_log_always = enabled;
+	}
+
+private:
+	bool m_log_always = false;
 };
 
 // Arguments that force a headless application (need to be checked in create_application)
@@ -492,6 +510,7 @@ int main(int argc, char** argv)
 	}
 
 	const std::string lock_name = fs::get_cache_dir() + "RPCS3.buf";
+	const std::string log_name = fs::get_cache_dir() + "RPCS3.log";
 
 	static fs::file instance_lock;
 
@@ -510,19 +529,19 @@ int main(int argc, char** argv)
 		{
 			if (fs::exists(lock_name))
 			{
-				report_fatal_error("Another instance of RPCS3 is running.\nClose it or kill its process, if necessary.");
+				report_fatal_error(fmt::format("Another instance of RPCS3 is running.\nClose it or kill its process, if necessary.\n'%s' still exists.", lock_name));
 			}
 
-			report_fatal_error("Cannot create RPCS3.log (access denied)."
+			report_fatal_error(fmt::format("Cannot create '%s' or '%s' (access denied).\n"
 #ifdef _WIN32
-				"\nNote that RPCS3 cannot be installed in Program Files or similar directories with limited permissions."
+				"Note that RPCS3 cannot be installed in Program Files or similar directories with limited permissions."
 #else
-				"\nPlease, check RPCS3 permissions in '~/.config/rpcs3'."
+				"Please, check RPCS3 permissions."
 #endif
-			);
+				, log_name, lock_name));
 		}
 
-		report_fatal_error(fmt::format("Cannot create RPCS3.log (error %s)", fs::g_tls_error));
+		report_fatal_error(fmt::format("Cannot create'%s' or '%s' (error=%s)", log_name, lock_name, fs::g_tls_error));
 	}
 
 #ifdef _WIN32
@@ -538,7 +557,7 @@ int main(int argc, char** argv)
 	}
 #endif
 
-#ifdef __APPLE__
+#if defined(__APPLE__) && defined(__x86_64__)
 	const int osx_ver_major = Darwin_Version::getNSmajorVersion();
 	const int osx_ver_minor = Darwin_Version::getNSminorVersion();
 	if ((osx_ver_major == 14 && osx_ver_minor < 3) && (utils::get_cpu_brand().rfind("VirtualApple", 0) == 0))
@@ -549,9 +568,6 @@ int main(int argc, char** argv)
 #endif
 
 	ensure(thread_ctrl::is_main(), "Not main thread");
-
-	// Initialize TSC freq (in case it isn't)
-	static_cast<void>(utils::get_tsc_freq());
 
 	// Initialize thread pool finalizer (on first use)
 	static_cast<void>(named_thread("", [](int) {}));
@@ -566,10 +582,10 @@ int main(int argc, char** argv)
 		}
 
 		// Limit log size to ~25% of free space
-		log_file = logs::make_file_listener(fs::get_cache_dir() + "RPCS3.log", stats.avail_free / 4);
+		log_file = logs::make_file_listener(log_name, stats.avail_free / 4);
 	}
 
-	static std::unique_ptr<logs::listener> fatal_listener = std::make_unique<fatal_error_listener>();
+	static std::unique_ptr<fatal_error_listener> fatal_listener = std::make_unique<fatal_error_listener>();
 	logs::listener::add(fatal_listener.get());
 
 	{
@@ -604,10 +620,26 @@ int main(int argc, char** argv)
 	std::string argument_str;
 	for (int i = 0; i < argc; i++)
 	{
+		if (i > 0) argument_str += " ";
 		argument_str += '\'' + std::string(argv[i]) + '\'';
-		if (i != argc - 1) argument_str += " ";
 	}
+
 	sys_log.notice("argc: %d, argv: %s", argc, argument_str);
+
+#ifdef _WIN32
+	int n_args = 0;
+	if (LPWSTR* arg_list = CommandLineToArgvW(GetCommandLineW(), &n_args))
+	{
+		std::string utf8_args;
+		for (int i = 0; i < n_args; i++)
+		{
+			if (i > 0) utf8_args += " ";
+			utf8_args += '\'' + wchar_to_utf8(arg_list[i]) + '\'';
+		}
+		LocalFree(arg_list);
+		sys_log.notice("argv_utf8: %s", utf8_args);
+	}
+#endif
 
 	// Before we proceed, run some sanity checks
 	run_platform_sanity_checks();
@@ -997,6 +1029,10 @@ int main(int argc, char** argv)
 		return 0;
 	}
 
+	// Enable console output of "always" log messages.
+	// Do this after parsing any Qt cli args that might open a window.
+	fatal_listener->log_always(true);
+
 	// Log unique ID
 	gui::utils::log_uuid();
 
@@ -1079,10 +1115,10 @@ int main(int argc, char** argv)
 		{
 			if (Emu.IsPathInsideDir(emu_dir, path.toStdString()))
 			{
-				report_fatal_error(fmt::format(
+				report_fatal_error(QObject::tr(
 					"RPCS3 should never be run from a temporary location!\n"
 					"Please install RPCS3 in a persistent location.\n"
-					"Current location:\n%s", emu_dir));
+					"Current location:\n%0").arg(QString::fromStdString(emu_dir)).toStdString());
 				return 1;
 			}
 		}
@@ -1092,10 +1128,10 @@ int main(int argc, char** argv)
 		{
 			if (emu_dir.find(expr) != umax)
 			{
-				report_fatal_error(fmt::format(
+				report_fatal_error(QObject::tr(
 					"RPCS3 should never be run from an archive!\n"
 					"Please install RPCS3 in a persistent location.\n"
-					"Current location:\n%s", emu_dir));
+					"Current location:\n%0").arg(QString::fromStdString(emu_dir)).toStdString());
 				return 1;
 			}
 		}

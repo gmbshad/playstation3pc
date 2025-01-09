@@ -33,13 +33,9 @@
 #include <QWheelEvent>
 #include <QGuiApplication>
 #include <QScreen>
+#include <QTimeZone>
 
 LOG_CHANNEL(gui_log, "GUI");
-
-namespace
-{
-	inline std::string sstr(const QString& _in) { return _in.toUtf8().toStdString(); }
-}
 
 enum GameUserRole
 {
@@ -424,7 +420,7 @@ bool trophy_manager_dialog::LoadTrophyFolderToDB(const std::string& trop_name)
 	std::unique_ptr<GameTrophiesData> game_trophy_data = std::make_unique<GameTrophiesData>();
 
 	game_trophy_data->path = vfs_path;
-	game_trophy_data->trop_usr.reset(new TROPUSRLoader());
+	game_trophy_data->trop_usr = std::make_unique<TROPUSRLoader>();
 	const std::string tropusr_path = trophy_path + "/TROPUSR.DAT";
 	const std::string tropconf_path = trophy_path + "/TROPCONF.SFM";
 	const bool success = game_trophy_data->trop_usr->Load(tropusr_path, tropconf_path).success;
@@ -527,6 +523,13 @@ void trophy_manager_dialog::RepaintUI(bool restore_layout)
 		//m_trophy_table->horizontalHeader()->resizeSections(QHeaderView::ResizeMode::ResizeToContents);
 	}
 
+	if (restore_layout)
+	{
+		// Make sure the actions and the headers are synced
+		m_game_table->sync_header_actions(m_game_column_acts, [this](int col) { return m_gui_settings->GetTrophyGamelistColVisibility(static_cast<gui::trophy_game_list_columns>(col)); });
+		m_trophy_table->sync_header_actions(m_trophy_column_acts, [this](int col) { return m_gui_settings->GetTrophylistColVisibility(static_cast<gui::trophy_list_columns>(col)); });
+	}
+
 	ApplyFilter();
 
 	// Show dialog and then paint gui in order to adjust headers correctly
@@ -548,6 +551,10 @@ void trophy_manager_dialog::HandleRepaintUiRequest()
 	m_game_table->horizontalHeader()->restoreState(game_table_state);
 	m_trophy_table->horizontalHeader()->restoreState(trophy_table_state);
 
+	// Make sure the actions and the headers are synced
+	m_game_table->sync_header_actions(m_game_column_acts, [this](int col) { return m_gui_settings->GetTrophyGamelistColVisibility(static_cast<gui::trophy_game_list_columns>(col)); });
+	m_trophy_table->sync_header_actions(m_trophy_column_acts, [this](int col) { return m_gui_settings->GetTrophylistColVisibility(static_cast<gui::trophy_list_columns>(col)); });
+
 	resize(window_size);
 }
 
@@ -562,11 +569,8 @@ void trophy_manager_dialog::ResizeGameIcons()
 	placeholder.fill(Qt::transparent);
 
 	qRegisterMetaType<QVector<int>>("QVector<int>");
-	QList<int> indices;
 	for (int i = 0; i < m_game_table->rowCount(); ++i)
 	{
-		indices.append(i);
-
 		if (QTableWidgetItem* icon_item = m_game_table->item(i, static_cast<int>(gui::trophy_game_list_columns::icon)))
 		{
 			icon_item->setData(Qt::DecorationRole, placeholder);
@@ -705,7 +709,7 @@ void trophy_manager_dialog::ResizeTrophyIcons()
 							}
 							else
 							{
-								gui_log.error("Failed to load trophy icon for trophy %d (icon='%s')", trophy_id, sstr(path));
+								gui_log.error("Failed to load trophy icon for trophy %d (icon='%s')", trophy_id, path);
 							}
 						}
 					}
@@ -1027,7 +1031,7 @@ void trophy_manager_dialog::StartTrophyLoadThreads()
 	atomic_t<usz> error_count{};
 	futureWatcher.setFuture(QtConcurrent::map(indices, [this, &error_count, &folder_list](const int& i)
 	{
-		const std::string dir_name = sstr(folder_list.value(i));
+		const std::string dir_name = folder_list.value(i).toStdString();
 		gui_log.trace("Loading trophy dir: %s", dir_name);
 
 		if (!LoadTrophyFolderToDB(dir_name))
@@ -1110,7 +1114,7 @@ void trophy_manager_dialog::PopulateTrophyTable()
 
 	const int all_trophies = data->trop_usr->GetTrophiesCount();
 	const int unlocked_trophies = data->trop_usr->GetUnlockedTrophiesCount();
-	const int percentage = 100 * unlocked_trophies / all_trophies;
+	const int percentage = (all_trophies > 0) ? (100 * unlocked_trophies / all_trophies) : 0;
 
 	m_game_progress->setText(tr("Progress: %1% (%2/%3)").arg(percentage).arg(unlocked_trophies).arg(all_trophies));
 
@@ -1168,11 +1172,12 @@ void trophy_manager_dialog::PopulateTrophyTable()
 		// Get name and detail
 		for (std::shared_ptr<rXmlNode> n2 = n->GetChildren(); n2; n2 = n2->GetNext())
 		{
-			if (n2->GetName() == "name")
+			const std::string name = n2->GetName();
+			if (name == "name")
 			{
 				strcpy_trunc(details.name, n2->GetNodeContent());
 			}
-			if (n2->GetName() == "detail")
+			else if (name == "detail")
 			{
 				strcpy_trunc(details.description, n2->GetNodeContent());
 			}
@@ -1300,11 +1305,10 @@ bool trophy_manager_dialog::eventFilter(QObject *object, QEvent *event)
 void trophy_manager_dialog::closeEvent(QCloseEvent *event)
 {
 	// Save gui settings
-	m_gui_settings->SetValue(gui::tr_geometry, saveGeometry());
-	m_gui_settings->SetValue(gui::tr_splitterState, m_splitter->saveState());
-	m_gui_settings->SetValue(gui::tr_games_state,  m_game_table->horizontalHeader()->saveState());
-	m_gui_settings->SetValue(gui::tr_trophy_state, m_trophy_table->horizontalHeader()->saveState());
-	m_gui_settings->sync();
+	m_gui_settings->SetValue(gui::tr_geometry, saveGeometry(), false);
+	m_gui_settings->SetValue(gui::tr_splitterState, m_splitter->saveState(), false);
+	m_gui_settings->SetValue(gui::tr_games_state,  m_game_table->horizontalHeader()->saveState(), false);
+	m_gui_settings->SetValue(gui::tr_trophy_state, m_trophy_table->horizontalHeader()->saveState(), true);
 
 	QWidget::closeEvent(event);
 }
@@ -1337,7 +1341,7 @@ QDateTime trophy_manager_dialog::TickToDateTime(u64 tick)
 	const QDateTime datetime(
 		QDate(rtc_date.year, rtc_date.month, rtc_date.day),
 		QTime(rtc_date.hour, rtc_date.minute, rtc_date.second, rtc_date.microsecond / 1000),
-		Qt::TimeSpec::UTC);
+		QTimeZone::UTC);
 	return datetime.toLocalTime();
 }
 

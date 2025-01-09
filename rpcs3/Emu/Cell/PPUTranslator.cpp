@@ -3,6 +3,7 @@
 
 #include "Emu/system_config.h"
 #include "Emu/Cell/Common.h"
+#include "Emu/Cell/lv2/sys_sync.h"
 #include "PPUTranslator.h"
 #include "PPUThread.h"
 #include "SPUThread.h"
@@ -16,19 +17,67 @@
 #include <unordered_set>
 #include <span>
 
+#ifdef ARCH_ARM64
+#include "Emu/CPU/Backends/AArch64/AArch64JIT.h"
+#include "Emu/IdManager.h"
+#include "Utilities/ppu_patch.h"
+#endif
+
 using namespace llvm;
 
 const ppu_decoder<PPUTranslator> s_ppu_decoder;
 extern const ppu_decoder<ppu_itype> g_ppu_itype;
 extern const ppu_decoder<ppu_iname> g_ppu_iname;
 
-PPUTranslator::PPUTranslator(LLVMContext& context, Module* _module, const ppu_module& info, ExecutionEngine& engine)
+PPUTranslator::PPUTranslator(LLVMContext& context, Module* _module, const ppu_module<lv2_obj>& info, ExecutionEngine& engine)
 	: cpu_translator(_module, false)
 	, m_info(info)
 	, m_pure_attr()
 {
 	// Bind context
 	cpu_translator::initialize(context, engine);
+
+	// Initialize transform passes
+	clear_transforms();
+
+#ifdef ARCH_ARM64
+	{
+		// Base reg table definition
+		// Assume all functions named __0x... are PPU functions and take the m_exec as the first arg
+		std::vector<std::pair<std::string, aarch64::gpr>> base_reg_lookup = {
+			{ "__0x", aarch64::x20 }, // PPU blocks
+			{ "__indirect", aarch64::x20 }, // Indirect jumps
+			{ "ppu_", aarch64::x19 }, // Fixed JIT helpers (e.g ppu_gateway)
+			{ "__", aarch64::x19 }    // Probably link table entries
+		};
+
+		// Build list of imposter functions built by the patch manager.
+		g_fxo->need<ppu_patch_block_registry_t>();
+		std::vector<std::string> faux_functions_list;
+		for (const auto& a : g_fxo->get<ppu_patch_block_registry_t>().block_addresses)
+		{
+			faux_functions_list.push_back(fmt::format("__0x%x", a));
+		}
+
+		aarch64::GHC_frame_preservation_pass::config_t config =
+		{
+			.debug_info = false,         // Set to "true" to insert debug frames on x27
+			.use_stack_frames = false,   // We don't need this since the PPU GW allocates global scratch on the stack
+			.hypervisor_context_offset = ::offset32(&ppu_thread::hv_ctx),
+			.exclusion_callback = {},    // Unused, we don't have special exclusion functions on PPU
+			.base_register_lookup = base_reg_lookup,
+			.faux_function_list = std::move(faux_functions_list)
+		};
+
+		// Create transform pass
+		std::unique_ptr<translator_pass> ghc_fixup_pass = std::make_unique<aarch64::GHC_frame_preservation_pass>(config);
+
+		// Register it
+		register_transform_pass(ghc_fixup_pass);
+	}
+#endif
+
+	reset_transforms();
 
 	// Thread context struct (TODO: safer member access)
 	const u32 off0 = offset32(&ppu_thread::state);
@@ -270,11 +319,11 @@ Function* PPUTranslator::Translate(const ppu_function& info)
 		}
 	}
 
-	replace_intrinsics(*m_function);
+	run_transforms(*m_function);
 	return m_function;
 }
 
-Function* PPUTranslator::GetSymbolResolver(const ppu_module& info)
+Function* PPUTranslator::GetSymbolResolver(const ppu_module<lv2_obj>& info)
 {
 	m_function = cast<Function>(m_module->getOrInsertFunction("__resolve_symbols", FunctionType::get(get_type<void>(), { get_type<u8*>(), get_type<u64>() }, false)).getCallee());
 
@@ -322,7 +371,7 @@ Function* PPUTranslator::GetSymbolResolver(const ppu_module& info)
 	{
 		// Possible special case for no functions (allowing the do-while optimization)
 		m_ir->CreateRetVoid();
-		replace_intrinsics(*m_function);
+		run_transforms(*m_function);
 		return m_function;
 	}
 
@@ -380,7 +429,7 @@ Function* PPUTranslator::GetSymbolResolver(const ppu_module& info)
 
 	m_ir->CreateRetVoid();
 
-	replace_intrinsics(*m_function);
+	run_transforms(*m_function);
 	return m_function;
 }
 
@@ -5345,7 +5394,7 @@ void PPUTranslator::build_interpreter()
 		this->i(op); \
 		FlushRegisters(); \
 		m_ir->CreateRetVoid(); \
-		replace_intrinsics(*m_function); \
+		run_transforms(*m_function); \
 	}
 
 	BUILD_VEC_INST(VADDCUW);

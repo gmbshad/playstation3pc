@@ -4,6 +4,7 @@
 #include "sdl_pad_handler.h"
 #include "Emu/system_utils.hpp"
 #include "Emu/system_config.h"
+#include "Emu/System.h"
 
 #include <mutex>
 
@@ -21,6 +22,12 @@ public:
 			sdl_log.notice("Quitting SDL ...");
 			SDL_Quit();
 		}
+	}
+
+	static sdl_instance& get_instance()
+	{
+		static sdl_instance instance {};
+		return instance;
 	}
 
 	bool initialize()
@@ -114,9 +121,6 @@ private:
 	bool m_initialized = false;
 };
 
-constexpr u32 rumble_duration_ms = 500; // Some high number to keep rumble updates at a minimum.
-constexpr u32 rumble_refresh_ms = rumble_duration_ms - 100; // We need to keep updating the rumble. Choose a refresh timeout that is unlikely to run into missed rumble updates.
-
 sdl_pad_handler::sdl_pad_handler() : PadHandlerBase(pad_handler::sdl)
 {
 	button_list =
@@ -175,6 +179,7 @@ sdl_pad_handler::sdl_pad_handler() : PadHandlerBase(pad_handler::sdl)
 	b_has_rgb = true;
 	b_has_battery = true;
 	b_has_battery_led = true;
+	b_has_orientation = true;
 
 	m_trigger_threshold = trigger_max / 2;
 	m_thumb_threshold = thumb_max / 2;
@@ -228,6 +233,8 @@ void sdl_pad_handler::init_config(cfg_pad* cfg)
 	cfg->l3.def       = ::at32(button_list, SDLKeyCodes::LS);
 
 	cfg->pressure_intensity_button.def = ::at32(button_list, SDLKeyCodes::None);
+	cfg->analog_limiter_button.def = ::at32(button_list, SDLKeyCodes::None);
+	cfg->orientation_reset_button.def = ::at32(button_list, SDLKeyCodes::None);
 
 	// Set default misc variables
 	cfg->lstick_anti_deadzone.def = static_cast<u32>(0.13 * thumb_max); // 13%
@@ -258,8 +265,14 @@ bool sdl_pad_handler::Init()
 	if (m_is_init)
 		return true;
 
-	static sdl_instance s_sdl_instance {};
-	if (!s_sdl_instance.initialize())
+	bool instance_success;
+
+	Emu.BlockingCallFromMainThread([&instance_success]()
+	{
+		instance_success = sdl_instance::get_instance().initialize();
+	});
+
+	if (!instance_success)
 		return false;
 
 	if (g_cfg.io.load_sdl_mappings)
@@ -721,14 +734,14 @@ void sdl_pad_handler::get_extended_info(const pad_ensemble& binding)
 		}
 		else
 		{
-			const float& accel_x = dev->values_accel[0]; // Angular speed around the x axis (pitch)
-			const float& accel_y = dev->values_accel[1]; // Angular speed around the y axis (yaw)
-			const float& accel_z = dev->values_accel[2]; // Angular speed around the z axis (roll
+			const f32 accel_x = dev->values_accel[0]; // Angular speed around the x axis (pitch)
+			const f32 accel_y = dev->values_accel[1]; // Angular speed around the y axis (yaw)
+			const f32 accel_z = dev->values_accel[2]; // Angular speed around the z axis (roll
 
 			// Convert to ds3. The ds3 resolution is 113/G.
-			pad->m_sensors[0].m_value = Clamp0To1023((accel_x / SDL_STANDARD_GRAVITY) * -1 * 113 + 512);
-			pad->m_sensors[1].m_value = Clamp0To1023((accel_y / SDL_STANDARD_GRAVITY) * -1 * 113 + 512);
-			pad->m_sensors[2].m_value = Clamp0To1023((accel_z / SDL_STANDARD_GRAVITY) * -1 * 113 + 512);
+			pad->m_sensors[0].m_value = Clamp0To1023((accel_x / SDL_STANDARD_GRAVITY) * -1 * MOTION_ONE_G + 512);
+			pad->m_sensors[1].m_value = Clamp0To1023((accel_y / SDL_STANDARD_GRAVITY) * -1 * MOTION_ONE_G + 512);
+			pad->m_sensors[2].m_value = Clamp0To1023((accel_z / SDL_STANDARD_GRAVITY) * -1 * MOTION_ONE_G + 512);
 		}
 	}
 
@@ -740,15 +753,19 @@ void sdl_pad_handler::get_extended_info(const pad_ensemble& binding)
 		}
 		else
 		{
-			//const float& gyro_x = dev->values_gyro[0]; // Angular speed around the x axis (pitch)
-			const float& gyro_y = dev->values_gyro[1]; // Angular speed around the y axis (yaw)
-			//const float& gyro_z = dev->values_gyro[2]; // Angular speed around the z axis (roll)
+			//const f32 gyro_x = dev->values_gyro[0]; // Angular speed around the x axis (pitch)
+			const f32 gyro_y = dev->values_gyro[1]; // Angular speed around the y axis (yaw)
+			//const f32 gyro_z = dev->values_gyro[2]; // Angular speed around the z axis (roll)
 
 			// Convert to ds3. The ds3 resolution is 123/90°/sec. The SDL gyro is measured in rad/sec.
-			static constexpr f32 PI = 3.14159265f;
-			const float degree = (gyro_y * 180.0f / PI);
+			const f32 degree = rad_to_degree(gyro_y);
 			pad->m_sensors[3].m_value = Clamp0To1023(degree * (123.f / 90.f) + 512);
 		}
+	}
+
+	if (dev->sdl.has_accel || dev->sdl.has_gyro)
+	{
+		set_raw_orientation(*pad);
 	}
 }
 
@@ -762,14 +779,14 @@ void sdl_pad_handler::get_motion_sensors(const std::string& pad_id, const motion
 	PadHandlerBase::get_motion_sensors(pad_id, callback, fail_callback, preview_values, sensors);
 }
 
-PadHandlerBase::connection sdl_pad_handler::get_next_button_press(const std::string& padId, const pad_callback& callback, const pad_fail_callback& fail_callback, bool get_blacklist, const std::vector<std::string>& buttons)
+PadHandlerBase::connection sdl_pad_handler::get_next_button_press(const std::string& padId, const pad_callback& callback, const pad_fail_callback& fail_callback, gui_call_type call_type, const std::vector<std::string>& buttons)
 {
 	if (!m_is_init)
 		return connection::disconnected;
 
 	SDL_PumpEvents();
 
-	return PadHandlerBase::get_next_button_press(padId, callback, fail_callback, get_blacklist, buttons);
+	return PadHandlerBase::get_next_button_press(padId, callback, fail_callback, call_type, buttons);
 }
 
 void sdl_pad_handler::apply_pad_data(const pad_ensemble& binding)
@@ -791,21 +808,21 @@ void sdl_pad_handler::apply_pad_data(const pad_ensemble& binding)
 		const u8 speed_large = cfg->enable_vibration_motor_large ? pad->m_vibrateMotors[idx_l].m_value : 0;
 		const u8 speed_small = cfg->enable_vibration_motor_small ? pad->m_vibrateMotors[idx_s].m_value : 0;
 
-		dev->has_new_rumble_data |= dev->large_motor != speed_large || dev->small_motor != speed_small;
+		dev->new_output_data |= dev->large_motor != speed_large || dev->small_motor != speed_small;
 
 		dev->large_motor = speed_large;
 		dev->small_motor = speed_small;
 
-		const steady_clock::time_point now = steady_clock::now();
-		const s64 elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - dev->last_vibration).count();
+		const auto now = steady_clock::now();
+		const auto elapsed = now - dev->last_output;
 
 		// XBox One Controller can't handle faster vibration updates than ~10ms. Elite is even worse. So I'll use 20ms to be on the safe side. No lag was noticable.
-		if ((dev->has_new_rumble_data && elapsed_ms > 20) || (elapsed_ms > rumble_refresh_ms))
+		if ((dev->new_output_data && elapsed > 20ms) || elapsed > min_output_interval)
 		{
 			set_rumble(dev, speed_large, speed_small);
 
-			dev->has_new_rumble_data = false;
-			dev->last_vibration = steady_clock::now();
+			dev->new_output_data = false;
+			dev->last_output = now;
 		}
 	}
 
@@ -878,6 +895,8 @@ void sdl_pad_handler::apply_pad_data(const pad_ensemble& binding)
 void sdl_pad_handler::set_rumble(SDLDevice* dev, u8 speed_large, u8 speed_small)
 {
 	if (!dev || !dev->sdl.game_controller) return;
+
+	constexpr u32 rumble_duration_ms = static_cast<u32>((min_output_interval + 100ms).count()); // Some number higher than the min_output_interval.
 
 	if (dev->sdl.has_rumble)
 	{
