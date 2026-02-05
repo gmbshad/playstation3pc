@@ -35,6 +35,8 @@ public:
 	{
 		SDL_Gamepad* gamepad = nullptr;
 		SDL_GamepadType type = SDL_GamepadType::SDL_GAMEPAD_TYPE_UNKNOWN;
+		SDL_GamepadType real_type = SDL_GamepadType::SDL_GAMEPAD_TYPE_UNKNOWN;
+		SDL_GUID guid {};
 		int power_level = 0;
 		int last_power_level = 0;
 
@@ -47,6 +49,7 @@ public:
 		u16 firmware_version = 0;
 
 		bool is_virtual_device = false;
+		bool is_ds3_with_pressure_buttons = false;
 
 		bool has_led = false;
 		bool has_mono_led = false;
@@ -98,6 +101,11 @@ class sdl_pad_handler : public PadHandlerBase
 		Back,
 		Guide,
 		Misc1,
+		Misc2,
+		Misc3,
+		Misc4,
+		Misc5,
+		Misc6,
 		RPaddle1,
 		LPaddle1,
 		RPaddle2,
@@ -119,7 +127,21 @@ class sdl_pad_handler : public PadHandlerBase
 		RSXNeg,
 		RSXPos,
 		RSYNeg,
-		RSYPos
+		RSYPos,
+
+		// DS3 Pressure sensitive buttons (reported as axis)
+		PressureBegin,
+		PressureCross,    // Cross        axis 6
+		PressureCircle,   // Circle       axis 7
+		PressureSquare,   // Square       axis 8
+		PressureTriangle, // Triangle     axis 9
+		PressureL1,       // L1           axis 10
+		PressureR1,       // R1           axis 11
+		PressureUp,       // D-Pad Up     axis 12
+		PressureDown,     // D-Pad Down   axis 13
+		PressureLeft,     // D-Pad Left   axis 14
+		PressureRight,    // D-Pad Right  axis 15
+		PressureEnd,
 	};
 
 public:
@@ -136,6 +158,7 @@ public:
 	u32 get_battery_level(const std::string& padId) override;
 	void get_motion_sensors(const std::string& pad_id, const motion_callback& callback, const motion_fail_callback& fail_callback, motion_preview_values preview_values, const std::array<AnalogSensor, 4>& sensors) override;
 	connection get_next_button_press(const std::string& padId, const pad_callback& callback, const pad_fail_callback& fail_callback, gui_call_type call_type, const std::vector<std::string>& buttons) override;
+	pad_capabilities get_capabilities(const std::string& pad_id) override;
 
 private:
 	// pseudo 'controller id' to keep track of unique controllers

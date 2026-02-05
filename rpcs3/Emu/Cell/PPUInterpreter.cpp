@@ -38,11 +38,13 @@ void ppubreak(ppu_thread& ppu)
 	}
 }
 
+#define PPU_WRITE(type, addr, value) vm::write<type>(addr, value, &ppu);
 #define PPU_WRITE_8(addr, value) vm::write8(addr, value, &ppu);
 #define PPU_WRITE_16(addr, value) vm::write16(addr, value, &ppu);
 #define PPU_WRITE_32(addr, value) vm::write32(addr, value, &ppu);
 #define PPU_WRITE_64(addr, value) vm::write64(addr, value, &ppu);
 #else
+#define PPU_WRITE(type, addr, value) vm::write<type>(addr, value);
 #define PPU_WRITE_8(addr, value) vm::write8(addr, value);
 #define PPU_WRITE_16(addr, value) vm::write16(addr, value);
 #define PPU_WRITE_32(addr, value) vm::write32(addr, value);
@@ -137,7 +139,7 @@ struct ppu_exec_select
 #define RETURN_(...) \
 	if constexpr (Build == 0) { \
 		static_cast<void>(exec); \
-		if (is_debugger_present()) return +[](ppu_thread& ppu, ppu_opcode_t op, be_t<u32>* this_op, ppu_intrp_func* next_fn) { \
+		if (is_debugger_present() || g_cfg.core.ppu_debug) return +[](ppu_thread& ppu, ppu_opcode_t op, be_t<u32>* this_op, ppu_intrp_func* next_fn) { \
 			exec(__VA_ARGS__); \
 			const auto next_op = this_op + 1; \
 			const auto fn = atomic_storage<ppu_intrp_func_t>::load(next_fn->fn); \
@@ -484,6 +486,7 @@ auto ppu_feed_data(ppu_thread& ppu, u64 addr)
 		{
 			// Reservation was lost
 			ppu.raddr = 0;
+			ppu.res_cached = 0;
 		}
 	}
 	else
@@ -503,6 +506,7 @@ auto ppu_feed_data(ppu_thread& ppu, u64 addr)
 		if (std::memcmp(buffer + offs, src, size))
 		{
 			ppu.raddr = 0;
+			ppu.res_cached = 0;
 		}
 	}
 
@@ -3479,7 +3483,7 @@ auto RLWIMI()
 
 	static const auto exec = [](ppu_thread& ppu, ppu_opcode_t op) {
 	const u64 mask = ppu_rotate_mask(32 + op.mb32, 32 + op.me32);
-	ppu.gpr[op.ra] = (ppu.gpr[op.ra] & ~mask) | (dup32(utils::rol32(static_cast<u32>(ppu.gpr[op.rs]), op.sh32)) & mask);
+	ppu.gpr[op.ra] = (ppu.gpr[op.ra] & ~mask) | (dup32(std::rotl<u32>(static_cast<u32>(ppu.gpr[op.rs]), op.sh32)) & mask);
 	if constexpr (((Flags == has_rc) || ...))
 		ppu_cr_set<s64>(ppu, 0, ppu.gpr[op.ra], 0);
 	};
@@ -3493,7 +3497,7 @@ auto RLWINM()
 		return ppu_exec_select<Flags...>::template select<>();
 
 	static const auto exec = [](ppu_thread& ppu, ppu_opcode_t op) {
-	ppu.gpr[op.ra] = dup32(utils::rol32(static_cast<u32>(ppu.gpr[op.rs]), op.sh32)) & ppu_rotate_mask(32 + op.mb32, 32 + op.me32);
+	ppu.gpr[op.ra] = dup32(std::rotl<u32>(static_cast<u32>(ppu.gpr[op.rs]), op.sh32)) & ppu_rotate_mask(32 + op.mb32, 32 + op.me32);
 	if constexpr (((Flags == has_rc) || ...))
 		ppu_cr_set<s64>(ppu, 0, ppu.gpr[op.ra], 0);
 	};
@@ -3507,7 +3511,7 @@ auto RLWNM()
 		return ppu_exec_select<Flags...>::template select<>();
 
 	static const auto exec = [](ppu_thread& ppu, ppu_opcode_t op) {
-	ppu.gpr[op.ra] = dup32(utils::rol32(static_cast<u32>(ppu.gpr[op.rs]), ppu.gpr[op.rb] & 0x1f)) & ppu_rotate_mask(32 + op.mb32, 32 + op.me32);
+	ppu.gpr[op.ra] = dup32(std::rotl<u32>(static_cast<u32>(ppu.gpr[op.rs]), ppu.gpr[op.rb] & 0x1f)) & ppu_rotate_mask(32 + op.mb32, 32 + op.me32);
 	if constexpr (((Flags == has_rc) || ...))
 		ppu_cr_set<s64>(ppu, 0, ppu.gpr[op.ra], 0);
 	};
@@ -3595,7 +3599,7 @@ auto RLDICL()
 		return ppu_exec_select<Flags...>::template select<>();
 
 	static const auto exec = [](ppu_thread& ppu, ppu_opcode_t op) {
-	ppu.gpr[op.ra] = utils::rol64(ppu.gpr[op.rs], op.sh64) & (~0ull >> op.mbe64);
+	ppu.gpr[op.ra] = std::rotl<u64>(ppu.gpr[op.rs], op.sh64) & (~0ull >> op.mbe64);
 	if constexpr (((Flags == has_rc) || ...))
 		ppu_cr_set<s64>(ppu, 0, ppu.gpr[op.ra], 0);
 	};
@@ -3609,7 +3613,7 @@ auto RLDICR()
 		return ppu_exec_select<Flags...>::template select<>();
 
 	static const auto exec = [](ppu_thread& ppu, ppu_opcode_t op) {
-	ppu.gpr[op.ra] = utils::rol64(ppu.gpr[op.rs], op.sh64) & (~0ull << (op.mbe64 ^ 63));
+	ppu.gpr[op.ra] = std::rotl<u64>(ppu.gpr[op.rs], op.sh64) & (~0ull << (op.mbe64 ^ 63));
 	if constexpr (((Flags == has_rc) || ...))
 		ppu_cr_set<s64>(ppu, 0, ppu.gpr[op.ra], 0);
 	};
@@ -3623,7 +3627,7 @@ auto RLDIC()
 		return ppu_exec_select<Flags...>::template select<>();
 
 	static const auto exec = [](ppu_thread& ppu, ppu_opcode_t op) {
-	ppu.gpr[op.ra] = utils::rol64(ppu.gpr[op.rs], op.sh64) & ppu_rotate_mask(op.mbe64, op.sh64 ^ 63);
+	ppu.gpr[op.ra] = std::rotl<u64>(ppu.gpr[op.rs], op.sh64) & ppu_rotate_mask(op.mbe64, op.sh64 ^ 63);
 	if constexpr (((Flags == has_rc) || ...))
 		ppu_cr_set<s64>(ppu, 0, ppu.gpr[op.ra], 0);
 	};
@@ -3638,7 +3642,7 @@ auto RLDIMI()
 
 	static const auto exec = [](ppu_thread& ppu, ppu_opcode_t op) {
 	const u64 mask = ppu_rotate_mask(op.mbe64, op.sh64 ^ 63);
-	ppu.gpr[op.ra] = (ppu.gpr[op.ra] & ~mask) | (utils::rol64(ppu.gpr[op.rs], op.sh64) & mask);
+	ppu.gpr[op.ra] = (ppu.gpr[op.ra] & ~mask) | (std::rotl<u64>(ppu.gpr[op.rs], op.sh64) & mask);
 	if constexpr (((Flags == has_rc) || ...))
 		ppu_cr_set<s64>(ppu, 0, ppu.gpr[op.ra], 0);
 	};
@@ -3652,7 +3656,7 @@ auto RLDCL()
 		return ppu_exec_select<Flags...>::template select<>();
 
 	static const auto exec = [](ppu_thread& ppu, ppu_opcode_t op) {
-	ppu.gpr[op.ra] = utils::rol64(ppu.gpr[op.rs], ppu.gpr[op.rb] & 0x3f) & (~0ull >> op.mbe64);
+	ppu.gpr[op.ra] = std::rotl<u64>(ppu.gpr[op.rs], ppu.gpr[op.rb] & 0x3f) & (~0ull >> op.mbe64);
 	if constexpr (((Flags == has_rc) || ...))
 		ppu_cr_set<s64>(ppu, 0, ppu.gpr[op.ra], 0);
 	};
@@ -3666,7 +3670,7 @@ auto RLDCR()
 		return ppu_exec_select<Flags...>::template select<>();
 
 	static const auto exec = [](ppu_thread& ppu, ppu_opcode_t op) {
-	ppu.gpr[op.ra] = utils::rol64(ppu.gpr[op.rs], ppu.gpr[op.rb] & 0x3f) & (~0ull << (op.mbe64 ^ 63));
+	ppu.gpr[op.ra] = std::rotl<u64>(ppu.gpr[op.rs], ppu.gpr[op.rb] & 0x3f) & (~0ull << (op.mbe64 ^ 63));
 	if constexpr (((Flags == has_rc) || ...))
 		ppu_cr_set<s64>(ppu, 0, ppu.gpr[op.ra], 0);
 	};
@@ -4571,7 +4575,7 @@ auto STVX()
 
 	static const auto exec = [](ppu_thread& ppu, ppu_opcode_t op) {
 	const u64 addr = (op.ra ? ppu.gpr[op.ra] + ppu.gpr[op.rb] : ppu.gpr[op.rb]) & ~0xfull;
-	vm::_ref<v128>(vm::cast(addr)) = ppu.vr[op.vs];
+	PPU_WRITE(v128, vm::cast(addr), ppu.vr[op.vs]);
 	};
 	RETURN_(ppu, op);
 }
@@ -5072,7 +5076,7 @@ auto STVXL()
 
 	static const auto exec = [](ppu_thread& ppu, ppu_opcode_t op) {
 	const u64 addr = (op.ra ? ppu.gpr[op.ra] + ppu.gpr[op.rb] : ppu.gpr[op.rb]) & ~0xfull;
-	vm::_ref<v128>(vm::cast(addr)) = ppu.vr[op.vs];
+	PPU_WRITE(v128, vm::cast(addr), ppu.vr[op.vs]);
 	};
 	RETURN_(ppu, op);
 }
@@ -5361,7 +5365,7 @@ auto STDBRX()
 
 	static const auto exec = [](ppu_thread& ppu, ppu_opcode_t op) {
 	const u64 addr = op.ra ? ppu.gpr[op.ra] + ppu.gpr[op.rb] : ppu.gpr[op.rb];
-	vm::_ref<le_t<u64>>(vm::cast(addr)) = ppu.gpr[op.rs];
+	PPU_WRITE(le_t<u64>, vm::cast(addr), ppu.gpr[op.rs]);
 	};
 	RETURN_(ppu, op);
 }
@@ -5400,7 +5404,7 @@ auto STWBRX()
 
 	static const auto exec = [](ppu_thread& ppu, ppu_opcode_t op) {
 	const u64 addr = op.ra ? ppu.gpr[op.ra] + ppu.gpr[op.rb] : ppu.gpr[op.rb];
-	vm::_ref<le_t<u32>>(vm::cast(addr)) = static_cast<u32>(ppu.gpr[op.rs]);
+	PPU_WRITE(le_t<u32>, vm::cast(addr), static_cast<u32>(ppu.gpr[op.rs]));
 	};
 	RETURN_(ppu, op);
 }
@@ -5413,7 +5417,7 @@ auto STFSX()
 
 	static const auto exec = [](ppu_thread& ppu, ppu_opcode_t op) {
 	const u64 addr = op.ra ? ppu.gpr[op.ra] + ppu.gpr[op.rb] : ppu.gpr[op.rb];
-	vm::_ref<f32>(vm::cast(addr)) = static_cast<float>(ppu.fpr[op.frs]);
+	PPU_WRITE(f32, vm::cast(addr), static_cast<float>(ppu.fpr[op.frs]));
 	};
 	RETURN_(ppu, op);
 }
@@ -5444,7 +5448,7 @@ auto STFSUX()
 
 	static const auto exec = [](ppu_thread& ppu, ppu_opcode_t op) {
 	const u64 addr = ppu.gpr[op.ra] + ppu.gpr[op.rb];
-	vm::_ref<f32>(vm::cast(addr)) = static_cast<float>(ppu.fpr[op.frs]);
+	PPU_WRITE(f32, vm::cast(addr), static_cast<float>(ppu.fpr[op.frs]));
 	ppu.gpr[op.ra] = addr;
 	};
 	RETURN_(ppu, op);
@@ -5494,7 +5498,7 @@ auto STFDX()
 
 	static const auto exec = [](ppu_thread& ppu, ppu_opcode_t op) {
 	const u64 addr = op.ra ? ppu.gpr[op.ra] + ppu.gpr[op.rb] : ppu.gpr[op.rb];
-	vm::_ref<f64>(vm::cast(addr)) = ppu.fpr[op.frs];
+	PPU_WRITE(f64, vm::cast(addr), ppu.fpr[op.frs]);
 	};
 	RETURN_(ppu, op);
 }
@@ -5507,7 +5511,7 @@ auto STFDUX()
 
 	static const auto exec = [](ppu_thread& ppu, ppu_opcode_t op) {
 	const u64 addr = ppu.gpr[op.ra] + ppu.gpr[op.rb];
-	vm::_ref<f64>(vm::cast(addr)) = ppu.fpr[op.frs];
+	PPU_WRITE(f64, vm::cast(addr), ppu.fpr[op.frs]);
 	ppu.gpr[op.ra] = addr;
 	};
 	RETURN_(ppu, op);
@@ -5662,7 +5666,7 @@ auto STHBRX()
 
 	static const auto exec = [](ppu_thread& ppu, ppu_opcode_t op) {
 	const u64 addr = op.ra ? ppu.gpr[op.ra] + ppu.gpr[op.rb] : ppu.gpr[op.rb];
-	vm::_ref<le_t<u16>>(vm::cast(addr)) = static_cast<u16>(ppu.gpr[op.rs]);
+	PPU_WRITE(le_t<u16>, vm::cast(addr), static_cast<u16>(ppu.gpr[op.rs]));
 	};
 	RETURN_(ppu, op);
 }
@@ -6052,7 +6056,7 @@ auto STFS()
 
 	static const auto exec = [](ppu_thread& ppu, ppu_opcode_t op) {
 	const u64 addr = op.ra || 1 ? ppu.gpr[op.ra] + op.simm16 : op.simm16;
-	vm::_ref<f32>(vm::cast(addr)) = static_cast<float>(ppu.fpr[op.frs]);
+	PPU_WRITE(f32, vm::cast(addr), static_cast<float>(ppu.fpr[op.frs]));
 	};
 	RETURN_(ppu, op);
 }
@@ -6065,7 +6069,7 @@ auto STFSU()
 
 	static const auto exec = [](ppu_thread& ppu, ppu_opcode_t op) {
 	const u64 addr = ppu.gpr[op.ra] + op.simm16;
-	vm::_ref<f32>(vm::cast(addr)) = static_cast<float>(ppu.fpr[op.frs]);
+	PPU_WRITE(f32, vm::cast(addr), static_cast<float>(ppu.fpr[op.frs]));
 	ppu.gpr[op.ra] = addr;
 	};
 	RETURN_(ppu, op);
@@ -6079,7 +6083,7 @@ auto STFD()
 
 	static const auto exec = [](ppu_thread& ppu, ppu_opcode_t op) {
 	const u64 addr = op.ra || 1 ? ppu.gpr[op.ra] + op.simm16 : op.simm16;
-	vm::_ref<f64>(vm::cast(addr)) = ppu.fpr[op.frs];
+	PPU_WRITE(f64, vm::cast(addr), ppu.fpr[op.frs]);
 	};
 	RETURN_(ppu, op);
 }
@@ -6092,7 +6096,7 @@ auto STFDU()
 
 	static const auto exec = [](ppu_thread& ppu, ppu_opcode_t op) {
 	const u64 addr = ppu.gpr[op.ra] + op.simm16;
-	vm::_ref<f64>(vm::cast(addr)) = ppu.fpr[op.frs];
+	PPU_WRITE(f64, vm::cast(addr), ppu.fpr[op.frs]);
 	ppu.gpr[op.ra] = addr;
 	};
 	RETURN_(ppu, op);
@@ -7655,8 +7659,8 @@ ppu_interpreter_rt_base::ppu_interpreter_rt_base() noexcept
 	INIT(LBZUX);
 	INIT_RC(NOR);
 	INIT(STVEBX);
-	INIT_OV(SUBFE);
-	INIT_OV(ADDE);
+	INIT_RC_OV(SUBFE);
+	INIT_RC_OV(ADDE);
 	INIT(MTOCRF);
 	INIT(STDX);
 	INIT(STWCX);

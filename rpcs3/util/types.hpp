@@ -214,6 +214,14 @@ using atomic_be_t = atomic_t<be_t<T>, Align>;
 template <typename T, usz Align = alignof(T)>
 using atomic_le_t = atomic_t<le_t<T>, Align>;
 
+// Removes be_t<> wrapper from type be_<T> with nop fallback for unwrapped T
+template<typename T>
+struct remove_be { using type = T; };
+template<typename T>
+struct remove_be<be_t<T>> { using type = T; };
+template<typename T>
+using remove_be_t = typename remove_be<T>::type;
+
 // Bool type equivalent
 class b8
 {
@@ -991,17 +999,18 @@ template <typename To, typename From> requires (std::is_integral_v<decltype(std:
 	constexpr bool is_from_signed = std::is_signed_v<CommonFrom>;
 	constexpr bool is_to_signed = std::is_signed_v<CommonTo>;
 
-	constexpr auto from_mask = (is_from_signed && !is_to_signed) ? UnFrom{umax} >> 1 : UnFrom{umax};
+	// For unsigned/signed mismatch, create an "unsigned" compatible mask
+	constexpr auto from_mask = (is_from_signed && !is_to_signed && sizeof(CommonFrom) <= sizeof(CommonTo)) ? UnFrom{umax} >> 1 : UnFrom{umax};
 	constexpr auto to_mask = (is_to_signed && !is_from_signed) ? UnTo{umax} >> 1 : UnTo{umax};
 
-	constexpr auto mask = ~(from_mask & to_mask);
+	constexpr auto mask = static_cast<UnFrom>(~(from_mask & to_mask));
 
-	// Signed to unsigned always require test
-	// Otherwise, this is bit-wise narrowing or conversion between types of different signedness of the same size
-	if constexpr ((is_from_signed && !is_to_signed) || to_mask < from_mask)
+	// If destination ("unsigned" compatible) mask is smaller than source ("unsigned" compatible) mask
+	// It requires narrowing.
+	if constexpr (!!mask)
 	{
 		// Try to optimize test if both are of the same signedness
-		if (is_from_signed != is_to_signed ? !!(value & mask) : static_cast<CommonTo>(value) != value) [[unlikely]]
+		if (is_from_signed != is_to_signed ? !!(value & mask) : static_cast<CommonFrom>(static_cast<CommonTo>(value)) != value) [[unlikely]]
 		{
 			fmt::raw_verify_error(src_loc, u8"Narrowing error", +value);
 		}
@@ -1192,7 +1201,7 @@ constexpr void write_to_ptr(U&& array, usz pos, const T& value)
 {
 	static_assert(sizeof(T) % sizeof(array[0]) == 0);
 	if (!std::is_constant_evaluated())
-		std::memcpy(&array[pos], &value, sizeof(value));
+		std::memcpy(static_cast<void*>(&array[pos]), &value, sizeof(value));
 	else
 		ensure(!"Unimplemented");
 }
@@ -1202,7 +1211,7 @@ constexpr void write_to_ptr(U&& array, const T& value)
 {
 	static_assert(sizeof(T) % sizeof(array[0]) == 0);
 	if (!std::is_constant_evaluated())
-		std::memcpy(&array[0], &value, sizeof(value));
+		std::memcpy(static_cast<void*>(&array[0]), &value, sizeof(value));
 	else
 		ensure(!"Unimplemented");
 }

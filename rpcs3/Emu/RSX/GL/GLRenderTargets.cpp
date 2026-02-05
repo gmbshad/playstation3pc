@@ -153,7 +153,7 @@ void GLGSRender::init_buffers(rsx::framebuffer_creation_context context, bool /*
 	{
 		if (m_surface_info[i].pitch && g_cfg.video.write_color_buffers)
 		{
-			const utils::address_range surface_range = m_surface_info[i].get_memory_range();
+			const utils::address_range32 surface_range = m_surface_info[i].get_memory_range();
 			m_gl_texture_cache.set_memory_read_flags(surface_range, rsx::memory_read_flags::flush_once);
 			m_gl_texture_cache.flush_if_cache_miss_likely(cmd, surface_range);
 		}
@@ -182,7 +182,7 @@ void GLGSRender::init_buffers(rsx::framebuffer_creation_context context, bool /*
 
 	if (m_depth_surface_info.pitch && g_cfg.video.write_depth_buffer)
 	{
-		const utils::address_range surface_range = m_depth_surface_info.get_memory_range();
+		const utils::address_range32 surface_range = m_depth_surface_info.get_memory_range();
 		m_gl_texture_cache.set_memory_read_flags(surface_range, rsx::memory_read_flags::flush_once);
 		m_gl_texture_cache.flush_if_cache_miss_likely(cmd, surface_range);
 	}
@@ -218,7 +218,7 @@ void GLGSRender::init_buffers(rsx::framebuffer_creation_context context, bool /*
 		static_cast<gl::framebuffer_holder*>(m_draw_fbo)->release();
 	}
 
-	for (auto &fbo : m_framebuffer_cache)
+	for (auto& fbo : m_framebuffer_cache)
 	{
 		if (fbo.matches(color_targets, depth_stencil_target))
 		{
@@ -264,6 +264,8 @@ void GLGSRender::init_buffers(rsx::framebuffer_creation_context context, bool /*
 		}
 	}
 
+	ensure(m_draw_fbo);
+
 	switch (rsx::method_registers.surface_color_target())
 	{
 	case rsx::surface_target::none: break;
@@ -301,6 +303,7 @@ void GLGSRender::init_buffers(rsx::framebuffer_creation_context context, bool /*
 	}
 
 	m_graphics_state.set(rsx::rtt_config_valid);
+	on_framebuffer_layout_updated();
 
 	check_zcull_status(true);
 	set_viewport();

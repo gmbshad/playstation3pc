@@ -10,6 +10,7 @@
 #include "Common/bitfield.hpp"
 #include "Common/profiling_timer.hpp"
 #include "Common/texture_cache_types.h"
+#include "Common/TextureUtils.h"
 #include "Program/RSXVertexProgram.h"
 #include "Program/RSXFragmentProgram.h"
 
@@ -91,8 +92,6 @@ namespace rsx
 		bool supports_normalized_barycentrics; // Basically all GPUs except NVIDIA have properly normalized barycentrics
 	};
 
-	class sampled_image_descriptor_base;
-
 	struct desync_fifo_cmd_info
 	{
 		u32 cmd;
@@ -150,7 +149,7 @@ namespace rsx
 		virtual f64 get_display_refresh_rate() const = 0;
 
 		// Invalidated memory range
-		address_range m_invalidated_memory_range;
+		address_range32 m_invalidated_memory_range;
 
 		// Profiler
 		rsx::profiling_timer m_profiler;
@@ -248,12 +247,19 @@ namespace rsx
 		program_hash_util::fragment_program_utils::fragment_program_metadata current_fp_metadata = {};
 		program_hash_util::vertex_program_utils::vertex_program_metadata current_vp_metadata = {};
 
+		std::array<std::unique_ptr<rsx::sampled_image_descriptor_base>, rsx::limits::fragment_textures_count> fs_sampler_state = {};
+		std::array<std::unique_ptr<rsx::sampled_image_descriptor_base>, rsx::limits::vertex_textures_count> vs_sampler_state = {};
+
 		std::array<u32, 4> get_color_surface_addresses() const;
 		u32 get_zeta_surface_address() const;
 
 	protected:
 		void get_framebuffer_layout(rsx::framebuffer_creation_context context, framebuffer_layout &layout);
 		bool get_scissor(areau& region, bool clip_viewport);
+
+		// Notify framebuffer layout has been committed.
+		// FIXME: This should not be here
+		void on_framebuffer_layout_updated();
 
 		RSXVertexProgram current_vertex_program = {};
 		RSXFragmentProgram current_fragment_program = {};
@@ -351,7 +357,7 @@ namespace rsx
 		virtual void flip(const display_flip_info_t& info) = 0;
 		virtual u64 timestamp();
 		virtual bool on_access_violation(u32 /*address*/, bool /*is_writing*/) { return false; }
-		virtual void on_invalidate_memory_range(const address_range & /*range*/, rsx::invalidation_cause) {}
+		virtual void on_invalidate_memory_range(const address_range32 & /*range*/, rsx::invalidation_cause) {}
 		virtual void notify_tile_unbound(u32 /*tile*/) {}
 
 		// control
@@ -372,6 +378,7 @@ namespace rsx
 		// sync
 		void sync();
 		flags32_t read_barrier(u32 memory_address, u32 memory_range, bool unconditional);
+		virtual void write_barrier(u32 /*memory_address*/, u32 /*memory_range*/) {}
 		virtual void sync_hint(FIFO::interrupt_hint hint, reports::sync_hint_payload_t payload);
 		virtual bool release_GCM_label(u32 /*address*/, u32 /*value*/) { return false; }
 

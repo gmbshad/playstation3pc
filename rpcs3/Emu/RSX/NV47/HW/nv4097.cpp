@@ -250,8 +250,12 @@ namespace rsx
 			const auto current = REGS(ctx)->decode<NV4097_SET_SURFACE_FORMAT>(arg);
 			const auto previous = REGS(ctx)->decode<NV4097_SET_SURFACE_FORMAT>(REGS(ctx)->latch);
 
-			if (*current.antialias() != *previous.antialias() ||                         // Antialias control has changed, update ROP parameters
-				current.is_integer_color_format() != previous.is_integer_color_format()) // The type of color format also requires ROP control update
+			if (current.is_integer_color_format() != previous.is_integer_color_format()) // Different ROP emulation
+			{
+				RSX(ctx)->m_graphics_state |= rsx::pipeline_state::fragment_program_state_dirty;
+			}
+
+			if (*current.antialias() != *previous.antialias()) // Antialias control has changed, update ROP parameters
 			{
 				RSX(ctx)->m_graphics_state |= rsx::pipeline_state::fragment_state_dirty;
 			}
@@ -300,6 +304,34 @@ namespace rsx
 
 			// Rollback
 			REGS(ctx)->decode(reg, REGS(ctx)->latch);
+		}
+
+		void set_aa_control(context* ctx, u32 reg, u32 arg)
+		{
+			const auto latch = REGS(ctx)->latch;
+			if (arg == latch)
+			{
+				return;
+			}
+
+			// Reconfigure pipeline.
+			RSX(ctx)->m_graphics_state |= rsx::pipeline_config_dirty;
+
+			// If we support A2C in hardware, leave the rest upto the hardware. The pipeline config should take care of it.
+			const auto& backend_config = RSX(ctx)->get_backend_config();
+			if (backend_config.supports_hw_a2c &&
+				backend_config.supports_hw_a2c_1spp)
+			{
+				return;
+			}
+
+			// No A2C hardware support or partial hardware support. Invalidate the current program if A2C state changed.
+			const auto a2c_old = REGS(ctx)->decode<NV4097_SET_ANTI_ALIASING_CONTROL>(latch).msaa_alpha_to_coverage();
+			const auto a2c_new = REGS(ctx)->decode<NV4097_SET_ANTI_ALIASING_CONTROL>(arg).msaa_alpha_to_coverage();
+			if (a2c_old != a2c_new)
+			{
+				RSX(ctx)->m_graphics_state |= rsx::fragment_program_state_dirty;
+			}
 		}
 
 		///// Draw call setup (vertex, etc)
@@ -566,7 +598,7 @@ namespace rsx
 			default:
 				rsx_log.error("NV4097_GET_REPORT: Bad type %d", type);
 
-				vm::_ref<atomic_t<CellGcmReportData>>(address_ptr).atomic_op([&](CellGcmReportData& data)
+				vm::_ptr<atomic_t<CellGcmReportData>>(address_ptr)->atomic_op([&](CellGcmReportData& data)
 				{
 					data.timer = RSX(ctx)->timestamp();
 					data.padding = 0;
@@ -651,7 +683,7 @@ namespace rsx
 
 			ensure(addr != umax);
 
-			vm::_ref<atomic_t<RsxNotify>>(addr).store(
+			vm::_ptr<atomic_t<RsxNotify>>(addr)->store(
 			{
 				RSX(ctx)->timestamp(),
 				0

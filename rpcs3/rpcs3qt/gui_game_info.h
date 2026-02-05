@@ -5,6 +5,7 @@
 
 #include "Emu/GameInfo.h"
 
+#include <set>
 #include <QPixmap>
 
 /* Having the icons associated with the game info simplifies logic internally */
@@ -15,10 +16,12 @@ struct gui_game_info
 	compat::status compat;
 	QPixmap icon;
 	QPixmap pxmap;
-	bool hasCustomConfig = false;
-	bool hasCustomPadConfig = false;
+	bool has_custom_config = false;
+	bool has_custom_pad_config = false;
+	bool has_custom_icon = false;
 	bool has_hover_gif = false;
 	bool has_hover_pam = false;
+	bool icon_in_archive = false;
 	movie_item_base* item = nullptr;
 
 	// Returns the visible version string in the game list

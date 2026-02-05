@@ -69,6 +69,8 @@ public:
 	/** Call this method before calling app.exec */
 	bool Init() override;
 
+	static s32 get_language_id();
+
 	std::unique_ptr<gs_frame> get_gs_frame();
 
 	main_window* m_main_window = nullptr;
@@ -79,7 +81,7 @@ private:
 		return thread();
 	}
 
-	void SwitchTranslator(QTranslator& translator, const QString& filename, const QString& language_code);
+	void SwitchTranslator(const QString& language_code);
 	void LoadLanguage(const QString& language_code);
 	static QStringList GetAvailableLanguageCodes();
 
@@ -90,6 +92,8 @@ private:
 	void UpdatePlaytime();
 	void StopPlaytime();
 
+	void set_language_code(QString language_code);
+
 	class native_event_filter : public QAbstractNativeEventFilter
 	{
 	public:
@@ -97,8 +101,10 @@ private:
 
 	} m_native_event_filter;
 
+	std::vector<QTranslator*> m_qt_translators;
 	QTranslator m_translator;
 	QString m_language_code;
+	static s32 m_language_id;
 
 	QTimer m_timer;
 	QElapsedTimer m_timer_playtime;

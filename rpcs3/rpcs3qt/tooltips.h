@@ -41,6 +41,8 @@ public:
 		const QString force_hw_MSAA                = tr("Forces MSAA to use the host GPU's resolve capabilities for all sampling operations.\nThis option incurs a performance penalty as well as the risk of visual artifacts but can yield crisper visuals when MSAA is enabled.");
 		const QString disable_vertex_cache         = tr("Disables the vertex cache.\nMight resolve missing or flickering graphics output.\nMay degrade performance.");
 		const QString disable_async_host_mm        = tr("Force host memory management calls to be inlined instead of handled asynchronously.\nThis can cause severe performance degradation and stuttering in some games.\nThis option is only needed by developers to debug problems with texture cache memory protection.");
+		const QString disable_spin_optimization    = tr("Disable SPU GETLLAR spin optimization.\nThis can cause severe performance degradation and stuttering in many games.\nThis option is only needed for a select number of games.");
+		const QString enable_spu_events_busy_loop  = tr("Enable SPU RdEventStat spin.\nThis increases CPU usage, this setting is beneficial for high-threaded CPUs (12+) with select number of games.");
 		const QString zcull_operation_mode         = tr("Changes ZCULL report synchronization behaviour. Experiment to find the best option for your game. Approximate mode is recommended for most games.\n· Precise is the most accurate to PS3 behaviour. Required for accurate visuals in some titles such as Demon's Souls and The Darkness.\n· Approximate is a much faster way to generate occlusion data which may not always match what the PS3 would generate. Works well with most PS3 games.\n· Relaxed changes the synchronization method completely and can greatly improve performance in some games or completely break others.");
 		const QString max_spurs_threads            = tr("Limits the maximum number of SPURS threads in each thread group.\nMay improve performance in some cases, especially on systems with limited number of hardware threads.\nLimiting the number of threads is likely to cause crashes; it's recommended to keep this at the default value.");
 		const QString sleep_timers_accuracy        = tr("Changes the sleep period accuracy.\n'As Host' uses default accuracy of the underlying operating system, while 'All Timers' attempts to improve it.\n'Usleep Only' limits the adjustments to usleep syscall only.\nCan affect performance in unexpected ways.");
@@ -55,7 +57,8 @@ public:
 		const QString anti_cheat_savestates        = tr("When this mode is on, emulation exits when saving and the savestate file is concealed after its load, preventing reuse by RPCS3.\nThis mode is like hibernation of emulation: if you don't want to be able to cheat using savestates when playing the game, consider using this mode.\nDo note that the savestate file is not gone completely, just ignored by RPCS3. You can manually relaunch it if needed.");
 		const QString compatible_savestates        = tr("When this mode is on, SPU emulation prioritizes savestate compatibility, however, it may reduce performance slightly.\nWhen this mode is off, some games may not allow making a savestate and show an SPU pause error in the log.");
 		const QString paused_savestates            = tr("When this mode is on, savestates are loaded and paused on the first frame.\nThis allows players to prepare for gameplay without being thrown into the action immediately.");
-		const QString spu_profiler                 = tr("When enabled, SPU performance is measured at runtime.\nEnable only at a developr's request because when enabled it reduces performance a bit by itself.");
+		const QString spu_profiler                 = tr("When enabled, SPU performance is measured at runtime.\nEnable only at a developer's request because when enabled it reduces performance a bit by itself.");
+		const QString use_ReBAR                    = tr("When enabled, Vulkan will try to use PCI-e resizable bar address space for GPU uploads of timing-sensitive data.\nThis yields a massive performance win on NVIDIA cards when the base framerate is low.\nFor games with very high framerates, this option can result in worse performance for all GPU vendors.\n");
 
 		// audio
 
@@ -88,7 +91,6 @@ public:
 		const QString xfloat                    = tr("Control accuracy to SPU float vectors processing.\nFixes bugs in various games at the cost of performance.\nThis setting is only applied when SPU Decoder is set to Dynamic or LLVM.");
 		const QString enable_thread_scheduler   = tr("Control how RPCS3 utilizes the threads of your system.\nEach option heavily depends on the game and on your CPU. It's recommended to try each option to find out which performs the best.\nChanging the thread scheduler is not supported on CPUs with less than 12 threads.");
 		const QString spu_loop_detection        = tr("Try to detect loop conditions in SPU kernels and use them as scheduling hints.\nImproves performance and reduces CPU usage.\nMay cause severe audio stuttering in rare cases.");
-		const QString enable_tsx                = tr("Enable usage of TSX instructions.\nNeeds to be forced on some Haswell or Broadwell CPUs or CPUs with the TSX-FA instruction set.\nForcing TSX in these cases may lead to system and performance instability, use it with caution.");
 		const QString spu_block_size            = tr("This option controls the SPU analyser, particularly the size of compiled units. The Mega and Giga modes may improve performance by tying smaller units together, decreasing the number of compiled units but increasing their size.\nUse the Safe mode for maximum compatibility.");
 		const QString preferred_spu_threads     = tr("Some SPU stages are sensitive to race conditions and allowing a limited number at a time helps alleviate performance stalls.\nSetting this to a smaller value might improve performance and reduce stuttering in some games.\nLeave this on auto if performance is negatively affected when setting a small value.");
 		const QString max_cpu_preempt           = tr("Reduces CPU usage and power consumption, improving battery life on mobile devices. (0 means disabled)\nHigher values cause a more pronounced effect, but may cause audio or performance issues. A value of 50 or less is recommended.\nThis option forces an FPS limit because it's active when framerate is stable.\nThe lighter the game is on the hardware, the more power is saved by it. (until the preemption count barrier is reached)");
@@ -111,7 +113,8 @@ public:
 		const QString force_high_pz                = tr("Only useful when debugging differences in GPU hardware.\nNot necessary for average users.\nIf unsure, don't use this option.");
 		const QString debug_output                 = tr("Enables the selected API's inbuilt debugging functionality.\nWill cause severe performance degradation especially with Vulkan.\nOnly useful to developers.\nIf unsure, don't use this option.");
 		const QString debug_overlay                = tr("Provides a graphical overlay of various debugging information.\nIf unsure, don't use this option.");
-		const QString debug_overlay_io             = tr("Provides a graphical overlay with pad input values for player 1.\nThis is only shown if the other debug overlay is disabled.\nIf unsure, don't use this option.");
+		const QString debug_overlay_io             = tr("Provides a graphical overlay with pad input values for player 1.\nThis is only shown if the debug overlay is disabled.\nIf unsure, don't use this option.");
+		const QString debug_overlay_mouse          = tr("Provides a graphical overlay with mouse input values.\nThis is only shown if the other debug overlays are disabled.\nIf unsure, don't use this option.");
 		const QString log_shader_programs          = tr("Dump game shaders to file. Only useful to developers.\nIf unsure, don't use this option.");
 		const QString disable_occlusion_queries    = tr("Disables running occlusion queries. Minor to moderate performance boost.\nMight introduce issues with broken occlusion e.g missing geometry and extreme pop-in.");
 		const QString disable_video_output         = tr("Disables all video output and PS3 graphical rendering.\nIts only use case is to evaluate performance on CELL for development.");
@@ -127,6 +130,8 @@ public:
 
 		// emulator
 
+		const QString enable_gamemode              = tr("Activate Feral Interactive's GameMode.\nThis is a series of CPU and GPU optimizations and can potentially benefit game performance on some systems.");
+		const QString no_gamemode                  = tr("This requires Feral Interactive's GameMode to be installed.\nGameMode is a series of CPU and GPU optimizations and can potentially benefit game performance on some systems.\nTo install GameMode for your specific Linux distribution, go to the GitHub page:https://github.com/FeralInteractive/gamemode.");
 		const QString exit_on_stop                 = tr("Automatically close RPCS3 when closing a game, or when a game closes itself.");
 		const QString pause_on_focus_loss          = tr("Automatically pause emulation when RPCS3 loses its focus or the application is inactive in order to save power and reduce CPU usage.\nDo note that emulation pausing in general is not perfect and may not be compatible with all games.\nAlthough it currently also pauses gameplay, it is not recommended to rely on it as this behavior may be changed in the future and it is not the purpose of this setting.");
 		const QString start_game_fullscreen        = tr("Automatically puts the game window in fullscreen.\nDouble click on the game window or press Alt+Enter to toggle fullscreen and windowed mode.");
@@ -147,7 +152,9 @@ public:
 		const QString show_pressure_intensity_toggle_hint = tr("Shows pressure intensity toggle hint using the native overlay.");
 		const QString show_analog_limiter_toggle_hint = tr("Shows analog limiter toggle hint using the native overlay.");
 		const QString show_mouse_and_keyboard_toggle_hint = tr("Shows mouse and keyboard toggle hint using the native overlay.");
+		const QString show_capture_hints           = tr("Shows screenshot and recording hints using the native overlay.");
 		const QString use_native_interface         = tr("Enables use of native HUD within the game window that can interact with game controllers.\nWhen disabled, regular Qt dialogs are used instead.\nCurrently, the on-screen keyboard only supports the English key layout.");
+		const QString record_with_overlays         = tr("Enables recording with overlays.\nThis also affects screenshots.");
 		const QString pause_during_home_menu       = tr("When enabled, opening the home menu will also pause emulation.\nWhile most games pause themselves while the home menu is shown, some do not.\nIn that case it can be helpful to pause the emulation whenever the home menu is open.");
 
 		const QString perf_overlay_enabled                 = tr("Enables or disables the performance overlay.");
@@ -165,7 +172,7 @@ public:
 		const QString perf_overlay_center_x                = tr("Centers the performance overlay horizontally and overrides the horizontal margin.");
 		const QString perf_overlay_center_y                = tr("Centers the performance overlay vertically and overrides the vertical margin.");
 
-		const QString shader_load_bg_enabled   = tr("Shows a background image during the native shader loading dialog/loading screen.\nBy default the used image will be <gamedir>/PS3_GAME/PIC1.PNG or <gamedir>/PS3_GAME/PIC0.PNG.");
+		const QString shader_load_bg_enabled   = tr("Shows a background image during the native shader loading dialog/loading screen.\nBy default the used image will be <gamedir>/PS3_GAME/PIC1.PNG.");
 		const QString shader_load_bg_darkening = tr("Changes the background image darkening effect strength of the native shader loading dialog.\nThis may be used to improve readability and/or aesthetics.");
 		const QString shader_load_bg_blur      = tr("Changes the background image blur effect strength of the native shader loading dialog.\nThis may be used to improve readability and/or aesthetics.");
 
@@ -253,11 +260,14 @@ public:
 		const QString bind          = tr("Interface IP Address to bind to.\nOnly available in custom configurations.");
 		const QString enable_upnp   = tr("Enable UPNP.\nThis will automatically forward ports bound on 0.0.0.0 if your router has UPNP enabled.");
 		const QString psn_country   = tr("Changes the RPCN country.");
+		const QString enable_clans  = tr("Enable connection to the Clans server.\nOnly affects games supporting the Clans feature.");
 
 		// system
 
 		const QString license_area            = tr("The console region defines the license area of the PS3.\nDepending on the license area, some games may not work.");
 		const QString system_language         = tr("Some games may fail to boot if the system language is not available in the game itself.\nOther games will switch language automatically to what is selected here.\nIt is recommended leaving this on a language supported by the game.");
+		const QString date_format             = tr("Select the PS3's date format.");
+		const QString time_format             = tr("Select the PS3's time format.");
 		const QString keyboard_type           = tr("Sets the used keyboard layout.\nCurrently only US, Japanese and German layouts are fully supported at this moment.");
 		const QString enter_button_assignment = tr("The button used for enter/accept/confirm in system dialogs.\nChange this to use the Circle button instead, which is the default configuration on Japanese systems and in many Japanese games.\nIn these cases having the cross button assigned can often lead to confusion.");
 		const QString enable_host_root        = tr("Required for some Homebrew.\nIf unsure, do not use this option.");
@@ -288,13 +298,13 @@ public:
 		const QString sdl         = tr("The SDL handler supports a variety of controllers across different platforms.");
 
 		const QString orientation_reset  = tr("Resets the sensor orientation when pressed.<br>Toggle the checkbox to enable or disable the orientation feature.<br>Currently only used for PS Move interactions.");
-		const QString analog_limiter     = tr("Applies the stick multipliers while this special button is pressed.<br>Enable \"Toggle\" if you want to toggle the analog limiter on button press instead.");
+		const QString analog_limiter     = tr("Applies the stick multipliers while this special button is pressed.<br>Enable \"Toggle\" if you want to toggle the analog limiter on button press instead.<br>If no button has been assigned, the stick multipliers are always applied.");
 		const QString pressure_intensity = tr("Controls the intensity of pressure sensitive buttons while this special button is pressed.<br>Enable \"Toggle\" if you want to toggle the intensity on button press instead.<br>Use the percentage to change how hard you want to press a button.");
 		const QString pressure_deadzone  = tr("Controls the deadzone of pressure sensitive buttons. It determines how far the button has to be pressed until it is recognized by the game. The resulting range will be projected onto the full button sensitivity range.");
 		const QString squircle_factor    = tr("The actual DualShock 3's stick range is not circular but formed like a rounded square (or squircle) which represents the maximum range of the emulated sticks. You can use the squircle values to modify the stick input if your sticks can't reach the corners of that range. A value of 0 does not apply any so called squircling. A value of 8000 is usually recommended.");
 		const QString stick_multiplier   = tr("The stick multipliers can be used to change the sensitivity of your stick movements.<br>The default setting is 1 and represents normal input.");
 		const QString stick_deadzones    = tr("A stick's deadzone determines how far the stick has to be moved until it is fully recognized by the game. The resulting range will be projected onto the full input range in order to give you a smooth experience. Movement inside the deadzone is simulated using the anti-deadzone slider (default is 13%), so don't worry if there is still movement shown in the emulated stick preview.");
-		const QString vibration          = tr("The PS3 activates two motors (large and small) to handle controller vibrations.<br>You can enable, disable or even switch these signals for the currently selected pad here.");
+		const QString vibration          = tr("The PS3 activates two motors (large and small) to handle controller vibrations.<br>You can enable, disable or even switch these signals for the currently selected pad here.<br>The game sends values from 0-255 to activate the motors.<br>Any value smaller or equal the threshold will be set to 0. This is 63 by default for pad handlers other than DualShock3 in order to emulate the DualShock3's behavior.");
 		const QString motion_controls    = tr("Use this to configure the gamepad motion controls.");
 		const QString emulated_preview   = tr("The emulated stick values (red dots) in the stick preview represent the actual stick positions as they will be visible to the game. The actual DualShock 3's stick range is not circular but formed like a rounded square (or squircle) which represents the maximum range of the emulated sticks. The blue regular dots represent the raw stick values (including stick multipliers) before they are converted for ingame usage.");
 		const QString trigger_deadzones  = tr("A trigger's deadzone determines how far the trigger has to be moved until it is recognized by the game. The resulting range will be projected onto the full input range in order to give you a smooth experience.");

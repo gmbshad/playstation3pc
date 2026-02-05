@@ -15,7 +15,7 @@ public:
 		[[maybe_unused]] const std::vector<game_info>& game_data,
 		[[maybe_unused]] const std::map<QString, QString>& notes_map,
 		[[maybe_unused]] const std::map<QString, QString>& title_map,
-		[[maybe_unused]] const std::string& selected_item_id,
+		[[maybe_unused]] const std::set<std::string>& selected_item_ids,
 		[[maybe_unused]] bool play_hover_movies){};
 
 	void set_icon_size(QSize size) { m_icon_size = std::move(size); }
@@ -32,7 +32,7 @@ protected:
 	QPixmap PaintedPixmap(const QPixmap& icon, qreal device_pixel_ratio, bool paint_config_icon = false, bool paint_pad_config_icon = false, const QColor& compatibility_color = {}) const;
 	QColor GetGridCompatibilityColor(const QString& string) const;
 
-	std::function<void(const game_info&)> m_icon_ready_callback{};
+	std::function<void(const game_info&, const movie_item_base*)> m_icon_ready_callback{};
 	bool m_draw_compat_status_to_grid{};
 	bool m_is_list_layout{};
 	QSize m_icon_size{};

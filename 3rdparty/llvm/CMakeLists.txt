@@ -66,12 +66,10 @@ if(WITH_LLVM)
 		find_package(LLVM CONFIG)
 
 		if (NOT LLVM_FOUND)
-			message(FATAL_ERROR "Can't find LLVM libraries from the CMAKE_PREFIX_PATH path or LLVM_DIR. \
-													 Enable BUILD_LLVM option to build LLVM from included as a git submodule.")
+			message(FATAL_ERROR "Can't find LLVM libraries from the CMAKE_PREFIX_PATH path or LLVM_DIR. Enable BUILD_LLVM option to build LLVM from included as a git submodule.")
 		endif()
 		if (LLVM_VERSION VERSION_LESS 18)
-			message(FATAL_ERROR "Found LLVM version ${LLVM_VERSION}. Required version 18 or above. \
-													 Enable BUILD_LLVM option to build LLVM from included as a git submodule.")
+			message(FATAL_ERROR "Found LLVM version ${LLVM_VERSION}. Required version 18 or above. Enable BUILD_LLVM option to build LLVM from included as a git submodule.")
 		endif()
 	endif()
 
@@ -109,7 +107,7 @@ if(WITH_LLVM)
 
 	add_library(3rdparty_llvm INTERFACE)
 	target_link_libraries(3rdparty_llvm INTERFACE ${LLVM_LIBS})
-	target_include_directories(3rdparty_llvm INTERFACE ${LLVM_INCLUDE_DIRS})
+	target_include_directories(3rdparty_llvm SYSTEM INTERFACE ${LLVM_INCLUDE_DIRS})
 	separate_arguments(LLVM_DEFINITIONS_LIST NATIVE_COMMAND ${LLVM_DEFINITIONS})
 	target_compile_definitions(3rdparty_llvm INTERFACE ${LLVM_DEFINITIONS_LIST} LLVM_AVAILABLE)
 

@@ -71,9 +71,10 @@ namespace Darwin_ProcessInfo
 }
 #endif
 
+#ifdef _WIN32
+#if !defined(ARCH_X64)
 namespace utils
 {
-#ifdef _WIN32
 	// Some helpers for sanity
 	const auto read_reg_dword = [](HKEY hKey, std::string_view value_name) -> std::pair<bool, DWORD>
 	{
@@ -151,8 +152,9 @@ namespace utils
 
 		return fmt::format("Operating system: %s, Version %s", product_name, version_id);
 	}
-#endif
 }
+#endif
+#endif
 
 bool utils::has_ssse3()
 {
@@ -278,17 +280,6 @@ bool utils::has_avx10()
 #endif
 }
 
-bool utils::has_avx10_512()
-{
-#if defined(ARCH_X64)
-	// AVX10 with 512 wide vectors
-	static const bool g_value = has_avx10() && get_cpuid(24, 0)[2] & 0x40000;
-	return g_value;
-#else
-	return false;
-#endif
-}
-
 u32 utils::avx10_isa_version()
 {
 #if defined(ARCH_X64)
@@ -307,28 +298,6 @@ u32 utils::avx10_isa_version()
 	return g_value;
 #else
 	return 0;
-#endif
-}
-
-bool utils::has_avx512_256()
-{
-#if defined(ARCH_X64)
-	// Either AVX10 or AVX512 implies support for 256-bit length AVX-512 SKL-X tier instructions
-	static const bool g_value = (has_avx512() || has_avx10());
-	return g_value;
-#else
-	return false;
-#endif
-}
-
-bool utils::has_avx512_icl_256()
-{
-#if defined(ARCH_X64)
-	// Check for AVX512_ICL or check for AVX10, together with GFNI, VAES, and VPCLMULQDQ, implies support for the same instructions that AVX-512_icl does at 256 bit length
-	static const bool g_value = (has_avx512_icl() || (has_avx10() && get_cpuid(7, 0)[2] & 0x00000700));
-	return g_value;
-#else
-	return false;
 #endif
 }
 
@@ -536,15 +505,6 @@ std::string utils::get_system_info()
 		{
 			const u32 avx10_version = avx10_isa_version();
 			fmt::append(result, "10.%d", avx10_version);
-
-			if (has_avx10_512())
-			{
-				result += "-512";
-			}
-			else
-			{
-				result += "-256";
-			}
 		}
 		else if (has_avx512())
 		{
@@ -890,7 +850,7 @@ static const bool s_tsc_freq_evaluated = []() -> bool
 		printf("[TSC calibration] Available clock sources: '%s'\n", clock_sources.c_str());
 
 		// Check if the Kernel has blacklisted the TSC
-		const auto available_clocks = fmt::split(clock_sources, { " " });
+		const auto available_clocks = fmt::split_sv(clock_sources, { " " });
 		const bool tsc_reliable = std::find(available_clocks.begin(), available_clocks.end(), "tsc") != available_clocks.end();
 
 		if (!tsc_reliable)

@@ -74,7 +74,8 @@ class pad_settings_dialog : public QDialog
 		id_reset_parameters,
 		id_blacklist,
 		id_refresh,
-		id_add_config_file
+		id_add_config_file,
+		id_remove_config_file
 	};
 
 	struct pad_button
@@ -100,7 +101,9 @@ private Q_SLOTS:
 	void ChangeConfig(const QString& config_file);
 	void ChangeDevice(int index);
 	void HandleDeviceClassChange(u32 class_id) const;
+	void HandleDeviceProductChange(u32 product_id) const;
 	void AddConfigFile();
+	void RemoveConfigFile();
 	/** Update the current player config with the GUI values. */
 	void ApplyCurrentPlayerConfig(int new_player_id);
 	void RefreshPads();
@@ -170,12 +173,18 @@ private:
 	{
 		PadHandlerBase::connection status = PadHandlerBase::connection::disconnected;
 		bool has_new_data = false;
-		u32 button_id = button_ids::id_pad_begin;
-		u16 val = 0;
-		std::string name;
 		std::string pad_name;
 		u32 battery_level = 0;
 		std::array<int, 6> preview_values{};
+		pad_capabilities capabilities{};
+
+		struct input_values
+		{
+			std::string button_name;
+			u32 button_id = button_ids::id_pad_begin;
+			u16 val = 0;
+		};
+		std::vector<input_values> values;
 	} m_input_callback_data;
 
 	// Input thread. Its Callback handles the input
@@ -186,6 +195,9 @@ private:
 	void start_input_thread();
 	void pause_input_thread();
 
+	std::pair<QStringList, QString> get_config_files();
+
+	void save(bool check_duplicates);
 	void SaveExit();
 	void CancelExit();
 

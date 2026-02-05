@@ -265,25 +265,7 @@
            </layout>
           </item>
           <item>
-           <layout class="QVBoxLayout" name="coreTabRightLayout" stretch="0,0,0,0,0">
-            <item>
-             <widget class="QGroupBox" name="gb_tsx">
-              <property name="sizePolicy">
-               <sizepolicy hsizetype="Preferred" vsizetype="Minimum">
-                <horstretch>0</horstretch>
-                <verstretch>0</verstretch>
-               </sizepolicy>
-              </property>
-              <property name="title">
-               <string>TSX Instructions</string>
-              </property>
-              <layout class="QVBoxLayout" name="gb_tsx_layout">
-               <item>
-                <widget class="QComboBox" name="enableTSX"/>
-               </item>
-              </layout>
-             </widget>
-            </item>
+           <layout class="QVBoxLayout" name="coreTabRightLayout" stretch="0,0,0,0">
             <item>
              <widget class="QGroupBox" name="gb_spu_threads">
               <property name="sizePolicy">
@@ -551,6 +533,13 @@
                <string>3D</string>
               </property>
               <layout class="QVBoxLayout" name="gb_stereo_layout">
+               <item>
+                <widget class="QCheckBox" name="stereoRenderEnabled">
+                 <property name="text">
+                  <string>Enable 3D Support</string>
+                 </property>
+                </widget>
+               </item>
                <item>
                 <widget class="QComboBox" name="stereoRenderMode"/>
                </item>
@@ -2009,6 +1998,30 @@
              </widget>
             </item>
             <item>
+             <widget class="QGroupBox" name="gb_dateFormat">
+              <property name="title">
+               <string>Date Format</string>
+              </property>
+              <layout class="QVBoxLayout" name="verticalLayout_dateFormat">
+               <item>
+                <widget class="QComboBox" name="dateFormat"/>
+               </item>
+              </layout>
+             </widget>
+            </item>
+            <item>
+             <widget class="QGroupBox" name="gb_timeFormat">
+              <property name="title">
+               <string>Time Format</string>
+              </property>
+              <layout class="QVBoxLayout" name="verticalLayout_timeFormat">
+               <item>
+                <widget class="QComboBox" name="timeFormat"/>
+               </item>
+              </layout>
+             </widget>
+            </item>
+            <item>
              <widget class="QGroupBox" name="gb_console_time">
               <property name="title">
                <string>Console Time</string>
@@ -2307,6 +2320,13 @@
               </widget>
              </item>
              <item>
+              <widget class="QCheckBox" name="enable_clans">
+                <property name="text">
+                 <string>Enable Clans</string>
+                </property>
+              </widget>
+             </item>
+             <item>
               <spacer name="networkTabSpacerRight">
                <property name="orientation">
                 <enum>Qt::Orientation::Vertical</enum>
@@ -2419,6 +2439,20 @@
                 <widget class="QCheckBox" name="accurateSpuDMA">
                  <property name="text">
                   <string>Accurate SPU DMA</string>
+                 </property>
+                </widget>
+               </item>
+               <item>
+                <widget class="QCheckBox" name="disableSpinOptimization">
+                 <property name="text">
+                  <string>Disable SPU GETLLAR Spin Optimization</string>
+                 </property>
+                </widget>
+               </item>
+               <item>
+                <widget class="QCheckBox" name="enableSpuEventsBusyLoop">
+                 <property name="text">
+                  <string>Enable SPU Events Busy Loop</string>
                  </property>
                 </widget>
                </item>
@@ -2683,6 +2717,13 @@
                 <widget class="QCheckBox" name="forceHwMSAAResolve">
                  <property name="text">
                   <string>Force Hardware MSAA Resolve</string>
+                 </property>
+                </widget>
+               </item>
+               <item>
+                <widget class="QCheckBox" name="useReBAR">
+                 <property name="text">
+                  <string>Use Re-BAR memory for GPU uploads</string>
                  </property>
                 </widget>
                </item>
@@ -2995,6 +3036,13 @@
                 </widget>
                </item>
                <item>
+                <widget class="QCheckBox" name="showCaptureHints">
+                 <property name="text">
+                  <string>Show capture hints</string>
+                 </property>
+                </widget>
+               </item>
+               <item>
                 <widget class="QCheckBox" name="startGameFullscreen">
                  <property name="text">
                   <string>Start games in fullscreen mode</string>
@@ -3005,6 +3053,20 @@
                 <widget class="QCheckBox" name="useNativeInterface">
                  <property name="text">
                   <string>Use native user interface</string>
+                 </property>
+                </widget>
+               </item>
+               <item>
+                <widget class="QCheckBox" name="recordWithOverlays">
+                 <property name="text">
+                  <string>Record with overlays</string>
+                 </property>
+                </widget>
+               </item>
+               <item>
+                <widget class="QCheckBox" name="enableGamemode">
+                 <property name="text">
+                  <string>Enable GameMode</string>
                  </property>
                 </widget>
                </item>
@@ -4242,16 +4304,16 @@
              </item>
              <item>
               <widget class="QCheckBox" name="disableAsyncHostMM">
-                <property name="text">
-                  <string>Disable Asynchronous Memory Manager</string>
-                </property>
+               <property name="text">
+                <string>Disable Asynchronous Memory Manager</string>
+               </property>
               </widget>
              </item>
              <item>
               <widget class="QCheckBox" name="disableOnDiskShaderCache">
-                <property name="text">
-                  <string>Disable On-Disk Shader Cache</string>
-                </property>
+               <property name="text">
+                <string>Disable On-Disk Shader Cache</string>
+               </property>
               </widget>
              </item>
              <item>
@@ -4365,16 +4427,16 @@
              </item>
              <item>
               <widget class="QCheckBox" name="fixupPPUVNAN">
-                <property name="text">
-                  <string>PPU Vector NaN Fixup</string>
-                </property>
+               <property name="text">
+                <string>PPU Vector NaN Fixup</string>
+               </property>
               </widget>
              </item>
              <item>
               <widget class="QCheckBox" name="spuProfiler">
-                <property name="text">
-                  <string>SPU Profiler</string>
-                </property>
+               <property name="text">
+                <string>SPU Profiler</string>
+               </property>
               </widget>
              </item>
              <item>
@@ -4398,7 +4460,7 @@
           </item>
           <item>
            <widget class="QWidget" name="debug_more_stuff" native="true">
-            <layout class="QVBoxLayout" name="debug_more_stuff_layout" stretch="0,0,0,0,1">
+            <layout class="QVBoxLayout" name="debug_more_stuff_layout" stretch="0,0,0,0,0,1">
              <property name="leftMargin">
               <number>0</number>
              </property>
@@ -4459,23 +4521,23 @@
               </widget>
              </item>
              <item>
-             <widget class="QGroupBox" name="gb_vulkansched">
-              <property name="sizePolicy">
-               <sizepolicy hsizetype="Preferred" vsizetype="Minimum">
-                <horstretch>0</horstretch>
-                <verstretch>0</verstretch>
-               </sizepolicy>
-              </property>
-              <property name="title">
-               <string>Vulkan Queue Scheduler</string>
-              </property>
-              <layout class="QVBoxLayout" name="gb_vksched_layout">
-               <item>
-                <widget class="QComboBox" name="vulkansched"/>
-               </item>
-              </layout>
-             </widget>
-            </item>
+              <widget class="QGroupBox" name="gb_vulkansched">
+               <property name="sizePolicy">
+                <sizepolicy hsizetype="Preferred" vsizetype="Minimum">
+                 <horstretch>0</horstretch>
+                 <verstretch>0</verstretch>
+                </sizepolicy>
+               </property>
+               <property name="title">
+                <string>Vulkan Queue Scheduler</string>
+               </property>
+               <layout class="QVBoxLayout" name="gb_vksched_layout">
+                <item>
+                 <widget class="QComboBox" name="vulkansched"/>
+                </item>
+               </layout>
+              </widget>
+             </item>
              <item>
               <widget class="QGroupBox" name="gb_debug_io">
                <property name="title">
@@ -4486,6 +4548,13 @@
                  <widget class="QCheckBox" name="debugOverlayIO">
                   <property name="text">
                    <string>Debug Overlay For Pad Input</string>
+                  </property>
+                 </widget>
+                </item>
+                <item>
+                 <widget class="QCheckBox" name="debugOverlayMouse">
+                  <property name="text">
+                   <string>Debug Overlay For Mouse Input</string>
                   </property>
                  </widget>
                 </item>

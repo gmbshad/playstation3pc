@@ -8,8 +8,11 @@
 #include "Emu/Cell/Modules/sceNpTrophy.h"
 #include "Emu/Io/Null/null_camera_handler.h"
 #include "Emu/Io/Null/null_music_handler.h"
+#include "util/video_source.h"
 
 #include <clocale>
+
+LOG_CHANNEL(sys_log, "SYS");
 
 [[noreturn]] void report_fatal_error(std::string_view text, bool is_html = false, bool include_help_text = true);
 
@@ -55,6 +58,7 @@ void headless_application::InitializeCallbacks()
 				on_exit();
 			}
 
+			sys_log.notice("Quitting headless application");
 			quit();
 			return true;
 		}
@@ -98,6 +102,9 @@ void headless_application::InitializeCallbacks()
 			return std::make_shared<null_camera_handler>();
 		}
 		case camera_handler::qt:
+#ifdef HAVE_SDL3
+		case camera_handler::sdl:
+#endif
 		{
 			fmt::throw_exception("Headless mode can not be used with this camera handler. Current handler: %s", g_cfg.io.camera.get());
 		}
@@ -165,13 +172,15 @@ void headless_application::InitializeCallbacks()
 	callbacks.get_localized_u32string = [](localized_string_id, const char*) -> std::u32string { return {}; };
 	callbacks.get_localized_setting   = [](const cfg::_base*, u32) -> std::string { return {}; };
 
-	callbacks.play_sound = [](const std::string&){};
+	callbacks.play_sound = [](const std::string&, std::optional<f32>){};
 	callbacks.add_breakpoint = [](u32 /*addr*/){};
 
 	callbacks.display_sleep_control_supported = [](){ return false; };
 	callbacks.enable_display_sleep = [](bool /*enabled*/){};
 
 	callbacks.check_microphone_permissions = [](){};
+
+	callbacks.make_video_source = [](){ return nullptr; };
 
 	Emu.SetCallbacks(std::move(callbacks));
 }

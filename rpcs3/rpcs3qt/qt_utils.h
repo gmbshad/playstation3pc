@@ -92,6 +92,15 @@ namespace gui
 		// Returns the style for richtext <a> links. e.g. style="color: #123456;"
 		QString get_link_style(const QString& name = "richtext_link_color");
 
+		// Returns a richtext link
+		QString make_link(const QString& text, const QString& url);
+
+		// Returns a bold richtext string
+		QString make_bold(const QString& text);
+
+		// Returns a richtext paragraph with white-space: nowrap;
+		QString make_paragraph(QString text, const QString& white_space_style = "nowrap");
+
 		template <typename T>
 		void set_font_size(T& qobj, int size)
 		{
@@ -148,6 +157,15 @@ namespace gui
 		// Convert an arbitrary count of bytes to a readable format using global units (KB, MB...)
 		QString format_byte_size(usz size);
 
+		// Get a QDateTime from a timestamp
+		QDateTime datetime(s64 time);
+
+		// Convert a QDateTime to a readable string
+		QString format_datetime(const QDateTime& date, const QString& fmt = "yyyy-MM-dd HH:mm:ss", bool is_relative = false, const QString& fmt_relative = "HH:mm:ss");
+
+		// Convert a timestamp to a readable string
+		QString format_timestamp(s64 time, const QString& fmt = "yyyy-MM-dd HH:mm:ss");
+
 		static inline Qt::ColorScheme color_scheme()
 		{
 			// use the QGuiApplication's properties to report the default GUI color scheme
@@ -159,6 +177,12 @@ namespace gui
 			// "true" if the default GUI color scheme is dark. "false" otherwise
 			return color_scheme() == Qt::ColorScheme::Dark;
 		}
+
+		// Loads an icon from an (ISO) archive file.
+		bool load_iso_icon(QPixmap& icon, const std::string& icon_path, const std::string& archive_path);
+
+		// Loads an icon (optionally from an (ISO) archive file).
+		bool load_icon(QPixmap& icon, const std::string& icon_path, const std::string& archive_path);
 
 		template <typename T>
 		void stop_future_watcher(QFutureWatcher<T>& watcher, bool cancel, std::shared_ptr<atomic_t<bool>> cancel_flag = nullptr)

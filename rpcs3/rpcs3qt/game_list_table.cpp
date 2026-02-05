@@ -11,6 +11,8 @@
 #include "Emu/vfs_config.h"
 #include "Utilities/StrUtil.h"
 
+#include "Loader/ISO.h"
+
 #include <QHeaderView>
 #include <QScrollBar>
 #include <QStringBuilder>
@@ -24,7 +26,7 @@ game_list_table::game_list_table(game_list_frame* frame, std::shared_ptr<persist
 	setItemDelegate(new game_list_delegate(this));
 	setEditTriggers(QAbstractItemView::NoEditTriggers);
 	setSelectionBehavior(QAbstractItemView::SelectRows);
-	setSelectionMode(QAbstractItemView::SingleSelection);
+	setSelectionMode(QAbstractItemView::ExtendedSelection);
 	setVerticalScrollMode(QAbstractItemView::ScrollPerPixel);
 	setHorizontalScrollMode(QAbstractItemView::ScrollPerPixel);
 	verticalScrollBar()->setSingleStep(20);
@@ -41,10 +43,10 @@ game_list_table::game_list_table(game_list_frame* frame, std::shared_ptr<persist
 	setColumnCount(static_cast<int>(gui::game_list_columns::count));
 	setMouseTracking(true);
 
-	connect(this, &game_list_table::size_on_disk_ready, this, [this](const game_info& game)
+	connect(this, &game_list_table::size_on_disk_ready, this, [this](const game_info& game, movie_item_base* item)
 	{
-		if (!game || !game->item) return;
-		if (QTableWidgetItem* size_item = item(static_cast<movie_item*>(game->item)->row(), static_cast<int>(gui::game_list_columns::dir_size)))
+		if (!game || !game->item || game->item != item) return;
+		if (QTableWidgetItem* size_item = this->item(static_cast<movie_item*>(game->item)->row(), static_cast<int>(gui::game_list_columns::dir_size)))
 		{
 			const u64& game_size = game->info.size_on_disk;
 			size_item->setText(game_size != umax ? gui::utils::format_byte_size(game_size) : tr("Unknown"));
@@ -52,10 +54,9 @@ game_list_table::game_list_table(game_list_frame* frame, std::shared_ptr<persist
 		}
 	});
 
-	connect(this, &game_list::IconReady, this, [this](const game_info& game)
+	connect(this, &game_list::IconReady, this, [this](const game_info& game, const movie_item_base* item)
 	{
-		if (!game || !game->item) return;
-		game->item->call_icon_func();
+		if (game && item && game->item == item) item->image_change_callback();
 	});
 }
 
@@ -84,10 +85,9 @@ void game_list_table::restore_layout(const QByteArray& state)
 
 void game_list_table::resize_columns_to_contents(int spacing)
 {
-	verticalHeader()->resizeSections(QHeaderView::ResizeMode::ResizeToContents);
 	horizontalHeader()->resizeSections(QHeaderView::ResizeMode::ResizeToContents);
 
-	// Make non-icon columns slighty bigger for better visuals
+	// Make non-icon columns slightly bigger for better visuals
 	for (int i = 1; i < columnCount(); i++)
 	{
 		if (isColumnHidden(i))
@@ -103,6 +103,7 @@ void game_list_table::resize_columns_to_contents(int spacing)
 void game_list_table::adjust_icon_column()
 {
 	// Fixate vertical header and row height
+	verticalHeader()->setDefaultSectionSize(m_icon_size.height());
 	verticalHeader()->setMinimumSectionSize(m_icon_size.height());
 	verticalHeader()->setMaximumSectionSize(m_icon_size.height());
 
@@ -159,9 +160,9 @@ void game_list_table::sort(usz game_count, int sort_column, Qt::SortOrder col_so
 	}
 
 	// Fixate vertical header and row height
+	verticalHeader()->setDefaultSectionSize(m_icon_size.height());
 	verticalHeader()->setMinimumSectionSize(m_icon_size.height());
 	verticalHeader()->setMaximumSectionSize(m_icon_size.height());
-	resizeRowsToContents();
 
 	// Resize columns if the game list was empty before
 	if (!old_row_count && !old_game_count)
@@ -205,7 +206,7 @@ void game_list_table::populate(
 	const std::vector<game_info>& game_data,
 	const std::map<QString, QString>& notes_map,
 	const std::map<QString, QString>& title_map,
-	const std::string& selected_item_id,
+	const std::set<std::string>& selected_item_ids,
 	bool play_hover_movies)
 {
 	clear_list();
@@ -216,12 +217,11 @@ void game_list_table::populate(
 	const QLocale locale{};
 	const Localized localized;
 
-	const QString game_icon_path = play_hover_movies ? QString::fromStdString(fs::get_config_dir() + "/Icons/game_icons/") : "";
 	const std::string dev_flash = g_cfg_vfs.get_dev_flash();
 
 	int row = 0;
 	int index = -1;
-	int selected_row = -1;
+	std::set<int> selected_rows;
 
 	const auto get_title = [&title_map](const QString& serial, const std::string& name) -> QString
 	{
@@ -244,7 +244,7 @@ void game_list_table::populate(
 		custom_table_widget_item* icon_item = new custom_table_widget_item;
 		game->item = icon_item;
 
-		icon_item->set_icon_func([this, icon_item, game](const QVideoFrame& frame)
+		icon_item->set_image_change_callback([this, icon_item, game](const QVideoFrame& frame)
 		{
 			if (!icon_item || !game)
 			{
@@ -254,19 +254,19 @@ void game_list_table::populate(
 			if (const QPixmap pixmap = icon_item->get_movie_image(frame); icon_item->get_active() && !pixmap.isNull())
 			{
 				icon_item->setData(Qt::DecorationRole, pixmap.scaled(m_icon_size, Qt::KeepAspectRatio));
+				return;
 			}
-			else
-			{
-				std::lock_guard lock(icon_item->pixmap_mutex);
 
+			std::lock_guard lock(icon_item->pixmap_mutex);
+
+			if (!game->pxmap.isNull())
+			{
 				icon_item->setData(Qt::DecorationRole, game->pxmap);
 
 				if (!game->has_hover_gif && !game->has_hover_pam)
 				{
 					game->pxmap = {};
 				}
-
-				icon_item->stop_movie();
 			}
 		});
 
@@ -279,6 +279,13 @@ void game_list_table::populate(
 					// Do not report size of apps inside /dev_flash (it does not make sense to do so)
 					game->info.size_on_disk = 0;
 				}
+				else if (is_file_iso(game->info.path))
+				{
+					fs::stat_t iso_stat;
+					fs::get_stat(game->info.path, iso_stat);
+
+					game->info.size_on_disk = iso_stat.size;
+				}
 				else
 				{
 					game->info.size_on_disk = fs::get_dir_size(game->info.path, 1, cancel.get());
@@ -286,19 +293,20 @@ void game_list_table::populate(
 
 				if (!cancel || !cancel->load())
 				{
-					Q_EMIT size_on_disk_ready(game);
+					Q_EMIT size_on_disk_ready(game, game->item);
 					return;
 				}
 			}
 		});
 
-		if (play_hover_movies && game->has_hover_gif)
+		if (play_hover_movies && (game->has_hover_gif || game->has_hover_pam))
 		{
-			icon_item->set_movie_path(game_icon_path % serial % "/hover.gif");
-		}
-		else if (play_hover_movies && game->has_hover_pam)
-		{
-			icon_item->set_movie_path(QString::fromStdString(game->info.movie_path));
+			icon_item->set_video_path(game->info.movie_path);
+
+			if (!fs::exists(game->info.movie_path) && is_file_iso(game->info.path))
+			{
+				icon_item->set_iso_path(game->info.path);
+			}
 		}
 
 		icon_item->setData(Qt::UserRole, index, true);
@@ -384,15 +392,18 @@ void game_list_table::populate(
 		setItem(row, static_cast<int>(gui::game_list_columns::compat),     compat_item);
 		setItem(row, static_cast<int>(gui::game_list_columns::dir_size),   new custom_table_widget_item(game_size != umax ? gui::utils::format_byte_size(game_size) : tr("Unknown"), Qt::UserRole, QVariant::fromValue<qulonglong>(game_size)));
 
-		if (selected_item_id == game->info.path + game->info.icon_path)
+		if (selected_item_ids.contains(game->info.path + game->info.icon_path))
 		{
-			selected_row = row;
+			selected_rows.insert(row);
 		}
 
 		row++;
 	}
 
-	selectRow(selected_row);
+	for (int selected_row : selected_rows)
+	{
+		selectionModel()->select(model()->index(selected_row, 0), QItemSelectionModel::Select | QItemSelectionModel::Rows);
+	}
 }
 
 void game_list_table::repaint_icons(std::vector<game_info>& game_data, const QColor& icon_color, const QSize& icon_size, qreal device_pixel_ratio)

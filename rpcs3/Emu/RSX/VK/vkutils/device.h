@@ -30,6 +30,8 @@ namespace vk
 
 	struct memory_type_mapping
 	{
+		std::vector<memory_heap_info> heaps;
+
 		memory_type_info host_visible_coherent;
 		memory_type_info device_local;
 		memory_type_info device_bar;
@@ -37,8 +39,6 @@ namespace vk
 		u64 device_local_total_bytes;
 		u64 host_visible_total_bytes;
 		u64 device_bar_total_bytes;
-
-		PFN_vkGetMemoryHostPointerPropertiesEXT _vkGetMemoryHostPointerPropertiesEXT;
 	};
 
 	struct descriptor_indexing_features
@@ -61,6 +61,14 @@ namespace vk
 		operator bool() const { return supported; }
 	};
 
+	struct multidraw_features
+	{
+		bool supported;
+		u32 max_batch_size;
+
+		operator bool() const { return supported; }
+	};
+
 	class physical_device
 	{
 		VkInstance parent = VK_NULL_HANDLE;
@@ -79,6 +87,8 @@ namespace vk
 
 		custom_border_color_features custom_border_color_support{};
 
+		multidraw_features multidraw_support{};
+
 		struct
 		{
 			bool barycentric_coords = false;
@@ -86,19 +96,20 @@ namespace vk
 			bool debug_utils = false;
 			bool external_memory_host = false;
 			bool framebuffer_loops = false;
-			bool sampler_mirror_clamped = false;
 			bool shader_stencil_export = false;
 			bool surface_capabilities_2 = false;
 			bool synchronization_2 = false;
 			bool unrestricted_depth_range = false;
 			bool extended_device_fault = false;
 			bool texture_compression_bc = false;
+			bool portability = false;
 		} optional_features_support;
 
 		friend class render_device;
 	private:
 		void get_physical_device_features(bool allow_extensions);
-		void get_physical_device_properties(bool allow_extensions);
+		void get_physical_device_properties_0(bool allow_extensions);
+		void get_physical_device_properties_1(bool allow_extensions);
 
 	public:
 
@@ -129,7 +140,6 @@ namespace vk
 		physical_device* pgpu = nullptr;
 		memory_type_mapping memory_map{};
 		gpu_formats_support m_formats_support{};
-		pipeline_binding_table m_pipeline_binding_table{};
 		std::unique_ptr<mem_allocator_base> m_allocator;
 		VkDevice dev = VK_NULL_HANDLE;
 
@@ -146,18 +156,6 @@ namespace vk
 			const VkPhysicalDeviceFeatures& requested_features) const;
 
 	public:
-		// Exported device endpoints
-		PFN_vkCmdBeginConditionalRenderingEXT _vkCmdBeginConditionalRenderingEXT = nullptr;
-		PFN_vkCmdEndConditionalRenderingEXT _vkCmdEndConditionalRenderingEXT = nullptr;
-		PFN_vkSetDebugUtilsObjectNameEXT _vkSetDebugUtilsObjectNameEXT = nullptr;
-		PFN_vkQueueInsertDebugUtilsLabelEXT _vkQueueInsertDebugUtilsLabelEXT = nullptr;
-		PFN_vkCmdInsertDebugUtilsLabelEXT _vkCmdInsertDebugUtilsLabelEXT = nullptr;
-		PFN_vkCmdSetEvent2KHR _vkCmdSetEvent2KHR = nullptr;
-		PFN_vkCmdWaitEvents2KHR _vkCmdWaitEvents2KHR = nullptr;
-		PFN_vkCmdPipelineBarrier2KHR _vkCmdPipelineBarrier2KHR = nullptr;
-		PFN_vkGetDeviceFaultInfoEXT _vkGetDeviceFaultInfoEXT = nullptr;
-
-	public:
 		render_device() = default;
 		~render_device() = default;
 
@@ -172,9 +170,9 @@ namespace vk
 		const physical_device& gpu() const { return *pgpu; }
 		const memory_type_mapping& get_memory_mapping() const { return memory_map; }
 		const gpu_formats_support& get_formats_support() const { return m_formats_support; }
-		const pipeline_binding_table& get_pipeline_binding_table() const { return m_pipeline_binding_table; }
 		const gpu_shader_types_support& get_shader_types_support() const { return pgpu->shader_types_support; }
 		const custom_border_color_features& get_custom_border_color_support() const { return pgpu->custom_border_color_support; }
+		const multidraw_features get_multidraw_support() const { return pgpu->multidraw_support; }
 
 		bool get_shader_stencil_export_support() const { return pgpu->optional_features_support.shader_stencil_export; }
 		bool get_depth_bounds_support() const { return pgpu->features.depthBounds != VK_FALSE; }
@@ -186,7 +184,6 @@ namespace vk
 		bool get_external_memory_host_support() const { return pgpu->optional_features_support.external_memory_host; }
 		bool get_surface_capabilities_2_support() const { return pgpu->optional_features_support.surface_capabilities_2; }
 		bool get_debug_utils_support() const { return g_cfg.video.renderdoc_compatiblity && pgpu->optional_features_support.debug_utils; }
-		bool get_descriptor_indexing_support() const { return pgpu->descriptor_indexing_support; }
 		bool get_framebuffer_loops_support() const { return pgpu->optional_features_support.framebuffer_loops; }
 		bool get_barycoords_support() const { return pgpu->optional_features_support.barycentric_coords; }
 		bool get_synchronization2_support() const { return pgpu->optional_features_support.synchronization_2; }
@@ -210,7 +207,6 @@ namespace vk
 
 	memory_type_mapping get_memory_mapping(const physical_device& dev);
 	gpu_formats_support get_optimal_tiling_supported_formats(const physical_device& dev);
-	pipeline_binding_table get_pipeline_binding_table(const physical_device& dev);
 
 	extern const render_device* g_render_device;
 }

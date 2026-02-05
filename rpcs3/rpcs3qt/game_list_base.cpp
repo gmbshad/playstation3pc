@@ -1,4 +1,5 @@
 #include "stdafx.h"
+#include "qt_utils.h"
 #include "game_list_base.h"
 
 #include <QDir>
@@ -25,7 +26,7 @@ void game_list_base::repaint_icons(std::vector<game_info>& game_data, const QCol
 	for (game_info& game : game_data)
 	{
 		game->pxmap = placeholder;
-	
+
 		if (movie_item_base* item = game->item)
 		{
 			item->set_icon_load_func([this, game, device_pixel_ratio, cancel = item->icon_loading_aborted()](int)
@@ -33,7 +34,7 @@ void game_list_base::repaint_icons(std::vector<game_info>& game_data, const QCol
 				IconLoadFunction(game, device_pixel_ratio, cancel);
 			});
 
-			item->call_icon_func();
+			item->image_change_callback();
 		}
 	}
 }
@@ -48,7 +49,7 @@ void game_list_base::IconLoadFunction(game_info game, qreal device_pixel_ratio, 
 	static std::unordered_set<std::string> warn_once_list;
 	static shared_mutex s_mtx;
 
-	if (game->icon.isNull() && (game->info.icon_path.empty() || !game->icon.load(QString::fromStdString(game->info.icon_path))))
+	if (game->icon.isNull() && !gui::utils::load_icon(game->icon, game->info.icon_path, game->icon_in_archive ? game->info.path : ""))
 	{
 		if (game_list_log.warning)
 		{
@@ -73,13 +74,13 @@ void game_list_base::IconLoadFunction(game_info game, qreal device_pixel_ratio, 
 	const QColor color = GetGridCompatibilityColor(game->compat.color);
 	{
 		std::lock_guard lock(game->item->pixmap_mutex);
-		game->pxmap = PaintedPixmap(game->icon, device_pixel_ratio, game->hasCustomConfig, game->hasCustomPadConfig, color);
+		game->pxmap = PaintedPixmap(game->icon, device_pixel_ratio, game->has_custom_config, game->has_custom_pad_config, color);
 	}
 
 	if (!cancel || !cancel->load())
 	{
 		if (m_icon_ready_callback)
-			m_icon_ready_callback(game);
+			m_icon_ready_callback(game, game->item);
 	}
 }
 
@@ -197,17 +198,17 @@ QIcon game_list_base::GetCustomConfigIcon(const game_info& game)
 	static const QIcon icon_custom_config(":/Icons/custom_config.png");
 	static const QIcon icon_controllers(":/Icons/controllers.png");
 
-	if (game->hasCustomConfig && game->hasCustomPadConfig)
+	if (game->has_custom_config && game->has_custom_pad_config)
 	{
 		return icon_combo_config_bordered;
 	}
 
-	if (game->hasCustomConfig)
+	if (game->has_custom_config)
 	{
 		return icon_custom_config;
 	}
 
-	if (game->hasCustomPadConfig)
+	if (game->has_custom_pad_config)
 	{
 		return icon_controllers;
 	}

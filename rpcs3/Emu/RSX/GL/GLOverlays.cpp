@@ -176,6 +176,8 @@ namespace gl
 				cmd->disablei(GL_BLEND, 0);
 			}
 
+			cmd->polygon_mode(GL_FILL);
+
 			// Render
 			cmd->use_program(program_handle.id());
 			on_load();
@@ -218,12 +220,12 @@ namespace gl
 		m_input_filter = gl::filter::linear;
 	}
 
-	gl::texture_view* ui_overlay_renderer::load_simple_image(rsx::overlays::image_info* desc, bool temp_resource, u32 owner_uid)
+	gl::texture_view* ui_overlay_renderer::load_simple_image(rsx::overlays::image_info_base* desc, bool temp_resource, u32 owner_uid)
 	{
 		auto tex = std::make_unique<gl::texture>(GL_TEXTURE_2D, desc->w, desc->h, 1, 1, 1, GL_RGBA8, RSX_FORMAT_CLASS_COLOR);
 		tex->copy_from(desc->get_data(), gl::texture::format::rgba, gl::texture::type::uint_8_8_8_8, {});
 
-		GLenum remap[] = { GL_RED, GL_ALPHA, GL_BLUE, GL_GREEN };
+		const GLenum remap[] = { GL_RED, GL_ALPHA, GL_BLUE, GL_GREEN };
 		auto view = std::make_unique<gl::texture_view>(tex.get(), remap);
 
 		auto result = view.get();
@@ -234,7 +236,7 @@ namespace gl
 		}
 		else
 		{
-			u64 key = reinterpret_cast<u64>(desc);
+			const u64 key = reinterpret_cast<u64>(desc);
 			temp_image_cache[key] = std::make_pair(owner_uid, std::move(tex));
 			temp_view_cache[key] = std::move(view);
 		}
@@ -249,7 +251,7 @@ namespace gl
 		rsx::overlays::resource_config configuration;
 		configuration.load_files();
 
-		for (const auto &res : configuration.texture_raw_data)
+		for (const auto& res : configuration.texture_raw_data)
 		{
 			load_simple_image(res.get(), false, -1);
 		}
@@ -318,13 +320,22 @@ namespace gl
 		return result;
 	}
 
-	gl::texture_view* ui_overlay_renderer::find_temp_image(rsx::overlays::image_info* desc, u32 owner_uid)
+	gl::texture_view* ui_overlay_renderer::find_temp_image(rsx::overlays::image_info_base* desc, u32 owner_uid)
 	{
-		auto key = reinterpret_cast<u64>(desc);
+		const bool dirty = std::exchange(desc->dirty, false);
+		const u64 key = reinterpret_cast<u64>(desc);
+
 		auto cached = temp_view_cache.find(key);
 		if (cached != temp_view_cache.end())
 		{
-			return cached->second.get();
+			gl::texture_view* view = cached->second.get();
+
+			if (dirty)
+			{
+				view->image()->copy_from(desc->get_data(), gl::texture::format::rgba, gl::texture::type::uint_8_8_8_8, {});
+			}
+
+			return view;
 		}
 
 		return load_simple_image(desc, true, owner_uid);
@@ -386,7 +397,7 @@ namespace gl
 		}
 	}
 
-	void ui_overlay_renderer::run(gl::command_context& cmd_, const areau& viewport, GLuint target, rsx::overlays::overlay& ui)
+	void ui_overlay_renderer::run(gl::command_context& cmd_, const areau& viewport, GLuint target, rsx::overlays::overlay& ui, bool flip_vertically)
 	{
 		program_handle.uniforms["viewport"] = color4f(static_cast<f32>(viewport.width()), static_cast<f32>(viewport.height()), static_cast<f32>(viewport.x1), static_cast<f32>(viewport.y1));
 		program_handle.uniforms["ui_scale"] = color4f(static_cast<f32>(ui.virtual_width), static_cast<f32>(ui.virtual_height), 1.f, 1.f);
@@ -420,7 +431,7 @@ namespace gl
 			}
 			case rsx::overlays::image_resource_id::raw_image:
 			{
-				cmd_->bind_texture(31, GL_TEXTURE_2D, find_temp_image(static_cast<rsx::overlays::image_info*>(cmd.config.external_data_ref), ui.uid)->id());
+				cmd_->bind_texture(31, GL_TEXTURE_2D, find_temp_image(static_cast<rsx::overlays::image_info_base*>(cmd.config.external_data_ref), ui.uid)->id());
 				break;
 			}
 			case rsx::overlays::image_resource_id::font_file:
@@ -436,12 +447,13 @@ namespace gl
 			}
 			}
 
-			rsx::overlays::vertex_options vert_opts;
+			rsx::overlays::vertex_options vert_opts {};
 			program_handle.uniforms["vertex_config"] = vert_opts
 				.disable_vertex_snap(cmd.config.disable_vertex_snap)
+				.enable_vertical_flip(flip_vertically)
 				.get();
 
-			rsx::overlays::fragment_options draw_opts;
+			rsx::overlays::fragment_options draw_opts {};
 			program_handle.uniforms["fragment_config"] = draw_opts
 				.texture_mode(texture_mode)
 				.clip_fragments(cmd.config.clip_region)
@@ -478,7 +490,8 @@ namespace gl
 		m_input_filter = gl::filter::linear;
 	}
 
-	void video_out_calibration_pass::run(gl::command_context& cmd, const areau& viewport, const rsx::simple_array<GLuint>& source, f32 gamma, bool limited_rgb, stereo_render_mode_options stereo_mode, gl::filter input_filter)
+	void video_out_calibration_pass::run(gl::command_context& cmd, const areau& viewport, const rsx::simple_array<GLuint>& source, f32 gamma, bool limited_rgb,
+		bool stereo_enabled, stereo_render_mode_options stereo_mode, gl::filter input_filter)
 	{
 		if (m_input_filter != input_filter)
 		{
@@ -489,7 +502,7 @@ namespace gl
 
 		program_handle.uniforms["gamma"] = gamma;
 		program_handle.uniforms["limit_range"] = limited_rgb + 0;
-		program_handle.uniforms["stereo_display_mode"] = static_cast<u8>(stereo_mode);
+		program_handle.uniforms["stereo_display_mode"] = stereo_enabled ? static_cast<u8>(stereo_mode) : 0;
 		program_handle.uniforms["stereo_image_count"] = (source[1] == GL_NONE? 1 : 2);
 
 		saved_sampler_state saved(GL_TEMP_IMAGE_SLOT(0), m_sampler);

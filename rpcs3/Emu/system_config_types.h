@@ -116,7 +116,10 @@ enum class camera_handler
 {
 	null,
 	fake,
-	qt
+	qt,
+#ifdef HAVE_SDL3
+	sdl,
+#endif
 };
 
 enum class camera_flip
@@ -248,17 +251,23 @@ enum class rsx_fifo_mode : unsigned
 	as_ps3,
 };
 
-enum class tsx_usage
-{
-	disabled,
-	enabled,
-	forced,
-};
-
 enum class enter_button_assign
 {
 	circle, // CELL_SYSUTIL_ENTER_BUTTON_ASSIGN_CIRCLE
 	cross   // CELL_SYSUTIL_ENTER_BUTTON_ASSIGN_CROSS
+};
+
+enum class date_format
+{
+	yyyymmdd, // CELL_SYSUTIL_DATE_FMT_YYYYMMDD
+	ddmmyyyy, // CELL_SYSUTIL_DATE_FMT_DDMMYYYY
+	mmddyyyy  // CELL_SYSUTIL_DATE_FMT_MMDDYYYY
+};
+
+enum class time_format
+{
+	clock12, // CELL_SYSUTIL_TIME_FMT_CLOCK12
+	clock24  // CELL_SYSUTIL_TIME_FMT_CLOCK24
 };
 
 enum class np_internet_status

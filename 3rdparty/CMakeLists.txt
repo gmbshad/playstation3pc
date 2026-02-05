@@ -25,18 +25,8 @@ add_subdirectory(zstd EXCLUDE_FROM_ALL)
 # 7zip sdk
 add_subdirectory(7zip EXCLUDE_FROM_ALL)
 
-add_library(3rdparty_flatbuffers INTERFACE)
-if (USE_SYSTEM_FLATBUFFERS)
-	pkg_check_modules(FLATBUFFERS REQUIRED IMPORTED_TARGET flatbuffers>=2.0.0)
-	target_link_libraries(3rdparty_flatbuffers INTERFACE PkgConfig::FLATBUFFERS)
-	set(FBS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../rpcs3/Emu/NP/generated/")
-	execute_process(COMMAND flatc --cpp -o "${FBS_DIR}" "${FBS_DIR}/np2_structs.fbs" RESULT_VARIABLE FBS_CMD_ERROR)
-	if(FBS_CMD_ERROR AND NOT FBS_CMD_ERROR EQUAL 0)
-		message(FATAL_ERROR "flatc failed to regenerate flatbuffers headers.")
-	endif()
-else()
-	target_include_directories(3rdparty_flatbuffers INTERFACE flatbuffers/include)
-endif()
+# Protobuf
+add_subdirectory(protobuf EXCLUDE_FROM_ALL)
 
 # libPNG
 add_subdirectory(libpng EXCLUDE_FROM_ALL)
@@ -51,6 +41,14 @@ else()
 	add_subdirectory(pugixml EXCLUDE_FROM_ALL)
 endif()
 
+if (USE_SYSTEM_VULKAN_MEMORY_ALLOCATOR)
+	find_package(VulkanMemoryAllocator REQUIRED GLOBAL)
+	add_library(3rdparty::vulkanmemoryallocator ALIAS GPUOpen::VulkanMemoryAllocator)
+else()
+	add_library(3rdparty_vulkanmemoryallocator INTERFACE)
+	target_include_directories(3rdparty_vulkanmemoryallocator SYSTEM INTERFACE GPUOpen/VulkanMemoryAllocator/include)
+	add_library(3rdparty::vulkanmemoryallocator ALIAS 3rdparty_vulkanmemoryallocator)
+endif()
 
 # libusb
 if(CMAKE_SYSTEM_NAME MATCHES "DragonFly|FreeBSD")
@@ -92,9 +90,6 @@ add_subdirectory(hidapi)
 
 # glslang
 add_subdirectory(glslang EXCLUDE_FROM_ALL)
-add_library(3rdparty_glslang INTERFACE)
-target_link_libraries(3rdparty_glslang INTERFACE SPIRV)
-
 
 # yaml-cpp
 add_subdirectory(yaml-cpp)
@@ -102,11 +97,11 @@ add_subdirectory(yaml-cpp)
 
 # OpenGL
 
-if (NOT ANDROID)
+if (NOT ANDROID AND NOT APPLE)
 	find_package(OpenGL REQUIRED OPTIONAL_COMPONENTS EGL)
 
 	add_library(3rdparty_opengl INTERFACE)
-	target_include_directories(3rdparty_opengl INTERFACE GL)
+	target_include_directories(3rdparty_opengl SYSTEM INTERFACE GL)
 
 	if (WIN32)
 		if(NOT MSVC)
@@ -114,8 +109,6 @@ if (NOT ANDROID)
 		else()
 			target_link_libraries(3rdparty_opengl INTERFACE dxgi.lib d2d1.lib dwrite.lib)
 		endif()
-	elseif(APPLE)
-		target_link_libraries(3rdparty_opengl INTERFACE OpenGL::GL OpenGL::GLU)
 	else()
 		target_link_libraries(3rdparty_opengl INTERFACE OpenGL::GL OpenGL::GLU OpenGL::GLX)
 	endif()
@@ -131,7 +124,14 @@ add_subdirectory(stblib)
 add_subdirectory(discord-rpc)
 
 # Cubeb
-add_subdirectory(cubeb EXCLUDE_FROM_ALL)
+if(USE_SYSTEM_CUBEB)
+	find_package(cubeb REQUIRED GLOBAL)
+	message(STATUS "Using system cubeb version '${cubeb_VERSION}'")
+	add_library(3rdparty::cubeb ALIAS cubeb::cubeb)
+else()
+	message(STATUS "Using static cubeb from 3rdparty")
+	add_subdirectory(cubeb EXCLUDE_FROM_ALL)
+endif()
 
 # SoundTouch
 add_subdirectory(SoundTouch EXCLUDE_FROM_ALL)
@@ -192,10 +192,7 @@ if(USE_VULKAN)
 			find_package(Wayland)
 			if (WAYLAND_FOUND)
 				target_include_directories(3rdparty_vulkan
-					INTERFACE ${WAYLAND_INCLUDE_DIR})
-
-				target_compile_definitions(3rdparty_vulkan
-					INTERFACE -DVK_USE_PLATFORM_WAYLAND_KHR)
+					SYSTEM INTERFACE ${WAYLAND_INCLUDE_DIR})
 			endif()
 		endif()
 
@@ -211,6 +208,29 @@ endif()
 # AsmJit
 add_subdirectory(asmjit EXCLUDE_FROM_ALL)
 
+# SDL3
+set(SDL3_TARGET 3rdparty_dummy_lib)
+if(USE_SDL)
+	if(USE_SYSTEM_SDL)
+		find_package(SDL3)
+		if(SDL3_FOUND AND SDL3_VERSION VERSION_GREATER_EQUAL 3.2.0)
+			message(STATUS "Using system SDL3 version '${SDL3_VERSION}'")
+			add_library(3rdparty_sdl3 INTERFACE)
+			target_compile_definitions(3rdparty_sdl3 INTERFACE -DHAVE_SDL3=1)
+			target_link_libraries(3rdparty_sdl3 INTERFACE SDL3::SDL3)
+			set(SDL3_TARGET 3rdparty_sdl3)
+		else()
+			message(FATAL_ERROR "SDL3 is not available on this system")
+		endif()
+	else()
+		message(STATUS "Using static SDL3 from 3rdparty")
+		add_subdirectory(libsdl-org EXCLUDE_FROM_ALL)
+		target_compile_definitions(SDL3-static INTERFACE -DHAVE_SDL3=1)
+		set(SDL3_TARGET SDL3-static)
+		set(SDL3_DIR "${CMAKE_CURRENT_BINARY_DIR}/libsdl-org/SDL" CACHE STRING "")
+	endif()
+endif()
+
 # OpenAL
 if (NOT ANDROID)
 	add_subdirectory(OpenAL EXCLUDE_FROM_ALL)
@@ -225,31 +245,31 @@ if(USE_FAUDIO)
 	# FAudio depends on SDL3
 	find_package(SDL3)
 	if (USE_SYSTEM_FAUDIO)
-		if (NOT SDL3_FOUND OR SDL3_VERSION VERSION_LESS 3.2.0)
-			message(WARNING
-				"RPCS3: System FAudio requires SDL 3.2.0 or newer. Since a valid SDL3"
-				">=3.2.0 version cannot be found, building with FAudio will be skipped.")
-			set(USE_FAUDIO OFF CACHE BOOL "Disabled using system FAudio with SDL < 3.2.0" FORCE)
-		else()
+		if (SDL3_FOUND AND SDL3_VERSION VERSION_GREATER_EQUAL 3.2.0)
 			message(STATUS "RPCS3: Using system FAudio")
 			find_package(FAudio REQUIRED CONFIGS FAudioConfig.cmake FAudio-config.cmake)
 			add_library(3rdparty_FAudio INTERFACE)
 			target_link_libraries(3rdparty_FAudio INTERFACE FAudio)
 			target_compile_definitions(3rdparty_FAudio INTERFACE -DHAVE_FAUDIO)
 			set(FAUDIO_TARGET 3rdparty_FAudio)
+		else()
+			message(WARNING
+				"RPCS3: System FAudio requires SDL 3.2.0 or newer. Since a valid SDL3"
+				">=3.2.0 version cannot be found, building with FAudio will be skipped.")
+			set(USE_FAUDIO OFF CACHE BOOL "Disabled using system FAudio with SDL < 3.2.0" FORCE)
 		endif()
 	else()
-		if (NOT SDL3_FOUND OR SDL3_VERSION VERSION_LESS 3.2.0)
-			message(WARNING
-				"-- RPCS3: 3rdparty FAudio requires SDL 3.2.0 or newer. Since a valid SDL3"
-				">=3.2.0 version cannot be found, building with FAudio will be skipped.")
-			set(USE_FAUDIO OFF CACHE BOOL "Disabled FAudio with SDL < 3.2.0" FORCE)
-		else()
+		if (SDL3_FOUND AND SDL3_VERSION VERSION_GREATER_EQUAL 3.2.0)
 			message(STATUS "RPCS3: Using builtin FAudio")
 			set(BUILD_SHARED_LIBS OFF CACHE BOOL "Build shared library")
 			add_subdirectory(FAudio EXCLUDE_FROM_ALL)
 			target_compile_definitions(FAudio-static INTERFACE -DHAVE_FAUDIO)
 			set(FAUDIO_TARGET FAudio-static)
+		else()
+			message(WARNING
+				"-- RPCS3: 3rdparty FAudio requires SDL 3.2.0 or newer. Since a valid SDL3"
+				">=3.2.0 version cannot be found, building with FAudio will be skipped.")
+			set(USE_FAUDIO OFF CACHE BOOL "Disabled FAudio with SDL < 3.2.0" FORCE)
 		endif()
 	endif()
 endif()
@@ -266,7 +286,7 @@ if(NOT ANDROID)
 		message(STATUS "RPCS3: using shared ffmpeg")
 		find_package(FFMPEG REQUIRED)
 
-		target_include_directories(3rdparty_ffmpeg INTERFACE ${FFMPEG_INCLUDE_DIR})
+		target_include_directories(3rdparty_ffmpeg SYSTEM INTERFACE ${FFMPEG_INCLUDE_DIR})
 		target_link_libraries(3rdparty_ffmpeg INTERFACE ${FFMPEG_LIBRARIES})
 	else()
 		message(STATUS "RPCS3: using builtin ffmpeg")
@@ -296,14 +316,14 @@ if(NOT ANDROID)
 			${FFMPEG_LIB_SWSCALE}
 			${FFMPEG_LIB_SWRESAMPLE}
 		)
-		target_include_directories(3rdparty_ffmpeg INTERFACE "ffmpeg/include")
+		target_include_directories(3rdparty_ffmpeg SYSTEM INTERFACE "ffmpeg/include")
 	endif()
 endif()
 
 
 # GLEW
 add_library(3rdparty_glew INTERFACE)
-if(NOT MSVC AND NOT ANDROID)
+if(NOT MSVC AND NOT ANDROID AND NOT APPLE)
 	find_package(GLEW REQUIRED)
 	target_link_libraries(3rdparty_glew INTERFACE GLEW::GLEW)
 endif()
@@ -318,29 +338,6 @@ add_subdirectory(wolfssl EXCLUDE_FROM_ALL)
 # CURL
 add_subdirectory(curl EXCLUDE_FROM_ALL)
 
-# SDL3
-set(SDL3_TARGET 3rdparty_dummy_lib)
-if(USE_SDL)
-	if(USE_SYSTEM_SDL)
-		find_package(SDL3)
-		if(SDL3_FOUND AND NOT SDL3_VERSION VERSION_LESS 3.2.0)
-			message(STATUS "Using system SDL3 version '${SDL3_VERSION}'")
-			add_library(3rdparty_sdl3 INTERFACE)
-			target_compile_definitions(3rdparty_sdl3 INTERFACE -DHAVE_SDL3=1)
-			target_link_libraries(3rdparty_sdl3 INTERFACE SDL3::SDL3)
-			set(SDL3_TARGET 3rdparty_sdl3)
-		else()
-			message(FATAL_ERROR "SDL3 is not available on this system")
-		endif()
-	else()
-		message(STATUS "Using static SDL3 from 3rdparty")
-		add_library(3rdparty_sdl3 INTERFACE)
-		target_compile_definitions(3rdparty_sdl3 INTERFACE -DHAVE_SDL3=1)
-		add_subdirectory(libsdl-org EXCLUDE_FROM_ALL)
-		set(SDL3_TARGET 3rdparty_sdl3)
-	endif()
-endif()
-
 # MINIUPNP
 add_subdirectory(miniupnp EXCLUDE_FROM_ALL)
 
@@ -353,6 +350,9 @@ add_subdirectory(opencv EXCLUDE_FROM_ALL)
 # FUSION
 add_subdirectory(fusion EXCLUDE_FROM_ALL)
 
+# FERAL INTERACTIVE
+add_subdirectory(feralinteractive EXCLUDE_FROM_ALL)
+
 # add nice ALIAS targets for ease of use
 if(USE_SYSTEM_LIBUSB)
 	add_library(3rdparty::libusb ALIAS usb-1.0-shared)
@@ -362,7 +362,7 @@ endif()
 add_library(3rdparty::zlib ALIAS 3rdparty_zlib)
 add_library(3rdparty::zstd ALIAS 3rdparty_zstd)
 add_library(3rdparty::7zip ALIAS 3rdparty_7zip)
-add_library(3rdparty::flatbuffers ALIAS 3rdparty_flatbuffers)
+add_library(3rdparty::protobuf ALIAS 3rdparty_protobuf)
 add_library(3rdparty::pugixml ALIAS pugixml)
 add_library(3rdparty::glslang ALIAS 3rdparty_glslang)
 add_library(3rdparty::yaml-cpp ALIAS yaml-cpp)
@@ -381,7 +381,8 @@ add_library(3rdparty::wolfssl ALIAS wolfssl)
 add_library(3rdparty::libcurl ALIAS 3rdparty_libcurl)
 add_library(3rdparty::soundtouch ALIAS soundtouch)
 add_library(3rdparty::sdl3 ALIAS ${SDL3_TARGET})
-add_library(3rdparty::miniupnpc ALIAS libminiupnpc-static)
+add_library(3rdparty::miniupnpc ALIAS 3rdparty_miniupnpc)
 add_library(3rdparty::rtmidi ALIAS rtmidi)
 add_library(3rdparty::opencv ALIAS ${OPENCV_TARGET})
 add_library(3rdparty::fusion ALIAS Fusion)
+add_library(3rdparty::feralinteractive ALIAS 3rdparty_feralinteractive)

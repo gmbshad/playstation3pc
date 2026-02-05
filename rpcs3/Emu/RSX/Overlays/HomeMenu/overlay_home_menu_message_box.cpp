@@ -1,6 +1,5 @@
 #include "stdafx.h"
 #include "overlay_home_menu_message_box.h"
-#include "Emu/System.h"
 #include "Emu/system_config.h"
 
 namespace rsx
@@ -44,7 +43,7 @@ namespace rsx
 
 		compiled_resource& home_menu_message_box::get_compiled()
 		{
-			if (!is_compiled)
+			if (!is_compiled())
 			{
 				compiled_resource& compiled = overlay_element::get_compiled();
 				compiled.add(m_label.get_compiled());
@@ -77,7 +76,7 @@ namespace rsx
 			{
 			case pad_button::cross:
 			{
-				Emu.GetCallbacks().play_sound(fs::get_config_dir() + "sounds/snd_decide.wav");
+				play_sound(sound_effect::accept);
 				if (m_on_accept)
 				{
 					m_on_accept();
@@ -86,7 +85,7 @@ namespace rsx
 			}
 			case pad_button::circle:
 			{
-				Emu.GetCallbacks().play_sound(fs::get_config_dir() + "sounds/snd_cancel.wav");
+				play_sound(sound_effect::cancel);
 				if (m_on_cancel)
 				{
 					m_on_cancel();

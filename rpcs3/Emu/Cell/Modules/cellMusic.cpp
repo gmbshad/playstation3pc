@@ -177,6 +177,11 @@ struct music_state
 				return CELL_MUSIC_ERROR_NO_MORE_CONTENT;
 			}
 
+			if (!fs::is_file(path))
+			{
+				cellMusic.error("set_playback_command: File does not exist: '%s'", path);
+			}
+
 			switch (command)
 			{
 			case CELL_MUSIC_PB_CMD_FASTFORWARD:
@@ -210,7 +215,7 @@ error_code cell_music_select_contents()
 	const std::string vfs_dir_path = vfs::get("/dev_hdd0/music");
 	const std::string title = get_localized_string(localized_string_id::RSX_OVERLAYS_MEDIA_DIALOG_TITLE);
 
-	error_code error = rsx::overlays::show_media_list_dialog(rsx::overlays::media_list_dialog::media_type::audio, vfs_dir_path, title,
+	error_code error = rsx::overlays::show_media_list_dialog(rsx::overlays::media_list_dialog::media_type::audio, music_selection_context::max_depth, vfs_dir_path, title,
 		[&music](s32 status, utils::media_info info)
 		{
 			sysutil_register_cb([&music, info = std::move(info), status](ppu_thread& ppu) -> s32

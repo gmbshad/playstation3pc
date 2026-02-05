@@ -15,7 +15,6 @@
 #endif
 #include "Emu/Io/PadHandler.h"
 #include "Emu/system_config.h"
-#include "Utilities/Thread.h"
 #include "rpcs3qt/gui_settings.h"
 
 #ifdef __linux__
@@ -43,18 +42,13 @@ atomic_t<bool> gui_pad_thread::m_reset = false;
 
 gui_pad_thread::gui_pad_thread()
 {
-	m_thread = std::make_unique<std::thread>(&gui_pad_thread::run, this);
+	m_thread = std::make_unique<named_thread<std::function<void()>>>("Gui Pad Thread", [this](){ run(); });
 }
 
 gui_pad_thread::~gui_pad_thread()
 {
-	m_terminate = true;
-
-	if (m_thread && m_thread->joinable())
-	{
-		m_thread->join();
-		m_thread.reset();
-	}
+	// Join thread
+	m_thread.reset();
 
 #ifdef __linux__
 	if (m_uinput_fd != 1)
@@ -175,7 +169,7 @@ bool gui_pad_thread::init()
 	usetup.id.bustype = BUS_USB;
 	usetup.id.vendor = 0x1234;
 	usetup.id.product = 0x1234;
-	std::strcpy(usetup.name, "RPCS3 GUI Input Device");
+	strcpy_trunc(usetup.name, "RPCS3 GUI Input Device"sv);
 
 	// The ioctls below will enable the device that is about to be created to pass events.
 	CHECK_IOCTRL_RET(ioctl(m_uinput_fd, UI_SET_EVBIT, EV_KEY));
@@ -240,26 +234,28 @@ std::shared_ptr<PadHandlerBase> gui_pad_thread::GetHandler(pad_handler type)
 
 void gui_pad_thread::InitPadConfig(cfg_pad& cfg, pad_handler type, std::shared_ptr<PadHandlerBase>& handler)
 {
+	// We need to restore the original defaults first.
+	cfg.restore_defaults();
+
 	if (!handler)
 	{
 		handler = GetHandler(type);
+	}
 
-		if (handler)
-		{
-			handler->init_config(&cfg);
-		}
+	if (handler)
+	{
+		// Set and apply actual defaults depending on pad handler
+		handler->init_config(&cfg);
 	}
 }
 
 void gui_pad_thread::run()
 {
-	thread_base::set_name("Gui Pad Thread");
-
 	gui_log.notice("gui_pad_thread: Pad thread started");
 
 	m_reset = true;
 
-	while (!m_terminate)
+	while (thread_ctrl::state() != thread_state::aborting)
 	{
 		if (m_reset && m_reset.exchange(false))
 		{
@@ -275,7 +271,7 @@ void gui_pad_thread::run()
 		{
 			m_handler->process();
 
-			if (m_terminate)
+			if (thread_ctrl::state() == thread_state::aborting)
 			{
 				break;
 			}
@@ -283,12 +279,7 @@ void gui_pad_thread::run()
 			process_input();
 		}
 
-		if (m_terminate)
-		{
-			break;
-		}
-
-		std::this_thread::sleep_for(10ms);
+		thread_ctrl::wait_for(10000);
 	}
 
 	gui_log.notice("gui_pad_thread: Pad thread stopped");
@@ -296,7 +287,7 @@ void gui_pad_thread::run()
 
 void gui_pad_thread::process_input()
 {
-	if (!m_pad || !(m_pad->m_port_status & CELL_PAD_STATUS_CONNECTED))
+	if (!m_pad || !m_pad->is_connected())
 	{
 		return;
 	}

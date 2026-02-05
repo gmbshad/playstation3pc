@@ -79,7 +79,8 @@ std::string cfg_rpcn::get_host() const
 std::vector<std::pair<std::string, std::string>> cfg_rpcn::get_hosts()
 {
 	std::vector<std::pair<std::string, std::string>> vec_hosts;
-	auto hosts_list = fmt::split(hosts.to_string(), {"|||"});
+	const std::string host_str = hosts.to_string();
+	const auto hosts_list = fmt::split_sv(host_str, {"|||"});
 
 	for (const auto& cur_host : hosts_list)
 	{
@@ -190,9 +191,8 @@ bool cfg_rpcn::add_host(std::string_view new_description, std::string_view new_h
 
 bool cfg_rpcn::del_host(std::string_view del_description, std::string_view del_host)
 {
-	// Do not delete default servers
-	if ((del_description == "Official RPCN Server" && del_host == "np.rpcs3.net") ||
-		(del_description == "RPCN Test Server" && del_host == "test-np.rpcs3.net"))
+	// Do not delete default server
+	if (del_description == "Official RPCN Server" && del_host == "np.rpcs3.net")
 	{
 		return true;
 	}
@@ -210,4 +210,34 @@ bool cfg_rpcn::del_host(std::string_view del_description, std::string_view del_h
 	}
 
 	return false;
+}
+
+std::optional<std::pair<std::string, u16>> parse_rpcn_host(std::string_view host)
+{
+	if (host.empty())
+	{
+		rpcn_log.error("RPCN host is empty!");
+		return std::nullopt;
+	}
+
+	auto splithost = fmt::split(host, {":"});
+	if (splithost.size() != 1 && splithost.size() != 2)
+	{
+		rpcn_log.error("RPCN host is invalid!");
+		return std::nullopt;
+	}
+
+	u16 port = 31313;
+
+	if (splithost.size() == 2)
+	{
+		port = ::narrow<u16>(std::stoul(splithost[1]));
+		if (port == 0)
+		{
+			rpcn_log.error("RPCN port is invalid!");
+			return std::nullopt;
+		}
+	}
+
+	return std::make_pair(std::move(splithost[0]), port);
 }

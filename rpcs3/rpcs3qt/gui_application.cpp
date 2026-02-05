@@ -20,12 +20,18 @@
 #include "_discord_utils.h"
 #endif
 
+#ifdef HAVE_SDL3
+#include "Input/sdl_camera_handler.h"
+#endif
+
 #include "Emu/Audio/audio_utils.h"
+#include "Emu/Cell/Modules/cellSysutil.h"
 #include "Emu/Io/Null/null_camera_handler.h"
 #include "Emu/Io/Null/null_music_handler.h"
 #include "Emu/vfs_config.h"
 #include "util/init_mutex.hpp"
 #include "util/console.h"
+#include "qt_video_source.h"
 #include "trophy_notification_helper.h"
 #include "save_data_dialog.h"
 #include "msg_dialog_frame.h"
@@ -66,6 +72,8 @@ LOG_CHANNEL(gui_log, "GUI");
 
 std::unique_ptr<raw_mouse_handler> g_raw_mouse_handler;
 
+s32 gui_application::m_language_id = static_cast<s32>(CELL_SYSUTIL_LANG_ENGLISH_US);
+
 [[noreturn]] void report_fatal_error(std::string_view text, bool is_html = false, bool include_help_text = true);
 
 gui_application::gui_application(int& argc, char** argv) : QApplication(argc, argv)
@@ -101,17 +109,15 @@ bool gui_application::Init()
 		msg.setTextFormat(Qt::RichText);
 		msg.setStandardButtons(QMessageBox::Yes | QMessageBox::No);
 		msg.setDefaultButton(QMessageBox::No);
-		msg.setText(tr(
-			R"(
-				<p style="white-space: nowrap;">
-					Please understand that this build is not an official RPCS3 release.<br>
-					This build contains changes that may break games, or even <b>damage</b> your data.<br>
-					We recommend to download and use the official build from the <a %0 href='https://rpcs3.net/download'>RPCS3 website</a>.<br><br>
-					Build origin: %1<br>
-					Do you wish to use this build anyway?
-				</p>
-			)"
-		).arg(gui::utils::get_link_style()).arg(Qt::convertFromPlainText(branch_name.data())));
+		msg.setText(gui::utils::make_paragraph(tr(
+			"Please understand that this build is not an official RPCS3 release.\n"
+			"This build contains changes that may break games, or even <b>damage</b> your data.\n"
+			"We recommend to download and use the official build from the %0.\n"
+			"\n"
+			"Build origin: %1\n"
+			"Do you wish to use this build anyway?")
+			.arg(gui::utils::make_link(tr("RPCS3 website"), "https://rpcs3.net/download"))
+			.arg(Qt::convertFromPlainText(branch_name.data()))));
 		msg.layout()->setSizeConstraint(QLayout::SetFixedSize);
 
 		if (msg.exec() == QMessageBox::No)
@@ -214,29 +220,74 @@ bool gui_application::Init()
 	return true;
 }
 
-void gui_application::SwitchTranslator(QTranslator& translator, const QString& filename, const QString& language_code)
+void gui_application::SwitchTranslator(const QString& language_code)
 {
 	// remove the old translator
-	removeTranslator(&translator);
+	removeTranslator(&m_translator);
+	for (QTranslator* qt_translator : m_qt_translators)
+	{
+		removeTranslator(qt_translator);
+		qt_translator->deleteLater();
+	}
+	m_qt_translators.clear();
 
+	const QString default_code = QLocale(QLocale::English).bcp47Name();
 	const QString lang_path = QLibraryInfo::path(QLibraryInfo::TranslationsPath) + QStringLiteral("/");
-	const QString file_path = lang_path + filename;
 
+	// Load qt translation files
+	const QDir dir(lang_path);
+	if (dir.exists())
+	{
+		QStringList qm_files = dir.entryList(QStringList() << QStringLiteral("qt*_%1.qm").arg(language_code), QDir::Files | QDir::Readable);
+		if (qm_files.empty())
+		{
+			qm_files = dir.entryList(QStringList() << QStringLiteral("qt*_%1.qm").arg(QLocale::languageToCode(QLocale(language_code).language())), QDir::Files | QDir::Readable);
+		}
+
+		for (const QString& qm_file : qm_files)
+		{
+			const QString file_path = lang_path + qm_file;
+			QTranslator* qt_translator = new QTranslator(this);
+
+			if (qt_translator->load(file_path))
+			{
+				gui_log.notice("Installing translation: '%s'", file_path);
+				installTranslator(qt_translator);
+				m_qt_translators.push_back(std::move(qt_translator));
+			}
+			else
+			{
+				gui_log.error("Failed to load translation: '%s'", file_path);
+				qt_translator->deleteLater();
+			}
+		}
+	}
+	else
+	{
+		gui_log.error("Qt translation dir '%s' does not exist", lang_path);
+	}
+
+	const QString file_path = lang_path + QStringLiteral("rpcs3_%1.qm").arg(language_code);
 	if (QFileInfo(file_path).isFile())
 	{
 		// load the new translator
-		if (translator.load(file_path))
+		if (m_translator.load(file_path))
 		{
-			installTranslator(&translator);
+			gui_log.notice("Installing translation: '%s'", file_path);
+			installTranslator(&m_translator);
+		}
+		else
+		{
+			gui_log.error("Failed to load translation: '%s'", file_path);
 		}
 	}
-	else if (const QString default_code = QLocale(QLocale::English).bcp47Name(); language_code != default_code)
+	else if (language_code != default_code)
 	{
 		// show error, but ignore default case "en", since it is handled in source code
-		gui_log.error("No translation file found in: %s", file_path);
+		gui_log.error("No translation file found in: '%s'", file_path);
 
 		// reset current language to default "en"
-		m_language_code = default_code;
+		set_language_code(default_code);
 	}
 }
 
@@ -247,7 +298,7 @@ void gui_application::LoadLanguage(const QString& language_code)
 		return;
 	}
 
-	m_language_code = language_code;
+	set_language_code(language_code);
 
 	const QLocale locale      = QLocale(language_code);
 	const QString locale_name = QLocale::languageToString(locale.language());
@@ -258,7 +309,7 @@ void gui_application::LoadLanguage(const QString& language_code)
 	// As per QT recommendations to avoid conflicts for POSIX functions
 	std::setlocale(LC_NUMERIC, "C");
 
-	SwitchTranslator(m_translator, QStringLiteral("rpcs3_%1.qm").arg(language_code), language_code);
+	SwitchTranslator(language_code);
 
 	if (m_main_window)
 	{
@@ -283,6 +334,7 @@ QStringList gui_application::GetAvailableLanguageCodes()
 	QStringList language_codes;
 
 	const QString language_path = QLibraryInfo::path(QLibraryInfo::TranslationsPath);
+	gui_log.notice("Checking languages in '%s'", language_path);
 
 	if (QFileInfo(language_path).isDir())
 	{
@@ -301,12 +353,80 @@ QStringList gui_application::GetAvailableLanguageCodes()
 			}
 			else
 			{
+				gui_log.notice("Found language '%s' (%s)", language_code, filename);
 				language_codes << language_code;
 			}
 		}
 	}
+	else
+	{
+		gui_log.error("Language dir not found: '%s'", language_path);
+	}
 
 	return language_codes;
+}
+
+void gui_application::set_language_code(QString language_code)
+{
+	m_language_code = language_code;
+
+	// Transform language code to lowercase and use '-'
+	language_code = language_code.toLower().replace("_", "-");
+
+	// Try to find the CELL language ID for this language code
+	static const std::map<QString, CellSysutilLang> language_ids = {
+		{"ja", CELL_SYSUTIL_LANG_JAPANESE },
+		{"en", CELL_SYSUTIL_LANG_ENGLISH_US },
+		{"en-us", CELL_SYSUTIL_LANG_ENGLISH_US },
+		{"en-gb", CELL_SYSUTIL_LANG_ENGLISH_GB },
+		{"fr", CELL_SYSUTIL_LANG_FRENCH },
+		{"es", CELL_SYSUTIL_LANG_SPANISH },
+		{"de", CELL_SYSUTIL_LANG_GERMAN },
+		{"it", CELL_SYSUTIL_LANG_ITALIAN },
+		{"nl", CELL_SYSUTIL_LANG_DUTCH },
+		{"pt", CELL_SYSUTIL_LANG_PORTUGUESE_PT },
+		{"pt-pt", CELL_SYSUTIL_LANG_PORTUGUESE_PT },
+		{"pt-br", CELL_SYSUTIL_LANG_PORTUGUESE_BR },
+		{"ru", CELL_SYSUTIL_LANG_RUSSIAN },
+		{"ko", CELL_SYSUTIL_LANG_KOREAN },
+		{"zh", CELL_SYSUTIL_LANG_CHINESE_T },
+		{"zh-hant", CELL_SYSUTIL_LANG_CHINESE_T },
+		{"zh-hans", CELL_SYSUTIL_LANG_CHINESE_S },
+		{"fi", CELL_SYSUTIL_LANG_FINNISH },
+		{"sv", CELL_SYSUTIL_LANG_SWEDISH },
+		{"da", CELL_SYSUTIL_LANG_DANISH },
+		{"no", CELL_SYSUTIL_LANG_NORWEGIAN },
+		{"nn", CELL_SYSUTIL_LANG_NORWEGIAN },
+		{"nb", CELL_SYSUTIL_LANG_NORWEGIAN },
+		{"pl", CELL_SYSUTIL_LANG_POLISH },
+		{"tr", CELL_SYSUTIL_LANG_TURKISH },
+	};
+
+	// Check direct match first
+	const auto it = language_ids.find(language_code);
+	if (it != language_ids.cend())
+	{
+		m_language_id = static_cast<s32>(it->second);
+		return;
+	}
+
+	// Try to find closest match
+	for (const auto& [code, id] : language_ids)
+	{
+		if (language_code.startsWith(code))
+		{
+			m_language_id = static_cast<s32>(id);
+			return;
+		}
+	}
+
+	// Fallback to English (US)
+	m_language_id = static_cast<s32>(CELL_SYSUTIL_LANG_ENGLISH_US);
+}
+
+s32 gui_application::get_language_id()
+{
+	return m_language_id;
 }
 
 void gui_application::InitializeConnects()
@@ -528,6 +648,8 @@ void gui_application::InitializeCallbacks()
 				// Close main window in order to save its window state
 				m_main_window->close();
 			}
+
+			gui_log.notice("Quitting gui application");
 			quit();
 			return true;
 		}
@@ -578,6 +700,12 @@ void gui_application::InitializeCallbacks()
 		{
 			return std::make_shared<qt_camera_handler>();
 		}
+#ifdef HAVE_SDL3
+		case camera_handler::sdl:
+		{
+			return std::make_shared<sdl_camera_handler>();
+		}
+#endif
 		}
 		return nullptr;
 	};
@@ -676,9 +804,9 @@ void gui_application::InitializeCallbacks()
 		return m_emu_settings->GetLocalizedSetting(node, enum_index);
 	};
 
-	callbacks.play_sound = [this](const std::string& path)
+	callbacks.play_sound = [this](const std::string& path, std::optional<f32> volume)
 	{
-		Emu.CallFromMainThread([this, path]()
+		Emu.CallFromMainThread([this, path, volume]()
 		{
 			if (fs::is_file(path))
 			{
@@ -691,12 +819,12 @@ void gui_application::InitializeCallbacks()
 				// Create a new sound effect. Re-using the same object seems to be broken for some users starting with Qt 6.6.3.
 				std::unique_ptr<QSoundEffect> sound_effect = std::make_unique<QSoundEffect>();
 				sound_effect->setSource(QUrl::fromLocalFile(QString::fromStdString(path)));
-				sound_effect->setVolume(audio::get_volume());
+				sound_effect->setVolume(volume ? *volume : audio::get_volume());
 				sound_effect->play();
 
 				m_sound_effects.push_back(std::move(sound_effect));
 			}
-		});
+		}, nullptr, false);
 	};
 
 	if (m_show_gui) // If this is false, we already have a fallback in the main_application.
@@ -890,6 +1018,8 @@ void gui_application::InitializeCallbacks()
 			gui::utils::check_microphone_permission();
 		});
 	};
+
+	callbacks.make_video_source = [](){ return std::make_unique<qt_video_source_wrapper>(); };
 
 	Emu.SetCallbacks(std::move(callbacks));
 }

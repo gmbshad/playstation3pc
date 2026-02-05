@@ -23,8 +23,8 @@
 #include <iphlpapi.h>
 #else
 #ifdef __clang__
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wold-style-cast"
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wold-style-cast"
 #endif
 #include <sys/socket.h>
 #include <sys/ioctl.h>
@@ -34,7 +34,7 @@
 #include <netdb.h>
 #include <unistd.h>
 #ifdef __clang__
-#pragma GCC diagnostic pop
+#pragma clang diagnostic pop
 #endif
 #endif
 
@@ -239,6 +239,25 @@ namespace np
 		return true;
 	}
 
+	std::string ticket::get_service_id() const
+	{
+		if (!parse_success)
+		{
+			return "";
+		}
+
+		const auto& node = nodes[0].data.data_nodes[8];
+		if (node.len != SCE_NP_SERVICE_ID_SIZE)
+		{
+			return "";
+		}
+
+		// Trim null characters
+		const auto& vec = node.data.data_vec;
+		auto it = std::find(vec.begin(), vec.end(), 0);
+		return std::string(vec.begin(), it);
+	}
+
 	std::optional<ticket_data> ticket::parse_node(std::size_t index) const
 	{
 		if ((index + MIN_TICKET_DATA_SIZE) > size())
@@ -412,7 +431,7 @@ namespace np
 			nc.bind_sce_np_port();
 
 			std::lock_guard lock(mutex_rpcn);
-			rpcn = rpcn::rpcn_client::get_instance();
+			rpcn = rpcn::rpcn_client::get_instance(bind_ip);
 		}
 	}
 
@@ -455,19 +474,10 @@ namespace np
 			}
 
 			// Convert bind address
-			conv = {};
-			if (!inet_pton(AF_INET, g_cfg.net.bind_address.to_string().c_str(), &conv))
-			{
-				// Do not set to disconnected on invalid IP just error and continue using default (0.0.0.0)
-				nph_log.error("Provided IP(%s) address for bind is invalid!", g_cfg.net.bind_address.to_string());
-			}
-			else
-			{
-				bind_ip = conv.s_addr;
+			bind_ip = resolve_binding_ip();
 
-				if (bind_ip)
-					local_ip_addr = bind_ip;
-			}
+			if (bind_ip)
+				local_ip_addr = bind_ip;
 
 			if (g_cfg.net.upnp_enabled)
 				upnp.upnp_enable();
@@ -655,7 +665,7 @@ namespace np
 
 		for (; it != end; ++it)
 		{
-			strcpy(ifr.ifr_name, it->ifr_name);
+			strcpy_trunc(ifr.ifr_name, it->ifr_name);
 			if (ioctl(sock, SIOCGIFFLAGS, &ifr) == 0)
 			{
 				if (!(ifr.ifr_flags & IFF_LOOPBACK))
@@ -793,7 +803,7 @@ namespace np
 
 			if (!rpcn)
 			{
-				rpcn = rpcn::rpcn_client::get_instance();
+				rpcn = rpcn::rpcn_client::get_instance(bind_ip);
 				was_already_started = false;
 			}
 
@@ -858,7 +868,7 @@ namespace np
 		presence_self.pr_data = {};
 		presence_self.advertised = false;
 
-		if (g_cfg.net.psn_status == np_psn_status::psn_rpcn)
+		if (is_connected && is_psn_active && rpcn)
 		{
 			rpcn_log.notice("Setting RPCN state to disconnected!");
 			rpcn->reset_state();
@@ -1075,6 +1085,9 @@ namespace np
 
 	void np_handler::send_message(const message_data& msg_data, const std::set<std::string>& npids)
 	{
+		rpcn_log.notice("Sending message to \"%s\":", fmt::merge(npids, "\",\""));
+		msg_data.print();
+
 		get_rpcn()->send_message(msg_data, npids);
 	}
 
@@ -1114,6 +1127,7 @@ namespace np
 					case rpcn::CommandType::LeaveRoom: reply_leave_room(req_id, error, reply_data); break;
 					case rpcn::CommandType::SearchRoom: reply_search_room(req_id, error, reply_data); break;
 					case rpcn::CommandType::GetRoomDataExternalList: reply_get_roomdata_external_list(req_id, error, reply_data); break;
+					case rpcn::CommandType::GetRoomMemberDataExternalList: reply_get_room_member_data_external_list(req_id, error, reply_data); break;
 					case rpcn::CommandType::SetRoomDataExternal: reply_set_roomdata_external(req_id, error); break;
 					case rpcn::CommandType::GetRoomDataInternal: reply_get_roomdata_internal(req_id, error, reply_data); break;
 					case rpcn::CommandType::SetRoomDataInternal: reply_set_roomdata_internal(req_id, error); break;
@@ -1282,19 +1296,20 @@ namespace np
 		return false;
 	}
 
-	u32 np_handler::generate_callback_info(SceNpMatching2ContextId ctx_id, vm::cptr<SceNpMatching2RequestOptParam> optParam, SceNpMatching2Event event_type)
+	u32 np_handler::generate_callback_info(SceNpMatching2ContextId ctx_id, vm::cptr<SceNpMatching2RequestOptParam> optParam, SceNpMatching2Event event_type, bool abortable)
 	{
-		callback_info ret;
-
 		const auto ctx = get_match2_context(ctx_id);
 		ensure(ctx);
 
 		const u32 req_id = get_req_id(optParam ? optParam->appReqId : ctx->default_match2_optparam.appReqId);
 
-		ret.ctx_id = ctx_id;
-		ret.cb_arg = (optParam && optParam->cbFuncArg) ? optParam->cbFuncArg : ctx->default_match2_optparam.cbFuncArg;
-		ret.cb     = (optParam && optParam->cbFunc) ? optParam->cbFunc : ctx->default_match2_optparam.cbFunc;
-		ret.event_type = event_type;
+		callback_info ret{
+			.ctx_id = ctx_id,
+			.cb = (optParam && optParam->cbFunc) ? optParam->cbFunc : ctx->default_match2_optparam.cbFunc,
+			.cb_arg = (optParam && optParam->cbFuncArg) ? optParam->cbFuncArg : ctx->default_match2_optparam.cbFuncArg,
+			.event_type = event_type,
+			.abortable = abortable,
+		};
 
 		nph_log.trace("Callback used is 0x%x with req_id %d", ret.cb, req_id);
 
@@ -1319,16 +1334,22 @@ namespace np
 		return cb_info;
 	}
 
-	bool np_handler::abort_request(u32 req_id)
+	error_code np_handler::abort_request(u32 req_id)
 	{
-		auto cb_info_opt = take_pending_request(req_id);
+		std::lock_guard lock(mutex_pending_requests);
 
-		if (!cb_info_opt)
-			return false;
+		if (!pending_requests.contains(req_id))
+			return SCE_NP_MATCHING2_ERROR_REQUEST_NOT_FOUND;
 
-		cb_info_opt->queue_callback(req_id, 0, SCE_NP_MATCHING2_ERROR_ABORTED, 0);
+		if (!::at32(pending_requests, req_id).abortable)
+			return SCE_NP_MATCHING2_ERROR_CANNOT_ABORT;
 
-		return true;
+		const auto cb_info = std::move(::at32(pending_requests, req_id));
+		pending_requests.erase(req_id);
+
+		cb_info.queue_callback(req_id, 0, SCE_NP_MATCHING2_ERROR_ABORTED, 0);
+
+		return CELL_OK;
 	}
 
 	event_data& np_handler::allocate_req_result(u32 event_key, u32 max_size, u32 initial_size)
@@ -1352,6 +1373,24 @@ namespace np
 		auto& history = ::at32(players_history, npid_str);
 		history.timestamp = timestamp;
 		return history;
+	}
+
+	u32 np_handler::get_clan_ticket_ready()
+	{
+		return clan_ticket_ready.load();
+	}
+
+	ticket np_handler::get_clan_ticket()
+	{
+		clan_ticket_ready.wait(0, atomic_wait_timeout{60'000'000'000}); // 60 seconds
+
+		if (!clan_ticket_ready.load())
+		{
+			rpcn_log.error("Failed to get clan ticket within timeout.");
+			return ticket{};
+		}
+
+		return clan_ticket;
 	}
 
 	constexpr usz MAX_HISTORY_ENTRIES = 200;
@@ -1637,6 +1676,11 @@ namespace np
 		return np_cache.get_memberids(room_id, sort_method);
 	}
 
+	std::pair<error_code, std::optional<SceNpMatching2SignalingOptParam>> np_handler::local_get_signaling_opt_param(SceNpMatching2RoomId room_id)
+	{
+		return np_cache.get_opt_param(room_id);
+	}
+
 	error_code np_handler::local_get_room_member_data(SceNpMatching2RoomId room_id, SceNpMatching2RoomMemberId member_id, const std::vector<SceNpMatching2AttributeId>& binattrs_list, SceNpMatching2RoomMemberDataInternal* ptr_member, u32 addr_data, u32 size_data, u32 ctx_id)
 	{
 		auto [include_onlinename, include_avatarurl] = get_match2_context_options(ctx_id);
@@ -1709,6 +1753,31 @@ namespace np
 			return {};
 
 		return ctx;
+	}
+
+	void np_handler::callback_info::queue_callback(u32 req_id, u32 event_key, s32 error_code, u32 data_size) const
+	{
+		if (cb)
+		{
+			sysutil_register_cb([=, ctx_id = this->ctx_id, event_type = this->event_type, cb = this->cb, cb_arg = this->cb_arg](ppu_thread& cb_ppu) -> s32
+				{
+					sceNp2.trace("Calling callback 0x%x with req_id %d, event_type: 0x%x, error_code: 0x%x", cb, req_id, event_type, error_code);
+					cb(cb_ppu, ctx_id, req_id, event_type, event_key, error_code, data_size, cb_arg);
+					return 0;
+				});
+		}
+	}
+
+	SceNpMatching2MemoryInfo np_handler::get_memory_info() const
+	{
+		auto [m_size, m_usage, m_max_usage] = np_memory.get_stats();
+
+		SceNpMatching2MemoryInfo mem_info{};
+		mem_info.totalMemSize = m_size;
+		mem_info.curMemUsage = m_usage;
+		mem_info.maxMemUsage = m_max_usage;
+
+		return mem_info;
 	}
 
 } // namespace np
