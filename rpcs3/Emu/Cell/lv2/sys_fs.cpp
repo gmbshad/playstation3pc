@@ -382,10 +382,12 @@ lv2_fs_object::lv2_fs_object(utils::serial& ar, bool)
 
 u64 lv2_file::op_read(const fs::file& file, vm::ptr<void> buf, u64 size, u64 opt_pos)
 {
-	if (u64 region = buf.addr() >> 28, region_end = (buf.addr() & 0xfff'ffff) + (size & 0xfff'ffff); region == region_end && ((region >> 28) == 0 || region >= 0xC))
+	if (u64 region = buf.addr() >> 28, region_end = (buf.addr() + size) >> 28;
+		size < u32{umax} && region == region_end && (region == 0 || region == 0xD) && vm::check_addr(buf.addr(), vm::page_writable, static_cast<u32>(size)))
 	{
 		// Optimize reads from safe memory
-		return (opt_pos == umax ? file.read(buf.get_ptr(), size) : file.read_at(opt_pos, buf.get_ptr(), size));
+		const auto buf_ptr = vm::get_super_ptr(buf.addr());
+		return (opt_pos == umax ? file.read(buf_ptr, size) : file.read_at(opt_pos, buf_ptr, size));
 	}
 
 	// Copy data from intermediate buffer (avoid passing vm pointer to a native API)
@@ -412,6 +414,14 @@ u64 lv2_file::op_read(const fs::file& file, vm::ptr<void> buf, u64 size, u64 opt
 
 u64 lv2_file::op_write(const fs::file& file, vm::cptr<void> buf, u64 size)
 {
+	if (u64 region = buf.addr() >> 28, region_end = (buf.addr() + size) >> 28;
+		size < u32{umax} && region == region_end && (region == 0 || region == 0xD) && vm::check_addr(buf.addr(), vm::page_readable, static_cast<u32>(size)))
+	{
+		// Optimize writes from safe memory
+		const auto buf_ptr = vm::get_super_ptr(buf.addr());
+		return file.write(buf_ptr, size);
+	}
+
 	// Copy data to intermediate buffer (avoid passing vm pointer to a native API)
 	std::vector<uchar> local_buf(std::min<u64>(size, 65536));
 
@@ -890,10 +900,8 @@ lv2_file::open_raw_result_t lv2_file::open_raw(const std::string& local_path, s3
 		switch (auto error = fs::g_tls_error)
 		{
 		case fs::error::noent: return {CELL_ENOENT};
-		default: sys_fs.error("lv2_file::open(): unknown error %s", error);
+		default: fmt::throw_exception("unknown error %s", error);
 		}
-
-		return {CELL_EIO};
 	}
 
 	if (flags & CELL_FS_O_MSELF && !verify_mself(file))
@@ -1364,8 +1372,7 @@ error_code sys_fs_opendir(ppu_thread& ppu, vm::cptr<char> path, vm::ptr<u32> fd)
 		}
 		default:
 		{
-			sys_fs.error("sys_fs_opendir(): unknown error %s", error);
-			return {CELL_EIO, path};
+			fmt::throw_exception("unknown error %s", error);
 		}
 		}
 	}
@@ -1391,7 +1398,8 @@ error_code sys_fs_opendir(ppu_thread& ppu, vm::cptr<char> path, vm::ptr<u32> fd)
 			// Add additional entries for split file candidates (while ends with .66600)
 			while (mp.mp != &g_mp_sys_dev_hdd1 && data.back().name.ends_with(".66600"))
 			{
-				data.emplace_back(data.back()).name.resize(data.back().name.size() - 6);
+				fs::dir_entry copy = data.back();
+				data.emplace_back(copy).name.resize(copy.name.size() - 6);
 			}
 		}
 
@@ -1586,8 +1594,7 @@ error_code sys_fs_stat(ppu_thread& ppu, vm::cptr<char> path, vm::ptr<CellFsStat>
 		}
 		default:
 		{
-			sys_fs.error("sys_fs_stat(): unknown error %s", error);
-			return {CELL_EIO, path};
+			fmt::throw_exception("unknown error %s", error);
 		}
 		}
 	}
@@ -1721,10 +1728,8 @@ error_code sys_fs_mkdir(ppu_thread& ppu, vm::cptr<char> path, s32 mode)
 		{
 			return {sys_fs.warning, CELL_EEXIST, path};
 		}
-		default: sys_fs.error("sys_fs_mkdir(): unknown error %s", error);
+		default: fmt::throw_exception("unknown error %s", error);
 		}
-
-		return {CELL_EIO, path}; // ???
 	}
 
 	sys_fs.notice("sys_fs_mkdir(): directory %s created", path);
@@ -1786,10 +1791,8 @@ error_code sys_fs_rename(ppu_thread& ppu, vm::cptr<char> from, vm::cptr<char> to
 		{
 		case fs::error::noent: return {CELL_ENOENT, from};
 		case fs::error::exist: return {CELL_EEXIST, to};
-		default: sys_fs.error("sys_fs_rename(): unknown error %s", error);
+		default: fmt::throw_exception("unknown error %s", error);
 		}
-
-		return {CELL_EIO, from}; // ???
 	}
 
 	sys_fs.notice("sys_fs_rename(): %s renamed to %s", from, to);
@@ -1841,10 +1844,8 @@ error_code sys_fs_rmdir(ppu_thread& ppu, vm::cptr<char> path)
 		{
 		case fs::error::noent: return {CELL_ENOENT, path};
 		case fs::error::notempty: return {CELL_ENOTEMPTY, path};
-		default: sys_fs.error("sys_fs_rmdir(): unknown error %s", error);
+		default: fmt::throw_exception("unknown error %s", error);
 		}
-
-		return {CELL_EIO, path}; // ???
 	}
 
 	sys_fs.notice("sys_fs_rmdir(): directory %s removed", path);
@@ -1899,10 +1900,8 @@ error_code sys_fs_unlink(ppu_thread& ppu, vm::cptr<char> path)
 		{
 			return {mp == &g_mp_sys_dev_hdd1 ? sys_fs.warning : sys_fs.error, CELL_ENOENT, path};
 		}
-		default: sys_fs.error("sys_fs_unlink(): unknown error %s", error);
+		default: fmt::throw_exception("unknown error %s", error);
 		}
-
-		return {CELL_EIO, path}; // ???
 	}
 
 	sys_fs.notice("sys_fs_unlink(): file %s deleted", path);
@@ -2147,6 +2146,7 @@ error_code sys_fs_fcntl(ppu_thread& ppu, u32 fd, u32 op, vm::ptr<void> _arg, u32
 		sys_fs.notice("sys_fs_fcntl(0xc0000006): %s", vpath);
 
 		// Check only mountpoint
+		vpath = vpath.substr(0, vpath.find_first_of('\0'));
 		vpath = vpath.substr(0, vpath.find_first_of("/", 1));
 
 		// Some mountpoints seem to be handled specially
@@ -2620,10 +2620,8 @@ error_code sys_fs_lseek(ppu_thread& ppu, u32 fd, s64 offset, s32 whence, vm::ptr
 		switch (auto error = fs::g_tls_error)
 		{
 		case fs::error::inval: return {CELL_EINVAL, "fd=%u, offset=0x%x, whence=%d", fd, offset, whence};
-		default: sys_fs.error("sys_fs_lseek(): unknown error %s", error);
+		default: fmt::throw_exception("unknown error %s", error);
 		}
-
-		return CELL_EIO; // ???
 	}
 
 	lock.unlock();
@@ -2635,8 +2633,6 @@ error_code sys_fs_lseek(ppu_thread& ppu, u32 fd, s64 offset, s32 whence, vm::ptr
 
 error_code sys_fs_fdatasync(ppu_thread& ppu, u32 fd)
 {
-	lv2_obj::sleep(ppu);
-
 	sys_fs.trace("sys_fs_fdadasync(fd=%d)", fd);
 
 	const auto file = idm::get_unlocked<lv2_fs_object, lv2_file>(fd);
@@ -2661,8 +2657,6 @@ error_code sys_fs_fdatasync(ppu_thread& ppu, u32 fd)
 
 error_code sys_fs_fsync(ppu_thread& ppu, u32 fd)
 {
-	lv2_obj::sleep(ppu);
-
 	sys_fs.trace("sys_fs_fsync(fd=%d)", fd);
 
 	const auto file = idm::get_unlocked<lv2_fs_object, lv2_file>(fd);
@@ -2743,10 +2737,8 @@ error_code sys_fs_get_block_size(ppu_thread& ppu, vm::cptr<char> path, vm::ptr<u
 		{
 		case fs::error::exist: return {CELL_EISDIR, path};
 		case fs::error::noent: return {CELL_ENOENT, path};
-		default: sys_fs.error("sys_fs_get_block_size(): unknown error %s", error);
+		default: fmt::throw_exception("unknown error %s", error);
 		}
-
-		return {CELL_EIO, path}; // ???
 	}
 
 	static_cast<void>(ppu.test_stopped());
@@ -2801,10 +2793,8 @@ error_code sys_fs_truncate(ppu_thread& ppu, vm::cptr<char> path, u64 size)
 		{
 			return {mp == &g_mp_sys_dev_hdd1 ? sys_fs.warning : sys_fs.error, CELL_ENOENT, path};
 		}
-		default: sys_fs.error("sys_fs_truncate(): unknown error %s", error);
+		default: fmt::throw_exception("unknown error %s", error);
 		}
-
-		return {CELL_EIO, path}; // ???
 	}
 
 	return CELL_OK;
@@ -2850,10 +2840,8 @@ error_code sys_fs_ftruncate(ppu_thread& ppu, u32 fd, u64 size)
 		switch (auto error = fs::g_tls_error)
 		{
 		case fs::error::ok:
-		default: sys_fs.error("sys_fs_ftruncate(): unknown error %s", error);
+		default: fmt::throw_exception("unknown error %s", error);
 		}
-
-		return CELL_EIO; // ???
 	}
 
 	return CELL_OK;
@@ -2902,14 +2890,6 @@ error_code sys_fs_chmod(ppu_thread&, vm::cptr<char> path, s32 mode)
 		case fs::error::noent:
 		{
 			// Try to locate split files
-
-			for (u32 i = 66601; i <= 66699; i++)
-			{
-				if (mp != &g_mp_sys_dev_hdd1 && !fs::get_stat(fmt::format("%s.%u", local_path, i), info) && !info.is_directory)
-				{
-					break;
-				}
-			}
 
 			if (fs::get_stat(local_path + ".66600", info) && !info.is_directory)
 			{
@@ -3057,10 +3037,8 @@ error_code sys_fs_utime(ppu_thread& ppu, vm::cptr<char> path, vm::cptr<CellFsUti
 		{
 			return {mp == &g_mp_sys_dev_hdd1 ? sys_fs.warning : sys_fs.error, CELL_ENOENT, path};
 		}
-		default: sys_fs.error("sys_fs_utime(): unknown error %s", error);
+		default: fmt::throw_exception("unknown error %s", error);
 		}
-
-		return {CELL_EIO, path}; // ???
 	}
 
 	return CELL_OK;

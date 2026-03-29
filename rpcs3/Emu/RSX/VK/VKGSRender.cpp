@@ -1152,6 +1152,7 @@ void VKGSRender::check_present_status()
 void VKGSRender::set_viewport()
 {
 	const auto [clip_width, clip_height] = rsx::apply_resolution_scale<true>(
+		resolution_scaling_config,
 		rsx::method_registers.surface_clip_width(), rsx::method_registers.surface_clip_height());
 
 	const auto zclip_near = rsx::method_registers.clip_min();
@@ -1541,7 +1542,7 @@ std::pair<volatile vk::host_data_t*, VkBuffer> VKGSRender::map_host_object_data(
 	return { m_host_dma_ctrl->host_ctx(), m_host_object_data->value };
 }
 
-bool VKGSRender::release_GCM_label(u32 address, u32 args)
+bool VKGSRender::release_GCM_label(u32 type, u32 address, u32 args)
 {
 	if (!backend_config.supports_host_gpu_labels)
 	{
@@ -1550,7 +1551,7 @@ bool VKGSRender::release_GCM_label(u32 address, u32 args)
 
 	auto host_ctx = ensure(m_host_dma_ctrl->host_ctx());
 
-	if (host_ctx->texture_loads_completed())
+	if (type == NV4097_TEXTURE_READ_SEMAPHORE_RELEASE && host_ctx->texture_loads_completed())
 	{
 		// All texture loads already seen by the host GPU
 		// Wait for all previously submitted labels to be flushed
@@ -1572,13 +1573,10 @@ bool VKGSRender::release_GCM_label(u32 address, u32 args)
 
 	const auto release_event_id = host_ctx->on_label_acquire();
 
+	vk::insert_global_memory_barrier(*m_current_command_buffer);
+
 	if (host_ctx->has_unflushed_texture_loads())
 	{
-		if (vk::is_renderpass_open(*m_current_command_buffer))
-		{
-			vk::end_renderpass(*m_current_command_buffer);
-		}
-
 		vkCmdUpdateBuffer(*m_current_command_buffer, mapping.second->value, mapping.first, 4, &write_data);
 		flush_command_queue();
 	}
@@ -1955,7 +1953,7 @@ void VKGSRender::load_program_env()
 		m_draw_processor.fill_scale_offset_data(buf, false);
 		m_draw_processor.fill_user_clip_data(buf + 64);
 		*(reinterpret_cast<u32*>(buf + 68)) = ctx->transform_branch_bits();
-		*(reinterpret_cast<f32*>(buf + 72)) = ctx->point_size() * rsx::get_resolution_scale();
+		*(reinterpret_cast<f32*>(buf + 72)) = ctx->point_size() * resolution_scaling_config.scale_factor();
 		*(reinterpret_cast<f32*>(buf + 76)) = ctx->clip_min();
 		*(reinterpret_cast<f32*>(buf + 80)) = ctx->clip_max();
 
@@ -2444,6 +2442,7 @@ void VKGSRender::prepare_rtts(rsx::framebuffer_creation_context context)
 		m_framebuffer_layout.target, m_framebuffer_layout.aa_mode, m_framebuffer_layout.raster_type,
 		m_framebuffer_layout.color_addresses, m_framebuffer_layout.zeta_address,
 		m_framebuffer_layout.actual_color_pitch, m_framebuffer_layout.actual_zeta_pitch,
+		resolution_scaling_config,
 		(*m_device), *m_current_command_buffer);
 
 	// Reset framebuffer information
@@ -2623,7 +2622,7 @@ void VKGSRender::prepare_rtts(rsx::framebuffer_creation_context context)
 	m_cached_renderpass = vk::get_renderpass(*m_device, m_current_renderpass_key);
 
 	// Search old framebuffers for this same configuration
-	const auto [fbo_width, fbo_height] = rsx::apply_resolution_scale<true>(m_framebuffer_layout.width, m_framebuffer_layout.height);
+	const auto [fbo_width, fbo_height] = rsx::apply_resolution_scale<true>(resolution_scaling_config, m_framebuffer_layout.width, m_framebuffer_layout.height);
 
 	if (m_draw_fbo)
 	{

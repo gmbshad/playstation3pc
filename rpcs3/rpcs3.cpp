@@ -131,7 +131,7 @@ std::set<std::string> get_one_drive_paths()
 		do
 		{
 			path_buffer.resize(path_buffer.size() + MAX_PATH);
-			DWORD buffer_size = static_cast<DWORD>(path_buffer.size() - 1);
+			DWORD buffer_size = static_cast<DWORD>((path_buffer.size() - 1) * sizeof(wchar_t));
 			status = RegQueryValueExW(hkey, L"UserFolder", NULL, &type, reinterpret_cast<LPBYTE>(path_buffer.data()), &buffer_size);
 		}
 		while (status == ERROR_MORE_DATA);
@@ -197,6 +197,10 @@ std::set<std::string> get_one_drive_paths()
 
 		fmt::append(buf, "\nBuild: \"%s\"", rpcs3::get_verbose_version());
 		fmt::append(buf, "\nDate: \"%s\"", std::chrono::system_clock::now());
+
+		const auto [total, current] = utils::get_memory_usage();
+
+		fmt::append(buf, "\nRAM Usage: %dMB/%dMB (%dMB free)", current / (1024 * 1024), total / (1024 * 1024), (total - current) / (1024 * 1024));
 	}
 
 	std::string_view text = s_is_error_launch ? _text : buf;

@@ -25,7 +25,7 @@ generic_async_transaction_context::~generic_async_transaction_context()
 	}
 }
 
-std::optional<s32> generic_async_transaction_context::get_transaction_status()
+std::optional<s32> generic_async_transaction_context::get_transaction_status() const
 {
 	std::lock_guard lock(mutex);
 	return result;
@@ -46,7 +46,7 @@ error_code generic_async_transaction_context::wait_for_completion()
 		return *result;
 	}
 
-	completion_cond.wait(lock);
+	completion_cond.wait(lock, [this] { return result.has_value(); });
 
 	return *result;
 }
