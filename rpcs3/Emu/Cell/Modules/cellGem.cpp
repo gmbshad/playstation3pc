@@ -3,11 +3,13 @@
 #include "cellCamera.h"
 
 #include "Emu/Cell/lv2/sys_event.h"
+#include "Emu/Cell/lv2/sys_memory.h"
 #include "Emu/Cell/PPUModule.h"
 #include "Emu/Cell/timers.hpp"
 #include "Emu/Io/MouseHandler.h"
 #include "Emu/Io/PadHandler.h"
 #include "Emu/Io/gem_config.h"
+#include "Emu/Io/interception.h"
 #include "Emu/system_config.h"
 #include "Emu/System.h"
 #include "Emu/IdManager.h"
@@ -17,7 +19,7 @@
 #include "Input/ps_move_tracker.h"
 
 #ifdef HAVE_LIBEVDEV
-#include "Input/evdev_gun_handler.h"
+#include "Emu/Io/evdev_gun_handler.h"
 #endif
 
 #include <cmath> // for fmod
@@ -40,9 +42,18 @@ void fmt_class_string<gem_btn>::format(std::string& out, u64 arg)
 		case gem_btn::square: return "Square";
 		case gem_btn::move: return "Move";
 		case gem_btn::t: return "T";
-		case gem_btn::count: return "Count";
 		case gem_btn::x_axis: return "X-Axis";
 		case gem_btn::y_axis: return "Y-Axis";
+		case gem_btn::combo: return "Combo";
+		case gem_btn::combo_start: return "Combo Start";
+		case gem_btn::combo_select: return "Combo Select";
+		case gem_btn::combo_triangle: return "Combo Triangle";
+		case gem_btn::combo_circle: return "Combo Circle";
+		case gem_btn::combo_cross: return "Combo Cross";
+		case gem_btn::combo_square: return "Combo Square";
+		case gem_btn::combo_move: return "Combo Move";
+		case gem_btn::combo_t: return "Combo T";
+		case gem_btn::count: return "Count";
 		}
 
 		return unknown;
@@ -177,6 +188,7 @@ using gun_thread = named_thread<gun_handler>;
 
 cfg_gems g_cfg_gem_real;
 cfg_fake_gems g_cfg_gem_fake;
+cfg_mouse_gems g_cfg_gem_mouse;
 
 struct gem_config_data
 {
@@ -236,7 +248,7 @@ public:
 		u32 hue = 0;                                       // Tracking hue of the motion controller
 		f32 distance_mm{3000.0f};                          // Distance from the camera in mm
 		f32 radius{5.0f};                                  // Radius of the sphere in camera pixels
-		bool radius_valid = true;                          // If the radius and distance of the sphere was computed.
+		bool radius_valid = false;                         // If the radius and distance of the sphere was computed. Also used for visibility.
 
 		bool is_calibrating{false};                        // Whether or not we are currently calibrating
 		u64 calibration_start_us{0};                       // The start timestamp of the calibration in microseconds
@@ -264,16 +276,126 @@ public:
 
 	u64 start_timestamp_us = 0;
 
+	std::array<ps_move_data, CELL_GEM_MAX_NUM> fake_move_data {}; // No need to be in savestate
+
+	atomic_t<u32> m_wake_up = 0;
+	atomic_t<u32> m_done = 0;
+
+	void wake_up()
+	{
+		m_wake_up.release(1);
+		m_wake_up.notify_one();
+	}
+
+	void done()
+	{
+		m_done.release(1);
+		m_done.notify_one();
+	}
+
+	bool wait_for_result(ppu_thread& ppu)
+	{
+		// Notify gem thread that the initial state after loading a savestate can be updated.
+		if (m_done.compare_and_swap_test(2, 0))
+		{
+			m_done.notify_one();
+		}
+
+		while (!m_done && !ppu.is_stopped())
+		{
+			thread_ctrl::wait_on(m_done, 0);
+		}
+
+		if (ppu.is_stopped())
+		{
+			ppu.state += cpu_flag::again;
+			return false;
+		}
+
+		m_done = 0;
+		return true;
+	}
+
 	// helper functions
 	bool is_controller_ready(u32 gem_num) const
 	{
 		return controllers[gem_num].status == CELL_GEM_STATUS_READY;
 	}
 
+	void update_connections()
+	{
+		connected_controllers = 0;
+
+		const auto update_connection = [this](u32 i, bool connected)
+		{
+			if (connected)
+			{
+				connected_controllers++;
+				controllers[i].status = CELL_GEM_STATUS_READY;
+				controllers[i].port = port_num(i);
+			}
+			else
+			{
+				controllers[i].status = CELL_GEM_STATUS_DISCONNECTED;
+				controllers[i].port = 0;
+			}
+		};
+
+		switch (g_cfg.io.move)
+		{
+		case move_handler::real:
+		case move_handler::fake:
+		{
+			std::lock_guard lock(pad::g_pad_mutex);
+			const auto handler = pad::get_pad_thread(true);
+			if (!handler) break;
+
+			for (u32 i = 0; i < CELL_GEM_MAX_NUM; i++)
+			{
+				const auto& pad = ::at32(handler->GetPads(), pad_num(i));
+				const bool connected = pad && pad->is_connected() && !pad->is_copilot() && i < attribute.max_connect;
+				const bool is_real_move = g_cfg.io.move != move_handler::real || pad->m_pad_handler == pad_handler::move;
+
+				update_connection(i, connected && is_real_move);
+			}
+			break;
+		}
+		case move_handler::mouse:
+		case move_handler::raw_mouse:
+		{
+			auto& handler = *ensure(g_fxo->try_get<MouseHandlerBase>());
+			std::lock_guard mouse_lock(handler.mutex);
+			const MouseInfo& info = handler.GetInfo();
+
+			for (u32 i = 0; i < CELL_GEM_MAX_NUM; i++)
+			{
+				update_connection(i, i < attribute.max_connect && info.status[i] == CELL_MOUSE_STATUS_CONNECTED);
+			}
+			break;
+		}
+#ifdef HAVE_LIBEVDEV
+		case move_handler::gun:
+		{
+			gun_thread& gun = *ensure(g_fxo->try_get<gun_thread>());
+			std::scoped_lock lock(gun.handler.mutex);
+			gun.num_devices = gun.handler.init() ? gun.handler.get_num_guns() : 0;
+
+			for (u32 i = 0; i < CELL_GEM_MAX_NUM; i++)
+			{
+				update_connection(i, i < attribute.max_connect && i < gun.num_devices);
+			}
+			break;
+		}
+#endif
+		case move_handler::null:
+		{
+			break;
+		}
+		}
+	}
+
 	void update_calibration_status()
 	{
-		std::scoped_lock lock(mtx);
-
 		for (u32 gem_num = 0; gem_num < CELL_GEM_MAX_NUM; gem_num++)
 		{
 			gem_controller& controller = controllers[gem_num];
@@ -285,9 +407,9 @@ public:
 			if (g_cfg.io.move == move_handler::real)
 			{
 				std::lock_guard pad_lock(pad::g_pad_mutex);
-				const auto handler = pad::get_current_handler();
+				const auto handler = pad::get_pad_thread();
 				const auto& pad = ::at32(handler->GetPads(), pad_num(gem_num));
-				if (pad && pad->m_pad_handler == pad_handler::move)
+				if (pad && pad->m_pad_handler == pad_handler::move && !pad->is_copilot())
 				{
 					if (!pad->move_data.calibration_requested || !pad->move_data.calibration_succeeded)
 					{
@@ -315,9 +437,9 @@ public:
 			if (g_cfg.io.move == move_handler::real)
 			{
 				std::lock_guard pad_lock(pad::g_pad_mutex);
-				const auto handler = pad::get_current_handler();
+				const auto handler = pad::get_pad_thread();
 				const auto& pad = ::at32(handler->GetPads(), pad_num(gem_num));
-				if (pad && pad->m_pad_handler == pad_handler::move)
+				if (pad && pad->m_pad_handler == pad_handler::move && !pad->is_copilot())
 				{
 					pad->move_data.calibration_requested = false;
 					pad->move_data.calibration_succeeded = false;
@@ -345,11 +467,11 @@ public:
 		{
 			connected_controllers = 0;
 			std::lock_guard lock(pad::g_pad_mutex);
-			const auto handler = pad::get_current_handler();
+			const auto handler = pad::get_pad_thread();
 			for (u32 i = 0; i < std::min<u32>(attribute.max_connect, CELL_GEM_MAX_NUM); i++)
 			{
 				const auto& pad = ::at32(handler->GetPads(), pad_num(i));
-				if (pad && pad->m_pad_handler == pad_handler::move && (pad->m_port_status & CELL_PAD_STATUS_CONNECTED))
+				if (pad && pad->m_pad_handler == pad_handler::move && pad->is_connected() && !pad->is_copilot())
 				{
 					connected_controllers++;
 
@@ -366,11 +488,11 @@ public:
 		{
 			connected_controllers = 0;
 			std::lock_guard lock(pad::g_pad_mutex);
-			const auto handler = pad::get_current_handler();
+			const auto handler = pad::get_pad_thread();
 			for (u32 i = 0; i < std::min<u32>(attribute.max_connect, CELL_GEM_MAX_NUM); i++)
 			{
 				const auto& pad = ::at32(handler->GetPads(), pad_num(i));
-				if (pad && (pad->m_port_status & CELL_PAD_STATUS_CONNECTED))
+				if (pad && pad->is_connected() && !pad->is_copilot())
 				{
 					connected_controllers++;
 
@@ -385,7 +507,7 @@ public:
 		case move_handler::mouse:
 		case move_handler::raw_mouse:
 		{
-			auto& handler = g_fxo->get<MouseHandlerBase>();
+			auto& handler = *ensure(g_fxo->try_get<MouseHandlerBase>());
 			std::lock_guard mouse_lock(handler.mutex);
 
 			// Make sure that the mouse handler is initialized
@@ -402,7 +524,7 @@ public:
 #ifdef HAVE_LIBEVDEV
 		case move_handler::gun:
 		{
-			gun_thread& gun = g_fxo->get<gun_thread>();
+			gun_thread& gun = *ensure(g_fxo->try_get<gun_thread>());
 			std::scoped_lock lock(gun.handler.mutex);
 			gun.num_devices = gun.handler.init() ? gun.handler.get_num_guns() : 0;
 			connected_controllers = std::min<u32>(std::min<u32>(attribute.max_connect, CELL_GEM_MAX_NUM), gun.num_devices);
@@ -433,7 +555,7 @@ public:
 		load_configs();
 	};
 
-	SAVESTATE_INIT_POS(15);
+	SAVESTATE_INIT_POS(16.1); // Depends on cellCamera
 
 	void save(utils::serial& ar)
 	{
@@ -474,6 +596,11 @@ public:
 		}
 
 		ar(connected_controllers, updating, camera_frame, memory_ptr, start_timestamp_us);
+
+		if (ar.is_writing() || version >= 3)
+		{
+			ar(video_conversion_in_progress, video_data_out_size);
+		}
 	}
 
 	gem_config_data(utils::serial& ar)
@@ -494,8 +621,14 @@ public:
 			cellGem.notice("Could not load fake gem config. Using defaults.");
 		}
 
-		cellGem.notice("Real gem config=\n", g_cfg_gem_real.to_string());
-		cellGem.notice("Fake gem config=\n", g_cfg_gem_fake.to_string());
+		if (!g_cfg_gem_mouse.load())
+		{
+			cellGem.notice("Could not load mouse gem config. Using defaults.");
+		}
+
+		cellGem.notice("Real gem config=%s", g_cfg_gem_real.to_string());
+		cellGem.notice("Fake gem config=%s", g_cfg_gem_fake.to_string());
+		cellGem.notice("Mouse gem config=%s", g_cfg_gem_mouse.to_string());
 	}
 };
 
@@ -565,32 +698,222 @@ namespace gem
 		{
 		}
 
-		static inline u8 Y(u8 r, u8 g, u8 b) { return static_cast<u8>(0.299f * r + 0.587f * g + 0.114f * b); }
-		static inline u8 U(u8 r, u8 g, u8 b) { return static_cast<u8>(-0.14713f * r - 0.28886f * g + 0.436f * b); }
-		static inline u8 V(u8 r, u8 g, u8 b) { return static_cast<u8>(0.615f * r - 0.51499f * g - 0.10001f * b); }
+		YUV(const u8 rgb[3])
+		{
+			const u8 r = rgb[0];
+			const u8 g = rgb[1];
+			const u8 b = rgb[2];
+			y = Y(r, g, b);
+			u = U(r, g, b);
+			v = V(r, g, b);
+		}
+
+		static inline u8 Y(u8 r, u8 g, u8 b) { return static_cast<u8>(std::clamp(0.299f * r + 0.587f * g + 0.114f * b, 0.0f, 255.0f)); }
+		static inline u8 U(u8 r, u8 g, u8 b) { return static_cast<u8>(std::clamp(-0.169f * r - 0.331f * g + 0.499f * b + 128, 0.0f, 255.0f)); }
+		static inline u8 V(u8 r, u8 g, u8 b) { return static_cast<u8>(std::clamp(0.499f * r - 0.460f * g - 0.040f * b + 128, 0.0f, 255.0f)); }
 	};
 
-	bool convert_image_format(CellCameraFormat input_format, CellGemVideoConvertFormatEnum output_format,
-	                          const std::vector<u8>& video_data_in, u32 width, u32 height,
-	                          u8* video_data_out, u32 video_data_out_size)
+	template <bool use_gain>
+	static inline void debayer_raw8_impl(const u8* src, u8* dst, u8 alpha, f32 gain_r, f32 gain_g, f32 gain_b)
 	{
-		if (output_format != CELL_GEM_NO_VIDEO_OUTPUT && !video_data_out)
+		constexpr u32 in_pitch = 640;
+		constexpr u32 out_pitch = 640 * 4;
+
+		// Hamilton–Adams demosaicing
+		for (s32 y = 0; y < 480; y++)
+		{
+			const bool is_even_y = (y % 2) == 0;
+			const u8* srcc = src + y * in_pitch;
+			const u8* srcu = src + std::max(0, y - 1) * in_pitch;
+			const u8* srcd = src + std::min(480 - 1, y + 1) * in_pitch;
+
+			u8* dst0 = dst + y * out_pitch;
+
+			// Split loops (roughly twice the performance by removing one condition)
+			if (is_even_y)
+			{
+				for (s32 x = 0; x < 640; x++, dst0 += 4)
+				{
+					const bool is_even_x = (x % 2) == 0;
+					const int xl = std::max(0, x - 1);
+					const int xr = std::min(640 - 1, x + 1);
+
+					u8 r, b, g;
+
+					if (is_even_x)
+					{
+						// Blue pixel
+						const u8 up = srcu[x];
+						const u8 down = srcd[x];
+						const u8 left = srcc[xl];
+						const u8 right = srcc[xr];
+						const int dh = std::abs(int(left) - int(right));
+						const int dv = std::abs(int(up)   - int(down));
+
+						r = (srcu[xl] + srcu[xr] + srcd[xl] + srcd[xr]) / 4;
+						if (dh < dv)
+							g = (left + right) / 2;
+						else if (dv < dh)
+							g = (up + down) / 2;
+						else
+							g = (up + down + left + right) / 4;
+						b = srcc[x];
+					}
+					else
+					{
+						// Green (on blue row)
+						r = (srcu[x] + srcd[x]) / 2;
+						g = srcc[x];
+						b = (srcc[xl] + srcc[xr]) / 2;
+					}
+
+					if constexpr (use_gain)
+					{
+						dst0[0] = static_cast<u8>(std::clamp(r * gain_r, 0.0f, 255.0f));
+						dst0[1] = static_cast<u8>(std::clamp(g * gain_g, 0.0f, 255.0f));
+						dst0[2] = static_cast<u8>(std::clamp(b * gain_b, 0.0f, 255.0f));
+					}
+					else
+					{
+						dst0[0] = r;
+						dst0[1] = g;
+						dst0[2] = b;
+					}
+					dst0[3] = alpha;
+				}
+			}
+			else
+			{
+				for (s32 x = 0; x < 640; x++, dst0 += 4)
+				{
+					const bool is_even_x = (x % 2) == 0;
+					const int xl = std::max(0, x - 1);
+					const int xr = std::min(640 - 1, x + 1);
+
+					u8 r, b, g;
+
+					if (is_even_x)
+					{
+						// Green (on red row)
+						r = (srcc[xl] + srcc[xr]) / 2;
+						g = srcc[x];
+						b = (srcu[x] + srcd[x]) / 2;
+					}
+					else
+					{
+						// Red pixel
+						const u8 up = srcu[x];
+						const u8 down = srcd[x];
+						const u8 left = srcc[xl];
+						const u8 right = srcc[xr];
+						const int dh = std::abs(int(left) - int(right));
+						const int dv = std::abs(int(up)   - int(down));
+
+						r = srcc[x];
+						if (dh < dv)
+							g = (left + right) / 2;
+						else if (dv < dh)
+							g = (up + down) / 2;
+						else
+							g = (up + down + left + right) / 4;
+						b = (srcu[xl] + srcu[xr] + srcd[xl] + srcd[xr]) / 4;
+					}
+
+					if constexpr (use_gain)
+					{
+						dst0[0] = static_cast<u8>(std::clamp(r * gain_r, 0.0f, 255.0f));
+						dst0[1] = static_cast<u8>(std::clamp(g * gain_g, 0.0f, 255.0f));
+						dst0[2] = static_cast<u8>(std::clamp(b * gain_b, 0.0f, 255.0f));
+					}
+					else
+					{
+						dst0[0] = r;
+						dst0[1] = g;
+						dst0[2] = b;
+					}
+					dst0[3] = alpha;
+				}
+			}
+		}
+	}
+
+	static void debayer_raw8(const u8* src, u8* dst, u8 alpha, f32 gain_r, f32 gain_g, f32 gain_b)
+	{
+		if (gain_r != 1.0f || gain_g != 1.0f || gain_b != 1.0f)
+			debayer_raw8_impl<true>(src, dst, alpha, gain_r, gain_g, gain_b);
+		else
+			debayer_raw8_impl<false>(src, dst, alpha, gain_r, gain_g, gain_b);
+	}
+
+	template <bool use_gain>
+	static inline void debayer_raw8_downscale_impl(const u8* src, u8* dst, u8 alpha, f32 gain_r, f32 gain_g, f32 gain_b)
+	{
+		constexpr u32 in_pitch = 640;
+		constexpr u32 out_pitch = 320 * 4;
+
+		// Simple debayer
+		for (s32 y = 0; y < 240; y++)
+		{
+			const u8* src0 = src + y * 2 * in_pitch;
+			const u8* src1 = src0 + in_pitch;
+
+			u8* dst0 = dst + y * out_pitch;
+
+			for (s32 x = 0; x < 320; x++, dst0 += 4, src0 += 2, src1 += 2)
+			{
+				const u8 b  = src0[0];
+				const u8 g0 = src0[1];
+				const u8 g1 = src1[0];
+				const u8 r  = src1[1];
+				const u8 g  = (g0 + g1) >> 1;
+
+				if constexpr (use_gain)
+				{
+					dst0[0] = static_cast<u8>(std::clamp(r * gain_r, 0.0f, 255.0f));
+					dst0[1] = static_cast<u8>(std::clamp(g * gain_g, 0.0f, 255.0f));
+					dst0[2] = static_cast<u8>(std::clamp(b * gain_b, 0.0f, 255.0f));
+				}
+				else
+				{
+					dst0[0] = r;
+					dst0[1] = g;
+					dst0[2] = b;
+				}
+				dst0[3] = alpha;
+			}
+		}
+	}
+
+	static void debayer_raw8_downscale(const u8* src, u8* dst, u8 alpha, f32 gain_r, f32 gain_g, f32 gain_b)
+	{
+		if (gain_r != 1.0f || gain_g != 1.0f || gain_b != 1.0f)
+			debayer_raw8_downscale_impl<true>(src, dst, alpha, gain_r, gain_g, gain_b);
+		else
+			debayer_raw8_downscale_impl<false>(src, dst, alpha, gain_r, gain_g, gain_b);
+	}
+
+	bool convert_image_format(CellCameraFormat input_format, const CellGemVideoConvertAttribute& vc,
+	                          const std::vector<u8>& video_data_in, u32 width, u32 height,
+	                          u8* video_data_out, u32 video_data_out_size, u8* buffer_memory,
+	                          std::string_view caller)
+	{
+		if (vc.output_format != CELL_GEM_NO_VIDEO_OUTPUT && !video_data_out)
 		{
 			return false;
 		}
 
 		const u32 required_in_size = get_buffer_size_by_format(static_cast<s32>(input_format), width, height);
-		const s32 required_out_size = cellGemGetVideoConvertSize(output_format);
+		const s32 required_out_size = cellGemGetVideoConvertSize(vc.output_format);
 
 		if (video_data_in.size() != required_in_size)
 		{
-			cellGem.error("convert: in_size mismatch: required=%d, actual=%d", required_in_size, video_data_in.size());
+			cellGem.error("convert: in_size mismatch: required=%d, actual=%d (called from %s)", required_in_size, video_data_in.size(), caller);
 			return false;
 		}
 
 		if (required_out_size < 0 || video_data_out_size != static_cast<u32>(required_out_size))
 		{
-			cellGem.error("convert: out_size unknown: required=%d, format %d", required_out_size, output_format);
+			cellGem.error("convert: out_size unknown: required=%d, actual=%d, format %d (called from %s)", required_out_size, video_data_out_size, vc.output_format, caller);
 			return false;
 		}
 
@@ -599,7 +922,121 @@ namespace gem
 			return false;
 		}
 
-		switch (output_format)
+		thread_local std::vector<u8> corrected_buffer;
+		thread_local std::vector<u8> combined_buffer;
+		thread_local std::vector<u8> conversion_buffer;
+
+		const u8* src_data = video_data_in.data();
+		const u8 alpha = vc.alpha;
+		const f32 gain_r = vc.gain * vc.red_gain;
+		const f32 gain_g = vc.gain * vc.green_gain;
+		const f32 gain_b = vc.gain * vc.blue_gain;
+
+		// Only RAW8 should be relevant for cellGem unless I'm mistaken
+		if (input_format == CELL_CAMERA_RAW8)
+		{
+			// TODO: CELL_GEM_AUTO_WHITE_BALANCE
+			// TODO: CELL_GEM_GAMMA_BOOST
+
+			// Correct outliers
+			if (vc.conversion_flags & CELL_GEM_FILTER_OUTLIER_PIXELS)
+			{
+				corrected_buffer.resize(width * height);
+
+				for (u32 y = 0; y < height; y++)
+				{
+					const u8* src = src_data + y * 640;
+					u8* dst = &corrected_buffer[y * 640];
+
+					for (u32 x = 0; x < width; x++, src++)
+					{
+						// Let's just say these 2 are outliers
+						if (const u8 val = *src; val > 0 && val < 255)
+						{
+							*dst++ = val;
+							continue;
+						}
+
+						// Just take the 4 neighbours for now
+						s32 sum = 0;
+						if (y >= 2) sum += *(src - (2 * 640));
+						if (x >= 2) sum += *(src - 2);
+						if (x < 638) sum += *(src + 2);
+						if (y < 478) sum += *(src + (2 * 640));
+
+						*dst++ = sum / 4; // Ignore count. It will only be less than 4 on the edges
+					}
+				}
+
+				src_data = corrected_buffer.data();
+			}
+
+			// Combine with previous frame
+			if (buffer_memory && (vc.conversion_flags & CELL_GEM_COMBINE_PREVIOUS_INPUT_FRAME))
+			{
+				combined_buffer.resize(width * height);
+
+				for (u32 i = 0; i < combined_buffer.size(); i++)
+				{
+					const u8 val = src_data[i];
+					u8& old = buffer_memory[i];
+					combined_buffer[i] = (old + val) / 2;
+					old = val;
+				}
+
+				src_data = combined_buffer.data();
+			}
+
+			switch (vc.output_format)
+			{
+			case CELL_GEM_YUV_640x480:
+			case CELL_GEM_YUV422_640x480:
+			case CELL_GEM_YUV411_640x480:
+			{
+				// Let's debayer the image first for YUV formats
+				conversion_buffer.resize(cellGemGetVideoConvertSize(CELL_GEM_RGBA_640x480));
+
+				debayer_raw8(src_data, conversion_buffer.data(), alpha, gain_r, gain_g, gain_b);
+
+				src_data = conversion_buffer.data();
+				input_format = CELL_CAMERA_RGBA;
+				width = 640;
+				height = 480;
+				break;
+			}
+			case CELL_GEM_BAYER_RESTORED:
+			case CELL_GEM_BAYER_RESTORED_RGGB:
+			case CELL_GEM_BAYER_RESTORED_RASTERIZED:
+			{
+				// Let's apply gain
+				if (gain_r != 1.0f || gain_g != 1.0f || gain_b != 1.0f)
+				{
+					conversion_buffer.resize(cellGemGetVideoConvertSize(CELL_GEM_RGBA_640x480));
+
+					const f32 bggr_gains[2][2] = {{gain_b, gain_g}, {gain_g, gain_r}};
+					const u8* src = src_data;
+					u8* dst = conversion_buffer.data();
+
+					for (u32 y = 0; y < 480; y++)
+					{
+						const f32* gains = bggr_gains[y % 2];
+
+						for (u32 x = 0; x < 640; x++)
+						{
+							*dst++ = static_cast<u8>(std::clamp(*src++ * gains[x % 2], 0.0f, 255.0f));
+						}
+					}
+
+					src_data = conversion_buffer.data();
+				}
+				break;
+			}
+			default:
+				break;
+			}
+		}
+
+		switch (vc.output_format)
 		{
 		case CELL_GEM_RGBA_640x480: // RGBA output; 640*480*4-byte output buffer required
 		{
@@ -607,51 +1044,18 @@ namespace gem
 			{
 			case CELL_CAMERA_RAW8:
 			{
-				const u32 in_pitch = width;
-				const u32 out_pitch = width * 4;
-
-				for (u32 y = 0; y < height - 1; y += 2)
-				{
-					const u8* src0 = &video_data_in[y * in_pitch];
-					const u8* src1 = src0 + in_pitch;
-
-					u8* dst0 = video_data_out + y * out_pitch;
-					u8* dst1 = dst0 + out_pitch;
-
-					for (u32 x = 0; x < width - 1; x += 2, src0 += 2, src1 += 2, dst0 += 8, dst1 += 8)
-					{
-						const u8 b  = src0[0];
-						const u8 g0 = src0[1];
-						const u8 g1 = src1[0];
-						const u8 r  = src1[1];
-
-						const u8 top[4] = { r, g0, b, 255 };
-						const u8 bottom[4] = { r, g1, b, 255 };
-
-						// Top-Left
-						std::memcpy(dst0, top, 4);
-
-						// Top-Right Pixel
-						std::memcpy(dst0 + 4, top, 4);
-
-						// Bottom-Left Pixel
-						std::memcpy(dst1, bottom, 4);
-
-						// Bottom-Right Pixel
-						std::memcpy(dst1 + 4, bottom, 4);
-					}
-				}
+				debayer_raw8(src_data, video_data_out, alpha, gain_r, gain_g, gain_b);
 				break;
 			}
 			case CELL_CAMERA_RGBA:
 			{
-				std::memcpy(video_data_out, video_data_in.data(), std::min<usz>(required_in_size, required_out_size));
+				std::memcpy(video_data_out, src_data, std::min<usz>(required_in_size, required_out_size));
 				break;
 			}
 			default:
 			{
-				cellGem.error("Unimplemented: Converting %s to %s", input_format, output_format);
-				std::memcpy(video_data_out, video_data_in.data(), std::min<usz>(required_in_size, required_out_size));
+				cellGem.error("Unimplemented: Converting %s to %s (called from %s)", input_format, vc.output_format, caller);
+				std::memcpy(video_data_out, src_data, std::min<usz>(required_in_size, required_out_size));
 				return false;
 			}
 			}
@@ -661,17 +1065,18 @@ namespace gem
 		{
 			if (input_format == CELL_CAMERA_RAW8)
 			{
-				std::memcpy(video_data_out, video_data_in.data(), std::min<usz>(required_in_size, required_out_size));
+				std::memcpy(video_data_out, src_data, std::min<usz>(required_in_size, required_out_size));
 			}
 			else
 			{
-				cellGem.error("Unimplemented: Converting %s to %s", input_format, output_format);
+				cellGem.error("Unimplemented: Converting %s to %s (called from %s)", input_format, vc.output_format, caller);
 				return false;
 			}
 			break;
 		}
 		case CELL_GEM_YUV_640x480: // YUV output; 640*480+640*480+640*480-byte output buffer required (contiguous)
 		{
+			// YUV 4:4:4 planar. 1 value each per pixel
 			const u32 yuv_pitch = width;
 
 			u8* dst_y = video_data_out;
@@ -682,61 +1087,21 @@ namespace gem
 			{
 			case CELL_CAMERA_RAW8:
 			{
-				const u32 in_pitch = width;
-
-				for (u32 y = 0; y < height - 1; y += 2)
-				{
-					const u8* src0 = &video_data_in[y * in_pitch];
-					const u8* src1 = src0 + in_pitch;
-
-					u8* dst_y0 = dst_y + y * yuv_pitch;
-					u8* dst_y1 = dst_y0 + yuv_pitch;
-
-					u8* dst_u0 = dst_u + y * yuv_pitch;
-					u8* dst_u1 = dst_u0 + yuv_pitch;
-
-					u8* dst_v0 = dst_v + y * yuv_pitch;
-					u8* dst_v1 = dst_v0 + yuv_pitch;
-
-					for (u32 x = 0; x < width - 1; x += 2, src0 += 2, src1 += 2, dst_y0 += 2, dst_y1 += 2, dst_u0 += 2, dst_u1 += 2, dst_v0 += 2, dst_v1 += 2)
-					{
-						const u8 b  = src0[0];
-						const u8 g0 = src0[1];
-						const u8 g1 = src1[0];
-						const u8 r  = src1[1];
-
-						// Convert RGBA to YUV
-						const YUV yuv_top    = YUV(r, g0, b);
-						const YUV yuv_bottom = YUV(r, g1, b);
-
-						dst_y0[0] = dst_y0[1] = yuv_top.y;
-						dst_y1[0] = dst_y1[1] = yuv_bottom.y;
-
-						dst_u0[0] = dst_u0[1] = yuv_top.u;
-						dst_u1[0] = dst_u1[1] = yuv_bottom.u;
-
-						dst_v0[0] = dst_v0[1] = yuv_top.v;
-						dst_v1[0] = dst_v1[1] = yuv_bottom.v;
-					}
-				}
+				fmt::throw_exception("Unreachable: should already be debayered");
 				break;
 			}
 			case CELL_CAMERA_RGBA:
 			{
-				const u32 in_pitch = width / 4;
+				const u32 in_pitch = width * 4;
 
 				for (u32 y = 0; y < height; y++)
 				{
-					const u8* src = &video_data_in[y * in_pitch];
+					const u8* src = src_data + y * in_pitch;
 
 					for (u32 x = 0; x < width; x++, src += 4)
 					{
-						const u8 r = src[0];
-						const u8 g = src[1];
-						const u8 b = src[2];
-
 						// Convert RGBA to YUV
-						const YUV yuv = YUV(r, g, b);
+						const YUV yuv = YUV(src);
 
 						*dst_y++ = yuv.y;
 						*dst_u++ = yuv.u;
@@ -747,8 +1112,8 @@ namespace gem
 			}
 			default:
 			{
-				cellGem.error("Unimplemented: Converting %s to %s", input_format, output_format);
-				std::memcpy(video_data_out, video_data_in.data(), std::min<usz>(required_in_size, required_out_size));
+				cellGem.error("Unimplemented: Converting %s to %s (called from %s)", input_format, vc.output_format, caller);
+				std::memcpy(video_data_out, src_data, std::min<usz>(required_in_size, required_out_size));
 				return false;
 			}
 			}
@@ -756,6 +1121,7 @@ namespace gem
 		}
 		case CELL_GEM_YUV422_640x480: // YUV output; 640*480+320*480+320*480-byte output buffer required (contiguous)
 		{
+			// YUV 4:2:2 planar. 1 Y value per pixel, 1 U/V value per 2 horizontal pixels
 			const u32 y_pitch = width;
 			const u32 uv_pitch = width / 2;
 
@@ -767,43 +1133,7 @@ namespace gem
 			{
 			case CELL_CAMERA_RAW8:
 			{
-				const u32 in_pitch = width;
-
-				for (u32 y = 0; y < height - 1; y += 2)
-				{
-					const u8* src0 = &video_data_in[y * in_pitch];
-					const u8* src1 = src0 + in_pitch;
-
-					u8* dst_y0 = dst_y + y * y_pitch;
-					u8* dst_y1 = dst_y0 + y_pitch;
-
-					u8* dst_u0 = dst_u + y * uv_pitch;
-					u8* dst_u1 = dst_u0 + uv_pitch;
-
-					u8* dst_v0 = dst_v + y * uv_pitch;
-					u8* dst_v1 = dst_v0 + uv_pitch;
-
-					for (u32 x = 0; x < width - 1; x += 2, src0 += 2, src1 += 2, dst_y0 += 2, dst_y1 += 2)
-					{
-						const u8 b  = src0[0];
-						const u8 g0 = src0[1];
-						const u8 g1 = src1[0];
-						const u8 r  = src1[1];
-
-						// Convert RGBA to YUV
-						const YUV yuv_top    = YUV(r, g0, b);
-						const YUV yuv_bottom = YUV(r, g1, b);
-
-						dst_y0[0] = dst_y0[1] = yuv_top.y;
-						dst_y1[0] = dst_y1[1] = yuv_bottom.y;
-
-						*dst_u0++ = yuv_top.u;
-						*dst_u1++ = yuv_bottom.u;
-
-						*dst_v0++ = yuv_top.v;
-						*dst_v1++ = yuv_bottom.v;
-					}
-				}
+				fmt::throw_exception("Unreachable: should already be debayered");
 				break;
 			}
 			case CELL_CAMERA_RGBA:
@@ -812,33 +1142,28 @@ namespace gem
 
 				for (u32 y = 0; y < height; y++)
 				{
-					const u8* src = &video_data_in[y * in_pitch];
+					const u8* src = src_data + y * in_pitch;
 
 					for (u32 x = 0; x < width - 1; x += 2, src += 8, dst_y += 2)
 					{
-						const u8 r_0 = src[0];
-						const u8 g_0 = src[1];
-						const u8 b_0 = src[2];
-						const u8 r_1 = src[4];
-						const u8 g_1 = src[5];
-						const u8 b_1 = src[6];
-
 						// Convert RGBA to YUV
-						const YUV yuv_0 = YUV(r_0, g_0, b_0);
-						const u8 y_1 = YUV::Y(r_1, g_1, b_1);
+						const YUV yuv_0 = YUV(src);
+						const YUV yuv_1 = YUV(src + 4);
 
 						dst_y[0] = yuv_0.y;
-						dst_y[1] = y_1;
-						*dst_u++ = yuv_0.u;
-						*dst_v++ = yuv_0.v;
+						dst_y[1] = yuv_1.y;
+
+						// Average U/V from 2 horizontal pixels
+						*dst_u++ = (yuv_0.u + yuv_1.u) / 2;
+						*dst_v++ = (yuv_0.v + yuv_1.v) / 2;
 					}
 				}
 				break;
 			}
 			default:
 			{
-				cellGem.error("Unimplemented: Converting %s to %s", input_format, output_format);
-				std::memcpy(video_data_out, video_data_in.data(), std::min<usz>(required_in_size, required_out_size));
+				cellGem.error("Unimplemented: Converting %s to %s (called from %s)", input_format, vc.output_format, caller);
+				std::memcpy(video_data_out, src_data, std::min<usz>(required_in_size, required_out_size));
 				return false;
 			}
 			}
@@ -846,109 +1171,54 @@ namespace gem
 		}
 		case CELL_GEM_YUV411_640x480: // YUV411 output; 640*480+320*240+320*240-byte output buffer required (contiguous)
 		{
-			const u32 y_pitch = width;
-			const u32 uv_pitch = width / 4;
-
+			// YUV 4:1:1 planar. 1 Y value per pixel, 1 U/V value per 2x2 pixel block
 			u8* dst_y = video_data_out;
-			u8* dst_u = dst_y + y_pitch * height;
-			u8* dst_v = dst_u + uv_pitch * height;
+			u8* dst_u = dst_y + 640 * 480;
+			u8* dst_v = dst_u + 320 * 240;
 
 			switch (input_format)
 			{
 			case CELL_CAMERA_RAW8:
 			{
-				const u32 in_pitch = width;
-
-				for (u32 y = 0; y < height - 1; y += 2)
-				{
-					const u8* src0 = &video_data_in[y * in_pitch];
-					const u8* src1 = src0 + in_pitch;
-
-					u8* dst_y0 = dst_y + y * y_pitch;
-					u8* dst_y1 = dst_y0 + y_pitch;
-
-					u8* dst_u0 = dst_u + y * uv_pitch;
-					u8* dst_u1 = dst_u0 + uv_pitch;
-
-					u8* dst_v0 = dst_v + y * uv_pitch;
-					u8* dst_v1 = dst_v0 + uv_pitch;
-
-					for (u32 x = 0; x < width - 3; x += 4, src0 += 4, src1 += 4, dst_y0 += 4, dst_y1 += 4)
-					{
-						const u8 b_left   = src0[0];
-						const u8 g0_left  = src0[1];
-						const u8 b_right  = src0[2];
-						const u8 g0_right = src0[3];
-
-						const u8 g1_left  = src1[0];
-						const u8 r_left   = src1[1];
-						const u8 g1_right = src1[2];
-						const u8 r_right  = src1[3];
-
-						// Convert RGBA to YUV
-						const YUV yuv_top_left    = YUV(r_left, g0_left, b_left); // Re-used for top-right
-						const u8 y_top_right      = YUV::Y(r_right, g0_right, b_right);
-						const YUV yuv_bottom_left = YUV(r_left, g1_left, b_left); // Re-used for bottom-right
-						const u8 y_bottom_right   = YUV::Y(r_right, g1_right, b_right);
-
-						dst_y0[0] = dst_y0[1] = yuv_top_left.y;
-						dst_y0[2] = dst_y0[3] = y_top_right;
-
-						dst_y1[0] = dst_y1[1] = yuv_bottom_left.y;
-						dst_y1[2] = dst_y1[3] = y_bottom_right;
-
-						*dst_u0++ = yuv_top_left.u;
-						*dst_u1++ = yuv_bottom_left.u;
-
-						*dst_v0++ = yuv_top_left.v;
-						*dst_v1++ = yuv_bottom_left.v;
-					}
-				}
+				fmt::throw_exception("Unreachable: should already be debayered");
 				break;
 			}
 			case CELL_CAMERA_RGBA:
 			{
 				const u32 in_pitch = width * 4;
 
-				for (u32 y = 0; y < height; y++)
+				// 2 rows at a time to get a 2x2 pixel block
+				for (u32 y = 0; y < height - 1; y += 2)
 				{
-					const u8* src = &video_data_in[y * in_pitch];
+					const u8* src = src_data + y * in_pitch;
+					const u8* src2 = src + in_pitch;
+					u8* dst_y1 = dst_y + y * 640;
+					u8* dst_y2 = dst_y1 + 640;
 
-					for (u32 x = 0; x < width - 3; x += 4, src += 16, dst_y += 4)
+					for (u32 x = 0; x < width - 1; x += 2, src += 8, src2 += 8, dst_y1 += 2, dst_y2 += 2)
 					{
-						const u8 r_0 = src[0];
-						const u8 g_0 = src[1];
-						const u8 b_0 = src[2];
-						const u8 r_1 = src[4];
-						const u8 g_1 = src[5];
-						const u8 b_1 = src[6];
-						const u8 r_2 = src[8];
-						const u8 g_2 = src[9];
-						const u8 b_2 = src[10];
-						const u8 r_3 = src[12];
-						const u8 g_3 = src[13];
-						const u8 b_3 = src[14];
-
 						// Convert RGBA to YUV
-						const YUV yuv_0 = YUV(r_0, g_0, b_0);
-						const u8 y_1 = YUV::Y(r_1, g_1, b_1);
-						const u8 y_2 = YUV::Y(r_2, g_2, b_2);
-						const u8 y_3 = YUV::Y(r_3, g_3, b_3);
+						const YUV yuv_0 = YUV(src);
+						const YUV yuv_1 = YUV(src + 4);
+						const YUV yuv_2 = YUV(src2);
+						const YUV yuv_3 = YUV(src2 + 4);
 
-						dst_y[0] = yuv_0.y;
-						dst_y[1] = y_1;
-						dst_y[2] = y_2;
-						dst_y[3] = y_3;
-						*dst_u++ = yuv_0.u;
-						*dst_v++ = yuv_0.v;
+						dst_y1[0] = yuv_0.y;
+						dst_y1[1] = yuv_1.y;
+						dst_y2[0] = yuv_2.y;
+						dst_y2[1] = yuv_3.y;
+
+						// Average U/V from 2x2 pixel block
+						*dst_u++ = (yuv_0.u + yuv_1.u + yuv_2.u + yuv_3.u) / 4;
+						*dst_v++ = (yuv_0.v + yuv_1.v + yuv_2.v + yuv_3.v) / 4;
 					}
 				}
 				break;
 			}
 			default:
 			{
-				cellGem.error("Unimplemented: Converting %s to %s", input_format, output_format);
-				std::memcpy(video_data_out, video_data_in.data(), std::min<usz>(required_in_size, required_out_size));
+				cellGem.error("Unimplemented: Converting %s to %s (called from %s)", input_format, vc.output_format, caller);
+				std::memcpy(video_data_out, src_data, std::min<usz>(required_in_size, required_out_size));
 				return false;
 			}
 			}
@@ -960,34 +1230,7 @@ namespace gem
 			{
 			case CELL_CAMERA_RAW8:
 			{
-				const u32 in_pitch = width;
-				const u32 out_pitch = width * 4 / 2;
-
-				for (u32 y = 0; y < height - 1; y += 2)
-				{
-					const u8* src0 = &video_data_in[y * in_pitch];
-					const u8* src1 = src0 + in_pitch;
-
-					u8* dst0 = video_data_out + (y / 2) * out_pitch;
-					u8* dst1 = dst0 + out_pitch;
-
-					for (u32 x = 0; x < width - 1; x += 2, src0 += 2, src1 += 2, dst0 += 4, dst1 += 4)
-					{
-						const u8 b  = src0[0];
-						const u8 g0 = src0[1];
-						const u8 g1 = src1[0];
-						const u8 r  = src1[1];
-
-						const u8 top[4] = { r, g0, b, 255 };
-						const u8 bottom[4] = { r, g1, b, 255 };
-
-						// Top-Left
-						std::memcpy(dst0, top, 4);
-
-						// Bottom-Left Pixel
-						std::memcpy(dst1, bottom, 4);
-					}
-				}
+				debayer_raw8_downscale(src_data, video_data_out, alpha, gain_r, gain_g, gain_b);
 				break;
 			}
 			case CELL_CAMERA_RGBA:
@@ -997,7 +1240,7 @@ namespace gem
 
 				for (u32 y = 0; y < height / 2; y++)
 				{
-					const u8* src = &video_data_in[y * 2 * in_pitch];
+					const u8* src = src_data + y * 2 * in_pitch;
 					u8* dst = video_data_out + y * out_pitch;
 
 					for (u32 x = 0; x < width / 2; x++, src += 4 * 2, dst += 4)
@@ -1009,28 +1252,106 @@ namespace gem
 			}
 			default:
 			{
-				cellGem.error("Unimplemented: Converting %s to %s", input_format, output_format);
-				std::memcpy(video_data_out, video_data_in.data(), std::min<usz>(required_in_size, required_out_size));
+				cellGem.error("Unimplemented: Converting %s to %s (called from %s)", input_format, vc.output_format, caller);
+				std::memcpy(video_data_out, src_data, std::min<usz>(required_in_size, required_out_size));
 				return false;
 			}
 			}
 			break;
 		}
 		case CELL_GEM_BAYER_RESTORED_RGGB: // Restored Bayer output, 2x2 pixels rearranged into 320x240 RG1G2B
+		{
+			if (input_format == CELL_CAMERA_RAW8)
+			{
+				const u32 dst_w = std::min(320u, width / 2);
+				const u32 dst_h = std::min(240u, height / 2);
+				const u32 in_pitch = width;
+				constexpr u32 out_pitch = 320 * 4;
+
+				for (u32 y = 0; y < dst_h; y++)
+				{
+					const u8* src0 = src_data + y * 2 * in_pitch;
+					const u8* src1 = src0 + in_pitch;
+
+					u8* dst = video_data_out + y * out_pitch;
+
+					for (u32 x = 0; x < dst_w; x++, src0 += 2, src1 += 2, dst += 4)
+					{
+						const u8 b  = src0[0];
+						const u8 g0 = src0[1];
+						const u8 g1 = src1[0];
+						const u8 r  = src1[1];
+
+						dst[0] = r;
+						dst[1] = g0;
+						dst[2] = g1;
+						dst[3] = b;
+					}
+				}
+			}
+			else
+			{
+				cellGem.error("Unimplemented: Converting %s to %s (called from %s)", input_format, vc.output_format, caller);
+				std::memcpy(video_data_out, src_data, std::min<usz>(required_in_size, required_out_size));
+				return false;
+			}
+			break;
+		}
 		case CELL_GEM_BAYER_RESTORED_RASTERIZED: // Restored Bayer output, R,G1,G2,B rearranged into 4 contiguous 320x240 1-channel rasters
 		{
-			cellGem.error("Unimplemented: Converting %s to %s", input_format, output_format);
-			std::memcpy(video_data_out, video_data_in.data(), std::min<usz>(required_in_size, required_out_size));
-			return false;
+			if (input_format == CELL_CAMERA_RAW8)
+			{
+				const u32 dst_w = std::min(320u, width / 2);
+				const u32 dst_h = std::min(240u, height / 2);
+				const u32 in_pitch = width;
+				constexpr u32 out_plane = 320 * 240;
+				constexpr u32 out_pitch = 320;
+
+				u8* dst_plane_r = video_data_out;
+				u8* dst_plane_g1 = video_data_out + out_plane;
+				u8* dst_plane_g2 = video_data_out + out_plane * 2;
+				u8* dst_plane_b = video_data_out + out_plane * 3;
+
+				for (u32 y = 0; y < dst_h; y++)
+				{
+					const u8* src0 = src_data + y * 2 * in_pitch;
+					const u8* src1 = src0 + in_pitch;
+
+					u8* dst_r = dst_plane_r + y * out_pitch;
+					u8* dst_g1 = dst_plane_g1 + y * out_pitch;
+					u8* dst_g2 = dst_plane_g2 + y * out_pitch;
+					u8* dst_b = dst_plane_b + y * out_pitch;
+
+					for (u32 x = 0; x < dst_w; x++, src0 += 2, src1 += 2)
+					{
+						const u8 b  = src0[0];
+						const u8 g0 = src0[1];
+						const u8 g1 = src1[0];
+						const u8 r  = src1[1];
+
+						dst_r[x] = r;
+						dst_g1[x] = g0;
+						dst_g2[x] = g1;
+						dst_b[x] = b;
+					}
+				}
+			}
+			else
+			{
+				cellGem.error("Unimplemented: Converting %s to %s (called from %s)", input_format, vc.output_format, caller);
+				std::memcpy(video_data_out, src_data, std::min<usz>(required_in_size, required_out_size));
+				return false;
+			}
+			break;
 		}
 		case CELL_GEM_NO_VIDEO_OUTPUT: // Disable video output
 		{
-			cellGem.trace("Ignoring frame conversion for CELL_GEM_NO_VIDEO_OUTPUT");
+			cellGem.trace("Ignoring frame conversion for CELL_GEM_NO_VIDEO_OUTPUT (called from %s)", caller);
 			break;
 		}
 		default:
 		{
-			cellGem.error("Trying to convert %s to %s", input_format, output_format);
+			cellGem.error("Trying to convert %s to %s (called from %s)", input_format, vc.output_format, caller);
 			return false;
 		}
 		}
@@ -1138,16 +1459,55 @@ void gem_config_data::operator()()
 {
 	cellGem.notice("Starting thread");
 
+	u64 last_update_us = 0;
+
+	// Handle initial state after loading a savestate
+	if (state && video_conversion_in_progress)
+	{
+		// Wait for cellGemConvertVideoFinish. The initial savestate loading may take a while.
+		m_done = 2; // Use special value 2 for this case
+		thread_ctrl::wait_on(m_done, 2, 5'000'000);
+
+		// Just mark this conversion as complete (there's no real downside to this, except for a black image)
+		video_conversion_in_progress = false;
+		done();
+	}
+
 	while (thread_ctrl::state() != thread_state::aborting && !Emu.IsStopped())
 	{
-		while (!video_conversion_in_progress && thread_ctrl::state() != thread_state::aborting && !Emu.IsStopped())
+		u64 timeout = umax;
+
+		if (state && !video_conversion_in_progress)
 		{
-			if (state)
+			constexpr u64 update_timeout_us = 100'000; // Update controllers at 10Hz
+			const u64 now_us = get_system_time();
+			const u64 elapsed_us = now_us - last_update_us;
+
+			if (elapsed_us < update_timeout_us)
 			{
+				timeout = update_timeout_us - elapsed_us;
+			}
+			else
+			{
+				timeout = update_timeout_us;
+				last_update_us = now_us;
+
+				std::scoped_lock lock(mtx);
+				update_connections();
 				update_calibration_status();
 			}
+		}
 
-			thread_ctrl::wait_for(1000);
+		if (!m_wake_up)
+		{
+			thread_ctrl::wait_on(m_wake_up, 0, timeout);
+		}
+
+		m_wake_up = 0;
+
+		if (!video_conversion_in_progress)
+		{
+			continue;
 		}
 
 		if (thread_ctrl::state() == thread_state::aborting || Emu.IsStopped())
@@ -1161,25 +1521,36 @@ void gem_config_data::operator()()
 			vc = vc_attribute;
 		}
 
-		if (g_cfg.io.camera != camera_handler::qt)
+		switch (g_cfg.io.camera)
 		{
+#ifdef HAVE_SDL3
+		case camera_handler::sdl:
+#endif
+		case camera_handler::qt:
+			break;
+		case camera_handler::fake:
+		case camera_handler::null:
 			video_conversion_in_progress = false;
+			done();
 			continue;
 		}
 
 		const auto& shared_data = g_fxo->get<gem_camera_shared>();
 
-		if (gem::convert_image_format(shared_data.format, vc.output_format, video_data_in, shared_data.width, shared_data.height, vc_attribute.video_data_out ? vc_attribute.video_data_out.get_ptr() : nullptr, video_data_out_size))
+		if (gem::convert_image_format(shared_data.format, vc, video_data_in, shared_data.width, shared_data.height,
+			vc.video_data_out ? vc.video_data_out.get_ptr() : nullptr, video_data_out_size,
+			vc.buffer_memory ? vc.buffer_memory.get_ptr() : nullptr, "cellGem"))
 		{
 			cellGem.trace("Converted video frame of format %s to %s", shared_data.format.load(), vc.output_format.get());
 
 			if (g_cfg.io.paint_move_spheres)
 			{
-				paint_spheres(vc.output_format, shared_data.width, shared_data.height, vc_attribute.video_data_out ? vc_attribute.video_data_out.get_ptr() : nullptr, video_data_out_size);
+				paint_spheres(vc.output_format, shared_data.width, shared_data.height, vc.video_data_out ? vc.video_data_out.get_ptr() : nullptr, video_data_out_size);
 			}
 		}
 
 		video_conversion_in_progress = false;
+		done();
 	}
 }
 
@@ -1197,19 +1568,39 @@ public:
 		return m_busy;
 	}
 
-	void wake_up()
+	void wake_up_tracker()
 	{
-		m_wake_up.release(1);
-		m_wake_up.notify_one();
+		m_wake_up_tracker.release(1);
+		m_wake_up_tracker.notify_one();
 	}
 
-	void wait_for_result()
+	void tracker_done()
 	{
-		if (!m_done)
+		m_tracker_done.release(1);
+		m_tracker_done.notify_one();
+	}
+
+	bool wait_for_tracker_result(ppu_thread& ppu)
+	{
+		if (g_cfg.io.move != move_handler::real)
 		{
-			m_done.wait(0);
-			m_done.release(0);
+			m_tracker_done = 0;
+			return true;
 		}
+
+		while (!m_tracker_done && !ppu.is_stopped())
+		{
+			thread_ctrl::wait_on(m_tracker_done, 0);
+		}
+
+		if (ppu.is_stopped())
+		{
+			ppu.state += cpu_flag::again;
+			return false;
+		}
+
+		m_tracker_done = 0;
+		return true;
 	}
 
 	bool set_image(u32 addr)
@@ -1238,13 +1629,8 @@ public:
 			return false;
 		}
 
-		if (!m_camera_info.bytesize)
-		{
-			cellGem.error("gem_tracker: unexpected image size: %d", m_camera_info.bytesize);
-			return false;
-		}
-
 		m_tracker.set_image_data(m_camera_info.buffer.get_ptr(), m_camera_info.bytesize, m_camera_info.width, m_camera_info.height, m_camera_info.format);
+		m_framenumber++; // using framenumber instead of timestamp since the timestamp could be identical
 		return true;
 	}
 
@@ -1264,12 +1650,6 @@ public:
 		return ::at32(m_info, gem_num);
 	}
 
-	gem_tracker& operator=(thread_state)
-	{
-		wake_up();
-		return *this;
-	}
-
 	void operator()()
 	{
 		if (g_cfg.io.move != move_handler::real)
@@ -1283,14 +1663,15 @@ public:
 		}
 
 		auto& gem = g_fxo->get<gem_config>();
+		u64 last_framenumber = 0;
 
 		while (thread_ctrl::state() != thread_state::aborting)
 		{
 			// Check if we have a new frame
-			if (!m_wake_up)
+			if (!m_wake_up_tracker)
 			{
-				m_wake_up.wait(0);
-				m_wake_up.release(0);
+				thread_ctrl::wait_on(m_wake_up_tracker, 0);
+				m_wake_up_tracker.release(0);
 
 				if (thread_ctrl::state() == thread_state::aborting)
 				{
@@ -1298,12 +1679,19 @@ public:
 				}
 			}
 
+			if (std::exchange(last_framenumber, m_framenumber.load()) == last_framenumber)
+			{
+				cellGem.warning("Tracker woke up without new frame. Skipping processing (framenumber=%d)", last_framenumber);
+				tracker_done();
+				continue;
+			}
+
 			m_busy.release(true);
 
 			// Update PS Move LED colors
 			{
 				std::lock_guard lock(pad::g_pad_mutex);
-				const auto handler = pad::get_current_handler();
+				const auto handler = pad::get_pad_thread();
 				auto& handlers = handler->get_handlers();
 				if (auto it = handlers.find(pad_handler::move); it != handlers.end() && it->second)
 				{
@@ -1376,8 +1764,7 @@ public:
 			}
 
 			// Notify that we are finished with this frame
-			m_done.release(1);
-			m_done.notify_one();
+			tracker_done();
 
 			m_busy.release(false);
 		}
@@ -1387,9 +1774,16 @@ public:
 
 	shared_mutex mutex;
 
+	gem_tracker& operator=(thread_state) noexcept
+	{
+		wake_up_tracker();
+		return *this;
+	}
+
 private:
-	atomic_t<u32> m_wake_up = 0;
-	atomic_t<u32> m_done = 1;
+	atomic_t<u32> m_wake_up_tracker = 0;
+	atomic_t<u32> m_tracker_done = 0;
+	atomic_t<u64> m_framenumber = 0;
 	atomic_t<bool> m_busy = false;
 	ps_move_tracker<false> m_tracker{};
 	CellCameraInfoEx m_camera_info{};
@@ -1419,16 +1813,20 @@ static inline void draw_overlay_cursor(u32 gem_num, const gem_config::gem_contro
 	rsx::overlays::set_cursor(rsx::overlays::cursor_offset::cell_gem + gem_num, x, y, color, 2'000'000, false);
 }
 
-static inline void pos_to_gem_image_state(u32 gem_num, const gem_config::gem_controller& controller, vm::ptr<CellGemImageState>& gem_image_state, s32 x_pos, s32 y_pos, s32 x_max, s32 y_max)
+static inline void pos_to_gem_image_state(u32 gem_num, gem_config::gem_controller& controller, vm::ptr<CellGemImageState>& gem_image_state, s32 x_pos, s32 y_pos, s32 x_max, s32 y_max)
 {
 	const auto& shared_data = g_fxo->get<gem_camera_shared>();
 
 	if (x_max <= 0) x_max = shared_data.width;
 	if (y_max <= 0) y_max = shared_data.height;
 
+	// Move the cursor out of the screen if we're at the screen border (Time Crisis 4 needs this)
+	if (x_pos <= 0) x_pos -= x_max / 10; else if (x_pos >= x_max) x_pos += x_max / 10;
+	if (y_pos <= 0) y_pos -= y_max / 10; else if (y_pos >= y_max) y_pos += y_max / 10;
+
 	const f32 scaling_width = x_max / static_cast<f32>(shared_data.width);
 	const f32 scaling_height = y_max / static_cast<f32>(shared_data.height);
-	const f32 mmPerPixel = CELL_GEM_SPHERE_RADIUS_MM / controller.radius;
+	const f32 mmPerPixel = controller.radius <= 0.0f ? 0.0f : (CELL_GEM_SPHERE_RADIUS_MM / controller.radius);
 
 	// Image coordinates in pixels
 	const f32 image_x = static_cast<f32>(x_pos) / scaling_width;
@@ -1450,6 +1848,13 @@ static inline void pos_to_gem_image_state(u32 gem_num, const gem_config::gem_con
 	gem_image_state->projectionx = camera_x / controller.distance_mm;
 	gem_image_state->projectiony = camera_y / controller.distance_mm;
 
+	// Update visibility for fake handlers
+	if (g_cfg.io.move != move_handler::real)
+	{
+		// Let's say the sphere is not visible if the position is at the edge of the screen
+		controller.radius_valid = x_pos > 0 && x_pos < x_max && y_pos > 0 && y_pos < y_max;
+	}
+
 	if (g_cfg.io.show_move_cursor)
 	{
 		draw_overlay_cursor(gem_num, controller, x_pos, y_pos, x_max, y_max);
@@ -1461,16 +1866,20 @@ static inline void pos_to_gem_image_state(u32 gem_num, const gem_config::gem_con
 	}
 }
 
-static inline void pos_to_gem_state(u32 gem_num, gem_config::gem_controller& controller, vm::ptr<CellGemState>& gem_state, s32 x_pos, s32 y_pos, s32 x_max, s32 y_max, const ps_move_data& move_data)
+static inline void pos_to_gem_state(u32 gem_num, gem_config::gem_controller& controller, vm::ptr<CellGemState>& gem_state, s32 x_pos, s32 y_pos, s32 x_max, s32 y_max, ps_move_data& move_data)
 {
 	const auto& shared_data = g_fxo->get<gem_camera_shared>();
 
 	if (x_max <= 0) x_max = shared_data.width;
 	if (y_max <= 0) y_max = shared_data.height;
 
+	// Move the cursor out of the screen if we're at the screen border (Time Crisis 4 needs this)
+	if (x_pos <= 0) x_pos -= x_max / 10; else if (x_pos >= x_max) x_pos += x_max / 10;
+	if (y_pos <= 0) y_pos -= y_max / 10; else if (y_pos >= y_max) y_pos += y_max / 10;
+
 	const f32 scaling_width = x_max / static_cast<f32>(shared_data.width);
 	const f32 scaling_height = y_max / static_cast<f32>(shared_data.height);
-	const f32 mmPerPixel = CELL_GEM_SPHERE_RADIUS_MM / controller.radius;
+	const f32 mmPerPixel = controller.radius <= 0.0f ? 0.0f : (CELL_GEM_SPHERE_RADIUS_MM / controller.radius);
 
 	// Image coordinates in pixels
 	const f32 image_x = static_cast<f32>(x_pos) / scaling_width;
@@ -1494,21 +1903,10 @@ static inline void pos_to_gem_state(u32 gem_num, gem_config::gem_controller& con
 	gem_state->pos[2] = controller.distance_mm;
 	gem_state->pos[3] = 0.f;
 
-	// TODO: calculate handle position based on our world coordinate and the angles
-	gem_state->handle_pos[0] = camera_x;
-	gem_state->handle_pos[1] = camera_y;
-	gem_state->handle_pos[2] = controller.distance_mm + 10.0f;
-	gem_state->handle_pos[3] = 0.f;
-
 	// Calculate orientation
-	if (g_cfg.io.move == move_handler::real || (g_cfg.io.move == move_handler::fake && move_data.orientation_enabled))
-	{
-		gem_state->quat[0] = move_data.quaternion[0]; // x
-		gem_state->quat[1] = move_data.quaternion[1]; // y
-		gem_state->quat[2] = move_data.quaternion[2]; // z
-		gem_state->quat[3] = move_data.quaternion[3]; // w
-	}
-	else
+	ps_move_data::vect<4> quat = move_data.quaternion;
+
+	if (g_cfg.io.move != move_handler::real && !(g_cfg.io.move == move_handler::fake && move_data.orientation_enabled))
 	{
 		const f32 max_angle_per_side_h = g_cfg.io.fake_move_rotation_cone_h / 2.0f;
 		const f32 max_angle_per_side_v = g_cfg.io.fake_move_rotation_cone_v / 2.0f;
@@ -1522,15 +1920,47 @@ static inline void pos_to_gem_state(u32 gem_num, gem_config::gem_controller& con
 		const f32 cy = std::cos(yaw * 0.5f);
 		const f32 sy = std::sin(yaw * 0.5f);
 
-		const f32 q_x = sr * cp * cy - cr * sp * sy;
-		const f32 q_y = cr * sp * cy + sr * cp * sy;
-		const f32 q_z = cr * cp * sy - sr * sp * cy;
-		const f32 q_w = cr * cp * cy + sr * sp * sy;
+		quat.x() = sr * cp * cy - cr * sp * sy;
+		quat.y() = cr * sp * cy + sr * cp * sy;
+		quat.z() = cr * cp * sy - sr * sp * cy;
+		quat.w() = cr * cp * cy + sr * sp * sy;
+	}
 
-		gem_state->quat[0] = q_x;
-		gem_state->quat[1] = q_y;
-		gem_state->quat[2] = q_z;
-		gem_state->quat[3] = q_w;
+	gem_state->quat[0] = quat.x();
+	gem_state->quat[1] = quat.y();
+	gem_state->quat[2] = quat.z();
+	gem_state->quat[3] = quat.w();
+
+	// Calculate handle position based on our world coordinate and the current orientation
+	constexpr ps_move_data::vect<3> offset_local_mm({0.f, 0.f, -45.f}); // handle is ~45 mm below sphere
+	const ps_move_data::vect<3> offset_world = ps_move_data::rotate_vector(quat, offset_local_mm);
+
+	gem_state->handle_pos[0] = gem_state->pos[0] - offset_world.x(); // Flip x offset
+	gem_state->handle_pos[1] = gem_state->pos[1] - offset_world.y(); // Flip y offset
+	gem_state->handle_pos[2] = gem_state->pos[2] + offset_world.z();
+	gem_state->handle_pos[3] = 0.f;
+
+	// Calculate velocity
+	if constexpr (!ps_move_data::use_imu_for_velocity)
+	{
+		move_data.update_velocity(shared_data.frame_timestamp_us, gem_state->pos);
+
+		for (u32 i = 0; i < 3; i++)
+		{
+			gem_state->vel[i] = move_data.vel_world[i];
+			gem_state->accel[i] = move_data.accel_world[i];
+
+			// TODO: maybe this also needs to be adjusted depending on the orientation
+			gem_state->handle_vel[i] = gem_state->vel[i];
+			gem_state->handle_accel[i] = gem_state->accel[i];
+		}
+	}
+
+	// Update visibility for fake handlers
+	if (g_cfg.io.move != move_handler::real)
+	{
+		// Let's say the sphere is not visible if the position is at the edge of the screen
+		controller.radius_valid = x_pos > 0 && x_pos < x_max && y_pos > 0 && y_pos < y_max;
 	}
 
 	if (g_cfg.io.show_move_cursor)
@@ -1551,7 +1981,7 @@ extern bool is_input_allowed();
  *        Unavoidably buttons conflict with DS3 mappings, which is problematic for some games.
  * \param gem_num gem index to use
  * \param digital_buttons Bitmask filled with CELL_GEM_CTRL_* values
- * \param analog_t Analog value of Move's Trigger. Currently mapped to R2.
+ * \param analog_t Analog value of Move's Trigger.
  * \return true on success, false if controller is disconnected
  */
 static void ds3_input_to_pad(const u32 gem_num, be_t<u16>& digital_buttons, be_t<u16>& analog_t)
@@ -1559,22 +1989,22 @@ static void ds3_input_to_pad(const u32 gem_num, be_t<u16>& digital_buttons, be_t
 	digital_buttons = 0;
 	analog_t = 0;
 
-	if (!is_input_allowed())
+	if (!is_input_allowed() || input::g_pads_intercepted) // Let's intercept the PS Move just like a pad
 	{
 		return;
 	}
 
 	std::lock_guard lock(pad::g_pad_mutex);
 
-	const auto handler = pad::get_current_handler();
+	const auto handler = pad::get_pad_thread();
 	const auto& pad = ::at32(handler->GetPads(), pad_num(gem_num));
 
-	if (!(pad->m_port_status & CELL_PAD_STATUS_CONNECTED))
+	if (!pad->is_connected() || pad->is_copilot())
 	{
 		return;
 	}
 
-	const auto handle_input = [&](gem_btn btn, u16 value, bool pressed)
+	const auto handle_input = [&](gem_btn btn, pad_button /*pad_btn*/, u16 value, bool pressed, bool& /*abort*/)
 	{
 		if (!pressed)
 			return;
@@ -1606,9 +2036,7 @@ static void ds3_input_to_pad(const u32 gem_num, be_t<u16>& digital_buttons, be_t
 			digital_buttons |= CELL_GEM_CTRL_T;
 			analog_t = std::max<u16>(analog_t, value);
 			break;
-		case gem_btn::x_axis:
-		case gem_btn::y_axis:
-		case gem_btn::count:
+		default:
 			break;
 		}
 	};
@@ -1632,39 +2060,34 @@ static inline void ds3_get_stick_values(u32 gem_num, const std::shared_ptr<Pad>&
 	y_pos = 0;
 
 	const auto& cfg = ::at32(g_cfg_gem_fake.players, gem_num);
-	cfg->handle_input(pad, true, [&](gem_btn btn, u16 value, bool pressed)
-		{
-			if (!pressed)
-				return;
+	cfg->handle_input(pad, true, [&](gem_btn btn, pad_button /*pad_btn*/, u16 value, bool pressed, bool& /*abort*/)
+	{
+		if (!pressed)
+			return;
 
-			switch (btn)
-			{
-			case gem_btn::x_axis:
-				x_pos = value;
-				break;
-			case gem_btn::y_axis:
-				y_pos = value;
-				break;
-			default:
-				break;
-			}
-		});
+		switch (btn)
+		{
+		case gem_btn::x_axis: x_pos = value; break;
+		case gem_btn::y_axis: y_pos = value; break;
+		default: break;
+		}
+	});
 }
 
 template <typename T>
 static void ds3_pos_to_gem_state(u32 gem_num, gem_config::gem_controller& controller, T& gem_state)
 {
-	if (!gem_state || !is_input_allowed())
+	if (!gem_state || !is_input_allowed() || input::g_pads_intercepted) // Let's intercept the PS Move just like a pad
 	{
 		return;
 	}
 
 	std::lock_guard lock(pad::g_pad_mutex);
 
-	const auto handler = pad::get_current_handler();
+	const auto handler = pad::get_pad_thread();
 	const auto& pad = ::at32(handler->GetPads(), pad_num(gem_num));
 
-	if (!(pad->m_port_status & CELL_PAD_STATUS_CONNECTED))
+	if (!pad->is_connected() || pad->is_copilot())
 	{
 		return;
 	}
@@ -1685,17 +2108,17 @@ static void ds3_pos_to_gem_state(u32 gem_num, gem_config::gem_controller& contro
 template <typename T>
 static void ps_move_pos_to_gem_state(u32 gem_num, gem_config::gem_controller& controller, T& gem_state)
 {
-	if (!gem_state || !is_input_allowed())
+	if (!gem_state || !is_input_allowed() || input::g_pads_intercepted) // Let's intercept the PS Move just like a pad
 	{
 		return;
 	}
 
 	std::lock_guard lock(pad::g_pad_mutex);
 
-	const auto handler = pad::get_current_handler();
+	const auto handler = pad::get_pad_thread();
 	const auto& pad = ::at32(handler->GetPads(), pad_num(gem_num));
 
-	if (pad->m_pad_handler != pad_handler::move || !(pad->m_port_status & CELL_PAD_STATUS_CONNECTED))
+	if (pad->m_pad_handler != pad_handler::move || !pad->is_connected() || pad->is_copilot())
 	{
 		return;
 	}
@@ -1706,9 +2129,17 @@ static void ps_move_pos_to_gem_state(u32 gem_num, gem_config::gem_controller& co
 	if constexpr (std::is_same_v<T, vm::ptr<CellGemState>>)
 	{
 		gem_state->temperature = pad->move_data.temperature;
-		gem_state->accel[0] = pad->move_data.accelerometer_x * 1000; // linear velocity in mm/s²
-		gem_state->accel[1] = pad->move_data.accelerometer_y * 1000; // linear velocity in mm/s²
-		gem_state->accel[2] = pad->move_data.accelerometer_z * 1000; // linear velocity in mm/s²
+
+		for (u32 i = 0; i < 3; i++)
+		{
+			if constexpr (ps_move_data::use_imu_for_velocity)
+			{
+				gem_state->vel[i] = pad->move_data.vel_world[i];
+				gem_state->accel[i] = pad->move_data.accel_world[i];
+			}
+			gem_state->angvel[i] = pad->move_data.angvel_world[i];
+			gem_state->angaccel[i] = pad->move_data.angaccel_world[i];
+		}
 
 		pos_to_gem_state(gem_num, controller, gem_state, info.x_pos, info.y_pos, info.x_max, info.y_max, pad->move_data);
 	}
@@ -1730,17 +2161,17 @@ static void ds3_input_to_ext(u32 gem_num, gem_config::gem_controller& controller
 {
 	ext = {};
 
-	if (!is_input_allowed())
+	if (!is_input_allowed() || input::g_pads_intercepted) // Let's intercept the PS Move just like a pad
 	{
 		return;
 	}
 
 	std::lock_guard lock(pad::g_pad_mutex);
 
-	const auto handler = pad::get_current_handler();
+	const auto handler = pad::get_pad_thread();
 	const auto& pad = ::at32(handler->GetPads(), pad_num(gem_num));
 
-	if (!(pad->m_port_status & CELL_PAD_STATUS_CONNECTED))
+	if (!pad->is_connected() || pad->is_copilot())
 	{
 		return;
 	}
@@ -1752,7 +2183,7 @@ static void ds3_input_to_ext(u32 gem_num, gem_config::gem_controller& controller
 
 	ext.status = controller.ext_status;
 
-	for (const AnalogStick& stick : pad->m_sticks)
+	for (const AnalogStick& stick : pad->m_sticks_external)
 	{
 		switch (stick.m_offset)
 		{
@@ -1764,7 +2195,7 @@ static void ds3_input_to_ext(u32 gem_num, gem_config::gem_controller& controller
 		}
 	}
 
-	for (const Button& button : pad->m_buttons)
+	for (const Button& button : pad->m_buttons_external)
 	{
 		if (!button.m_pressed)
 			continue;
@@ -1811,7 +2242,7 @@ static bool mouse_input_to_pad(u32 mouse_no, be_t<u16>& digital_buttons, be_t<u1
 	digital_buttons = 0;
 	analog_t = 0;
 
-	if (!is_input_allowed())
+	if (!is_input_allowed() || input::g_pads_intercepted) // Let's intercept the PS Move just like a pad
 	{
 		return false;
 	}
@@ -1828,41 +2259,97 @@ static bool mouse_input_to_pad(u32 mouse_no, be_t<u16>& digital_buttons, be_t<u1
 		return false;
 	}
 
-	std::set<MouseButtonCodes> pressed_buttons;
 	const Mouse& mouse_data = ::at32(handler.GetMice(), mouse_no);
-	const auto is_pressed = [&mouse_data, &pressed_buttons](MouseButtonCodes button) -> bool
+	auto& cfg = ::at32(g_cfg_gem_mouse.players, mouse_no);
+
+	bool combo_active = false;
+	std::set<pad_button> combos;
+
+	static const std::unordered_map<gem_btn, u16> btn_map =
 	{
-		// Only allow each button to be used for one action unless it's the combo button.
-		return (mouse_data.buttons & button) && (button == (CELL_MOUSE_BUTTON_3 + 0u/*fix warning*/) || pressed_buttons.insert(button).second);
+		{ gem_btn::start, CELL_GEM_CTRL_START },
+		{ gem_btn::select, CELL_GEM_CTRL_SELECT },
+		{ gem_btn::triangle, CELL_GEM_CTRL_TRIANGLE },
+		{ gem_btn::circle, CELL_GEM_CTRL_CIRCLE },
+		{ gem_btn::cross, CELL_GEM_CTRL_CROSS },
+		{ gem_btn::square, CELL_GEM_CTRL_SQUARE },
+		{ gem_btn::move, CELL_GEM_CTRL_MOVE },
+		{ gem_btn::t, CELL_GEM_CTRL_T },
+		{ gem_btn::combo_start, CELL_GEM_CTRL_START },
+		{ gem_btn::combo_select, CELL_GEM_CTRL_SELECT },
+		{ gem_btn::combo_triangle, CELL_GEM_CTRL_TRIANGLE },
+		{ gem_btn::combo_circle, CELL_GEM_CTRL_CIRCLE },
+		{ gem_btn::combo_cross, CELL_GEM_CTRL_CROSS },
+		{ gem_btn::combo_square, CELL_GEM_CTRL_SQUARE },
+		{ gem_btn::combo_move, CELL_GEM_CTRL_MOVE },
+		{ gem_btn::combo_t, CELL_GEM_CTRL_T },
 	};
 
-	digital_buttons = 0;
+	// Check combo button first
+	cfg->handle_input(mouse_data, [&combo_active](gem_btn btn, pad_button /*pad_btn*/, u16 /*value*/, bool pressed, bool& abort)
+	{
+		if (pressed && btn == gem_btn::combo)
+		{
+			combo_active = true;
+			abort = true;
+		}
+	});
 
-	if ((is_pressed(CELL_MOUSE_BUTTON_3) && is_pressed(CELL_MOUSE_BUTTON_1)) || is_pressed(CELL_MOUSE_BUTTON_6))
-		digital_buttons |= CELL_GEM_CTRL_SELECT;
+	// Check combos
+	if (combo_active)
+	{
+		cfg->handle_input(mouse_data, [&digital_buttons, &combos](gem_btn btn, pad_button pad_btn, u16 /*value*/, bool pressed, bool& /*abort*/)
+		{
+			if (!pressed)
+				return;
 
-	if ((is_pressed(CELL_MOUSE_BUTTON_3) && is_pressed(CELL_MOUSE_BUTTON_2)) || is_pressed(CELL_MOUSE_BUTTON_7))
-		digital_buttons |= CELL_GEM_CTRL_START;
+			switch (btn)
+			{
+			case gem_btn::combo_start:
+			case gem_btn::combo_select:
+			case gem_btn::combo_triangle:
+			case gem_btn::combo_circle:
+			case gem_btn::combo_cross:
+			case gem_btn::combo_square:
+			case gem_btn::combo_move:
+			case gem_btn::combo_t:
+				digital_buttons |= ::at32(btn_map, btn);
+				combos.insert(pad_btn);
+				break;
+			default:
+				break;
+			}
+		});
+	}
 
-	if ((is_pressed(CELL_MOUSE_BUTTON_3) && is_pressed(CELL_MOUSE_BUTTON_4)) || is_pressed(CELL_MOUSE_BUTTON_8))
-		digital_buttons |= CELL_GEM_CTRL_TRIANGLE;
+	// Check normal buttons
+	cfg->handle_input(mouse_data, [&digital_buttons, &combos](gem_btn btn, pad_button pad_btn, u16 /*value*/, bool pressed, bool& /*abort*/)
+	{
+		if (!pressed)
+			return;
 
-	if (is_pressed(CELL_MOUSE_BUTTON_3) && is_pressed(CELL_MOUSE_BUTTON_5))
-		digital_buttons |= CELL_GEM_CTRL_SQUARE;
+		switch (btn)
+		{
+		case gem_btn::start:
+		case gem_btn::select:
+		case gem_btn::square:
+		case gem_btn::cross:
+		case gem_btn::circle:
+		case gem_btn::triangle:
+		case gem_btn::move:
+		case gem_btn::t:
+			// Ignore this gem_btn if the same pad_button was already used in a combo
+			if (!combos.contains(pad_btn))
+			{
+				digital_buttons |= ::at32(btn_map, btn);
+			}
+			break;
+		default:
+			break;
+		}
+	});
 
-	if (is_pressed(CELL_MOUSE_BUTTON_1))
-		digital_buttons |= CELL_GEM_CTRL_T;
-
-	if (is_pressed(CELL_MOUSE_BUTTON_2))
-		digital_buttons |= CELL_GEM_CTRL_MOVE;
-
-	if (is_pressed(CELL_MOUSE_BUTTON_4))
-		digital_buttons |= CELL_GEM_CTRL_CIRCLE;
-
-	if (is_pressed(CELL_MOUSE_BUTTON_5))
-		digital_buttons |= CELL_GEM_CTRL_CROSS;
-
-	analog_t = (mouse_data.buttons & CELL_MOUSE_BUTTON_1) ? 0xFFFF : 0;
+	analog_t = (digital_buttons & CELL_GEM_CTRL_T) ? 255 : 0;
 
 	return true;
 }
@@ -1870,7 +2357,7 @@ static bool mouse_input_to_pad(u32 mouse_no, be_t<u16>& digital_buttons, be_t<u1
 template <typename T>
 static void mouse_pos_to_gem_state(u32 mouse_no, gem_config::gem_controller& controller, T& gem_state)
 {
-	if (!gem_state || !is_input_allowed())
+	if (!gem_state || !is_input_allowed() || input::g_pads_intercepted) // Let's intercept the PS Move just like a pad
 	{
 		return;
 	}
@@ -1891,7 +2378,8 @@ static void mouse_pos_to_gem_state(u32 mouse_no, gem_config::gem_controller& con
 
 	if constexpr (std::is_same_v<T, vm::ptr<CellGemState>>)
 	{
-		pos_to_gem_state(mouse_no, controller, gem_state, mouse.x_pos, mouse.y_pos, mouse.x_max, mouse.y_max, {});
+		ps_move_data& move_data = ::at32(g_fxo->get<gem_config>().fake_move_data, mouse_no);
+		pos_to_gem_state(mouse_no, controller, gem_state, mouse.x_pos, mouse.y_pos, mouse.x_max, mouse.y_max, move_data);
 	}
 	else if constexpr (std::is_same_v<T, vm::ptr<CellGemImageState>>)
 	{
@@ -1935,7 +2423,7 @@ static bool gun_input_to_pad(u32 gem_no, be_t<u16>& digital_buttons, be_t<u16>& 
 	if (gun.handler.get_button(gem_no, gun_button::btn_6) == 1)
 		digital_buttons |= CELL_GEM_CTRL_SQUARE;
 
-	analog_t = gun.handler.get_button(gem_no, gun_button::btn_left) ? 0xFFFF : 0;
+	analog_t = gun.handler.get_button(gem_no, gun_button::btn_left) ? 255 : 0;
 
 	return true;
 }
@@ -1959,7 +2447,8 @@ static void gun_pos_to_gem_state(u32 gem_no, gem_config::gem_controller& control
 
 	if constexpr (std::is_same_v<T, vm::ptr<CellGemState>>)
 	{
-		pos_to_gem_state(gem_no, controller, gem_state, x_pos, y_pos, x_max, y_max, {});
+		ps_move_data& move_data = ::at32(g_fxo->get<gem_config>().fake_move_data, gem_no);
+		pos_to_gem_state(gem_no, controller, gem_state, x_pos, y_pos, x_max, y_max, move_data);
 	}
 	else if constexpr (std::is_same_v<T, vm::ptr<CellGemImageState>>)
 	{
@@ -2026,8 +2515,10 @@ error_code cellGemClearStatusFlags(u32 gem_num, u64 mask)
 	return CELL_OK;
 }
 
-error_code cellGemConvertVideoFinish()
+error_code cellGemConvertVideoFinish(ppu_thread& ppu)
 {
+	ppu.state += cpu_flag::wait;
+
 	cellGem.warning("cellGemConvertVideoFinish()");
 
 	auto& gem = g_fxo->get<gem_config>();
@@ -2042,16 +2533,18 @@ error_code cellGemConvertVideoFinish()
 		return CELL_GEM_ERROR_CONVERT_NOT_STARTED;
 	}
 
-	while (gem.video_conversion_in_progress && !Emu.IsStopped())
+	if (!gem.wait_for_result(ppu))
 	{
-		thread_ctrl::wait_for(100);
+		return {};
 	}
 
 	return CELL_OK;
 }
 
-error_code cellGemConvertVideoStart(vm::cptr<void> video_frame)
+error_code cellGemConvertVideoStart(ppu_thread& ppu, vm::cptr<void> video_frame)
 {
+	ppu.state += cpu_flag::wait;
+
 	cellGem.warning("cellGemConvertVideoStart(video_frame=*0x%x)", video_frame);
 
 	auto& gem = g_fxo->get<gem_config>();
@@ -2079,7 +2572,9 @@ error_code cellGemConvertVideoStart(vm::cptr<void> video_frame)
 	const auto& shared_data = g_fxo->get<gem_camera_shared>();
 	gem.video_data_in.resize(shared_data.size);
 	std::memcpy(gem.video_data_in.data(), video_frame.get_ptr(), gem.video_data_in.size());
+
 	gem.video_conversion_in_progress = true;
+	gem.wake_up();
 
 	return CELL_OK;
 }
@@ -2139,10 +2634,10 @@ error_code cellGemEnableMagnetometer(u32 gem_num, u32 enable)
 	{
 		std::lock_guard lock(pad::g_pad_mutex);
 
-		const auto handler = pad::get_current_handler();
+		const auto handler = pad::get_pad_thread();
 		const auto& pad = ::at32(handler->GetPads(), pad_num(gem_num));
 
-		if (pad && pad->m_pad_handler == pad_handler::move)
+		if (pad && pad->m_pad_handler == pad_handler::move && !pad->is_copilot())
 		{
 			pad->move_data.magnetometer_enabled = controller.enabled_magnetometer;
 		}
@@ -2187,10 +2682,10 @@ error_code cellGemEnableMagnetometer2(u32 gem_num, u32 enable)
 	{
 		std::lock_guard lock(pad::g_pad_mutex);
 
-		const auto handler = pad::get_current_handler();
+		const auto handler = pad::get_pad_thread();
 		const auto& pad = ::at32(handler->GetPads(), pad_num(gem_num));
 
-		if (pad && pad->m_pad_handler == pad_handler::move)
+		if (pad && pad->m_pad_handler == pad_handler::move && !pad->is_copilot())
 		{
 			pad->move_data.magnetometer_enabled = controller.enabled_magnetometer;
 		}
@@ -2201,11 +2696,13 @@ error_code cellGemEnableMagnetometer2(u32 gem_num, u32 enable)
 
 error_code cellGemEnd(ppu_thread& ppu)
 {
+	ppu.state += cpu_flag::wait;
+
 	cellGem.warning("cellGemEnd()");
 
 	auto& gem = g_fxo->get<gem_config>();
 
-	std::scoped_lock lock(gem.mtx);
+	std::unique_lock lock(gem.mtx);
 
 	if (gem.state.compare_and_swap_test(1, 0))
 	{
@@ -2217,8 +2714,13 @@ error_code cellGemEnd(ppu_thread& ppu)
 		return CELL_OK;
 	}
 
+	lock.unlock();
+
 	auto& tracker = g_fxo->get<named_thread<gem_tracker>>();
-	tracker.wait_for_result();
+	if (!tracker.wait_for_tracker_result(ppu))
+	{
+		return {};
+	}
 
 	gem.updating = false;
 
@@ -2250,7 +2752,7 @@ error_code cellGemFilterState(u32 gem_num, u32 enable)
 
 error_code cellGemForceRGB(u32 gem_num, f32 r, f32 g, f32 b)
 {
-	cellGem.todo("cellGemForceRGB(gem_num=%d, r=%f, g=%f, b=%f)", gem_num, r, g, b);
+	cellGem.warning("cellGemForceRGB(gem_num=%d, r=%f, g=%f, b=%f)", gem_num, r, g, b);
 
 	auto& gem = g_fxo->get<gem_config>();
 
@@ -2417,6 +2919,7 @@ error_code cellGemGetImageState(u32 gem_num, vm::ptr<CellGemImageState> gem_imag
 	cellGem.warning("cellGemGetImageState(gem_num=%d, image_state=&0x%x)", gem_num, gem_image_state);
 
 	auto& gem = g_fxo->get<gem_config>();
+	std::scoped_lock lock(gem.mtx);
 
 	if (!gem.state)
 	{
@@ -2432,15 +2935,11 @@ error_code cellGemGetImageState(u32 gem_num, vm::ptr<CellGemImageState> gem_imag
 
 	if (g_cfg.io.move != move_handler::null)
 	{
-		auto& shared_data = g_fxo->get<gem_camera_shared>();
+		const auto& shared_data = g_fxo->get<gem_camera_shared>();
 		auto& controller = gem.controllers[gem_num];
 
 		gem_image_state->frame_timestamp = shared_data.frame_timestamp_us.load();
 		gem_image_state->timestamp = gem_image_state->frame_timestamp + 10;
-		gem_image_state->r = controller.radius; // Radius in camera pixels
-		gem_image_state->distance = controller.distance_mm;
-		gem_image_state->visible = gem.is_controller_ready(gem_num);
-		gem_image_state->r_valid = controller.radius_valid;
 
 		switch (g_cfg.io.move)
 		{
@@ -2462,6 +2961,11 @@ error_code cellGemGetImageState(u32 gem_num, vm::ptr<CellGemImageState> gem_imag
 		case move_handler::null:
 			fmt::throw_exception("Unreachable");
 		}
+
+		gem_image_state->r = controller.radius; // Radius in camera pixels
+		gem_image_state->distance = controller.distance_mm;
+		gem_image_state->visible = controller.radius_valid && gem.is_controller_ready(gem_num);
+		gem_image_state->r_valid = controller.radius_valid;
 	}
 
 	return CELL_OK;
@@ -2498,7 +3002,7 @@ error_code cellGemGetInertialState(u32 gem_num, u32 state_flag, u64 timestamp, v
 
 		inertial_state->timestamp = (get_guest_system_time() - gem.start_timestamp_us);
 		inertial_state->counter = gem.inertial_counter++;
-		inertial_state->accelerometer[0] = 10; // Current gravity in m/s²
+		inertial_state->accelerometer[2] = 1.0f; // Current gravity in G units (9.81 == 1 unit)
 
 		switch (g_cfg.io.move)
 		{
@@ -2509,18 +3013,18 @@ error_code cellGemGetInertialState(u32 gem_num, u32 state_flag, u64 timestamp, v
 			{
 				std::lock_guard lock(pad::g_pad_mutex);
 
-				const auto handler = pad::get_current_handler();
+				const auto handler = pad::get_pad_thread();
 				const auto& pad = ::at32(handler->GetPads(), pad_num(gem_num));
 
-				if (pad && (pad->m_port_status & CELL_PAD_STATUS_CONNECTED))
+				if (pad && pad->is_connected() && !pad->is_copilot())
 				{
 					inertial_state->temperature = pad->move_data.temperature;
-					inertial_state->accelerometer[0] = pad->move_data.accelerometer_x;
-					inertial_state->accelerometer[1] = pad->move_data.accelerometer_y;
-					inertial_state->accelerometer[2] = pad->move_data.accelerometer_z;
-					inertial_state->gyro[0] = pad->move_data.gyro_x;
-					inertial_state->gyro[1] = pad->move_data.gyro_y;
-					inertial_state->gyro[2] = pad->move_data.gyro_z;
+
+					for (u32 i = 0; i < 3; i++)
+					{
+						inertial_state->accelerometer[i] = pad->move_data.accelerometer[i];
+						inertial_state->gyro[i] = pad->move_data.gyro[i];
+					}
 				}
 			}
 
@@ -2560,69 +3064,6 @@ error_code cellGemGetInfo(vm::ptr<CellGemInfo> info)
 	if (!info)
 	{
 		return CELL_GEM_ERROR_INVALID_PARAMETER;
-	}
-
-	switch (g_cfg.io.move)
-	{
-	case move_handler::real:
-	case move_handler::fake:
-	{
-		gem.connected_controllers = 0;
-
-		std::lock_guard lock(pad::g_pad_mutex);
-		const auto handler = pad::get_current_handler();
-
-		for (u32 i = 0; i < CELL_GEM_MAX_NUM; i++)
-		{
-			const auto& pad = ::at32(handler->GetPads(), pad_num(i));
-			const bool connected = (pad && (pad->m_port_status & CELL_PAD_STATUS_CONNECTED) && i < gem.attribute.max_connect);
-			const bool is_real_move = g_cfg.io.move != move_handler::real || pad->m_pad_handler == pad_handler::move;
-
-			if (connected && is_real_move)
-			{
-				gem.connected_controllers++;
-				gem.controllers[i].status = CELL_GEM_STATUS_READY;
-				gem.controllers[i].port = port_num(i);
-			}
-			else
-			{
-				gem.controllers[i].status = CELL_GEM_STATUS_DISCONNECTED;
-				gem.controllers[i].port = 0;
-			}
-		}
-		break;
-	}
-	case move_handler::raw_mouse:
-	{
-		gem.connected_controllers = 0;
-
-		auto& handler = g_fxo->get<MouseHandlerBase>();
-		std::lock_guard mouse_lock(handler.mutex);
-
-		const MouseInfo& info = handler.GetInfo();
-
-		for (u32 i = 0; i < CELL_GEM_MAX_NUM; i++)
-		{
-			const bool connected = i < gem.attribute.max_connect && info.status[i] == CELL_MOUSE_STATUS_CONNECTED;
-
-			if (connected)
-			{
-				gem.connected_controllers++;
-				gem.controllers[i].status = CELL_GEM_STATUS_READY;
-				gem.controllers[i].port = port_num(i);
-			}
-			else
-			{
-				gem.controllers[i].status = CELL_GEM_STATUS_DISCONNECTED;
-				gem.controllers[i].port = 0;
-			}
-		}
-		break;
-	}
-	default:
-	{
-		break;
-	}
 	}
 
 	info->max_connect = gem.attribute.max_connect;
@@ -2980,6 +3421,8 @@ error_code cellGemInit(ppu_thread& ppu, vm::cptr<CellGemAttribute> attribute)
 	// TODO: is this correct?
 	gem.start_timestamp_us = get_guest_system_time();
 
+	gem.wake_up();
+
 	return CELL_OK;
 }
 
@@ -3055,7 +3498,35 @@ error_code cellGemPrepareCamera(s32 max_exposure, f32 image_quality)
 	max_exposure = std::clamp(max_exposure, static_cast<s32>(CELL_GEM_MIN_CAMERA_EXPOSURE), static_cast<s32>(CELL_GEM_MAX_CAMERA_EXPOSURE));
 	image_quality = std::clamp(image_quality, 0.0f, 1.0f);
 
-	// TODO: prepare camera
+	// TODO: prepare camera properly
+
+	extern error_code cellCameraGetAttribute(s32 dev_num, s32 attrib, vm::ptr<u32> arg1, vm::ptr<u32> arg2);
+	extern error_code cellCameraSetAttribute(s32 dev_num, s32 attrib, u32 arg1, u32 arg2);
+	extern error_code cellCameraGetBufferInfoEx(ppu_thread&, s32 dev_num, vm::ptr<CellCameraInfoEx> info);
+
+	vm::var<CellCameraInfoEx> info = vm::make_var<CellCameraInfoEx>({});
+	vm::var<u32> arg1 = vm::make_var<u32>({});
+	vm::var<u32> arg2 = vm::make_var<u32>({});
+
+	cellCameraGetAttribute(0, 0x3e6, arg1, arg2);
+	cellCameraSetAttribute(0, 0x3e6, 0x3e, *arg2 | 0x80);
+	cellCameraGetBufferInfoEx(*cpu_thread::get_current<ppu_thread>(), 0, info);
+
+	if (info->width == 640)
+	{
+		// Disable some features
+		cellCameraSetAttribute(0, CELL_CAMERA_AGC, 0, 0);
+		cellCameraSetAttribute(0, CELL_CAMERA_AWB, 0, 0);
+		cellCameraSetAttribute(0, CELL_CAMERA_AEC, 0, 0);
+		cellCameraSetAttribute(0, CELL_CAMERA_GAMMA, 0, 0);
+		cellCameraSetAttribute(0, CELL_CAMERA_PIXELOUTLIERFILTER, 0, 0);
+
+		// Set new values for others
+		cellCameraSetAttribute(0, CELL_CAMERA_GREENGAIN, 96, 0);
+		cellCameraSetAttribute(0, CELL_CAMERA_REDBLUEGAIN, 64, 96);
+		cellCameraSetAttribute(0, CELL_CAMERA_GAIN, 0, 0); // TODO
+		cellCameraSetAttribute(0, CELL_CAMERA_EXPOSURE, 0, 0); // TODO
+	}
 
 	return CELL_OK;
 }
@@ -3157,10 +3628,10 @@ error_code cellGemReadExternalPortDeviceInfo(u32 gem_num, vm::ptr<u32> ext_id, v
 			{
 				std::lock_guard lock(pad::g_pad_mutex);
 
-				const auto handler = pad::get_current_handler();
+				const auto handler = pad::get_pad_thread();
 				const auto& pad = ::at32(handler->GetPads(), pad_num(gem_num));
 
-				if (pad->m_pad_handler != pad_handler::move || !(pad->m_port_status & CELL_PAD_STATUS_CONNECTED))
+				if (pad->m_pad_handler != pad_handler::move || !pad->is_connected() || pad->is_copilot())
 				{
 					return CELL_GEM_NOT_CONNECTED;
 				}
@@ -3174,7 +3645,7 @@ error_code cellGemReadExternalPortDeviceInfo(u32 gem_num, vm::ptr<u32> ext_id, v
 				if (!pad->move_data.external_device_read_requested)
 				{
 					*ext_id = controller.ext_id = pad->move_data.external_device_id;
-					std::memcpy(pad->move_data.external_device_read.data(), ext_info.get_ptr(), CELL_GEM_EXTERNAL_PORT_OUTPUT_SIZE);
+					std::memcpy(ext_info.get_ptr(), pad->move_data.external_device_read.data(), CELL_GEM_EXTERNAL_PORT_DEVICE_INFO_SIZE);
 					break;
 				}
 			}
@@ -3241,7 +3712,7 @@ error_code cellGemSetRumble(u32 gem_num, u8 rumble)
 	if (g_cfg.io.move == move_handler::real)
 	{
 		std::lock_guard pad_lock(pad::g_pad_mutex);
-		const auto handler = pad::get_current_handler();
+		const auto handler = pad::get_pad_thread();
 		auto& handlers = handler->get_handlers();
 		if (auto it = handlers.find(pad_handler::move); it != handlers.end() && it->second)
 		{
@@ -3250,7 +3721,7 @@ error_code cellGemSetRumble(u32 gem_num, u8 rumble)
 			{
 				if (!binding.device || binding.device->player_id != pad_index) continue;
 
-				handler->SetRumble(pad_index, rumble, rumble > 0);
+				handler->SetRumble(pad_index, rumble, rumble);
 				break;
 			}
 		}
@@ -3369,8 +3840,10 @@ error_code cellGemTrackHues(vm::cptr<u32> req_hues, vm::ptr<u32> res_hues)
 	return CELL_OK;
 }
 
-error_code cellGemUpdateFinish()
+error_code cellGemUpdateFinish(ppu_thread& ppu)
 {
+	ppu.state += cpu_flag::wait;
+
 	cellGem.warning("cellGemUpdateFinish()");
 
 	auto& gem = g_fxo->get<gem_config>();
@@ -3380,15 +3853,18 @@ error_code cellGemUpdateFinish()
 		return CELL_GEM_ERROR_UNINITIALIZED;
 	}
 
-	std::scoped_lock lock(gem.mtx);
-
 	if (!gem.updating)
 	{
 		return CELL_GEM_ERROR_UPDATE_NOT_STARTED;
 	}
 
 	auto& tracker = g_fxo->get<named_thread<gem_tracker>>();
-	tracker.wait_for_result();
+	if (!tracker.wait_for_tracker_result(ppu))
+	{
+		return {};
+	}
+
+	std::scoped_lock lock(gem.mtx);
 
 	gem.updating = false;
 
@@ -3433,12 +3909,14 @@ error_code cellGemUpdateStart(vm::cptr<void> camera_frame, u64 timestamp)
 
 	gem.camera_frame = camera_frame.addr();
 
-	if (!tracker.set_image(gem.camera_frame))
+	const bool image_set = tracker.set_image(gem.camera_frame);
+
+	tracker.wake_up_tracker();
+
+	if (!image_set)
 	{
 		return not_an_error(CELL_GEM_NO_VIDEO);
 	}
-
-	tracker.wake_up();
 
 	return CELL_OK;
 }
@@ -3468,10 +3946,10 @@ error_code cellGemWriteExternalPort(u32 gem_num, vm::ptr<u8[CELL_GEM_EXTERNAL_PO
 	{
 		std::lock_guard lock(pad::g_pad_mutex);
 
-		const auto handler = pad::get_current_handler();
+		const auto handler = pad::get_pad_thread();
 		const auto& pad = ::at32(handler->GetPads(), pad_num(gem_num));
 
-		if (pad->m_pad_handler != pad_handler::move || !(pad->m_port_status & CELL_PAD_STATUS_CONNECTED))
+		if (pad->m_pad_handler != pad_handler::move || !pad->is_connected() || pad->is_copilot())
 		{
 			return CELL_GEM_NOT_CONNECTED;
 		}

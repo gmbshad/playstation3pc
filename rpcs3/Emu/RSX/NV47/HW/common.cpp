@@ -1,6 +1,7 @@
 #include "stdafx.h"
 #include "common.h"
 
+#include "Emu/RSX/Common/TextureUtils.h"
 #include "Emu/RSX/RSXThread.h"
 
 #define RSX(ctx) ctx->rsxthr
@@ -10,6 +11,16 @@ namespace rsx
 {
 	namespace util
 	{
+		bool is_volatile_TIU(rsx::context* ctx, u32 index)
+		{
+			if (!RSX(ctx)->fs_sampler_state[index])
+			{
+				return false;
+			}
+
+			return RSX(ctx)->fs_sampler_state[index]->upload_context != rsx::texture_upload_context::shader_read;
+		}
+
 		void push_vertex_data(rsx::context* ctx, u32 attrib_index, u32 channel_select, int count, rsx::vertex_base_type vtype, u32 value)
 		{
 			if (RSX(ctx)->in_begin_end)
@@ -47,23 +58,17 @@ namespace rsx
 
 		u32 get_report_data_impl([[maybe_unused]] rsx::context* ctx, u32 offset)
 		{
-			u32 location = 0;
 			blit_engine::context_dma report_dma = REGS(ctx)->context_dma_report();
-
-			switch (report_dma)
-			{
-			case blit_engine::context_dma::to_memory_get_report: location = CELL_GCM_CONTEXT_DMA_REPORT_LOCATION_LOCAL; break;
-			case blit_engine::context_dma::report_location_main: location = CELL_GCM_CONTEXT_DMA_REPORT_LOCATION_MAIN; break;
-			case blit_engine::context_dma::memory_host_buffer: location = CELL_GCM_CONTEXT_DMA_MEMORY_HOST_BUFFER; break;
-			default:
-				return vm::addr_t(0);
-			}
-
-			return vm::cast(get_address(offset, location));
+			return vm::cast(get_address(offset, static_cast<u32>(report_dma)));
 		}
 
-		void set_fragment_texture_dirty_bit(rsx::context* ctx, u32 index)
+		void set_fragment_texture_dirty_bit(rsx::context* ctx, u32 arg, u32 index)
 		{
+			if (REGS(ctx)->latch == arg && !is_volatile_TIU(ctx, index))
+			{
+				return;
+			}
+
 			RSX(ctx)->m_textures_dirty[index] = true;
 
 			if (RSX(ctx)->current_fp_metadata.referenced_textures_mask & (1 << index))

@@ -5,7 +5,6 @@
 #include "VKHelpers.h"
 #include "VKFormats.h"
 #include "VKRenderPass.h"
-#include "VKRenderTargets.h"
 
 #include "vkutils/data_heap.h"
 #include "vkutils/image_helpers.h"
@@ -760,6 +759,10 @@ namespace vk
 	{
 		switch (block_size)
 		{
+		case 1:
+			return vk::get_compute_task<cs_deswizzle_3d<u8, u8, false>>();
+		case 2:
+			return vk::get_compute_task<cs_deswizzle_3d<u16, WordType, SwapBytes>>();
 		case 4:
 			return vk::get_compute_task<cs_deswizzle_3d<u32, WordType, SwapBytes>>();
 		case 8:
@@ -777,21 +780,27 @@ namespace vk
 		vk::cs_deswizzle_base* job = nullptr;
 		const auto block_size = (word_size * word_count);
 
-		ensure(word_size == 4 || word_size == 2);
-
 		if (!swap_bytes)
 		{
-			if (word_size == 4)
+			switch (word_size)
 			{
-				job = get_deswizzle_transformation<u32, false>(block_size);
-			}
-			else
-			{
+			case 1:
+				job = get_deswizzle_transformation<u8, false>(block_size);
+				break;
+			case 2:
 				job = get_deswizzle_transformation<u16, false>(block_size);
+				break;
+			case 4:
+				job = get_deswizzle_transformation<u32, false>(block_size);
+				break;
+			default:
+				fmt::throw_exception("Unimplemented deswizzle for format.");
 			}
 		}
 		else
 		{
+			ensure(word_size == 2 || word_size == 4);
+
 			if (word_size == 4)
 			{
 				job = get_deswizzle_transformation<u32, true>(block_size);
@@ -868,7 +877,7 @@ namespace vk
 	static const vk::command_buffer& prepare_for_transfer(const vk::command_buffer& primary_cb, vk::image* dst_image, rsx::flags32_t& flags)
 	{
 		AsyncTaskScheduler* async_scheduler = (flags & image_upload_options::upload_contents_async)
-			? std::addressof(g_fxo->get<AsyncTaskScheduler>())
+			? g_fxo->try_get<AsyncTaskScheduler>()
 			: nullptr;
 
 		if (async_scheduler && (dst_image->aspect() & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)))
@@ -930,7 +939,7 @@ namespace vk
 		return *pcmd;
 	}
 
-	static const std::pair<u32, u32> calculate_upload_pitch(int format, u32 heap_align, vk::image* dst_image, const rsx::subresource_layout& layout)
+	static const std::pair<u32, u32> calculate_upload_pitch(int format, u32 heap_align, vk::image* dst_image, const rsx::subresource_layout& layout, const rsx::texture_uploader_capabilities& caps)
 	{
 		u32 block_in_pixel = rsx::get_format_block_size_in_texel(format);
 		u8  block_size_in_bytes = rsx::get_format_block_size_in_bytes(format);
@@ -951,7 +960,7 @@ namespace vk
 
 			// We have row_pitch in source coordinates. But some formats have a software decode step which can affect this packing!
 			// For such formats, the packed pitch on src does not match packed pitch on dst
-			if (!rsx::is_compressed_host_format(format))
+			if (!rsx::is_compressed_host_format(caps, format))
 			{
 				const auto host_texel_width = vk::get_format_texel_width(dst_image->format());
 				const auto host_packed_pitch = host_texel_width * layout.width_in_texel;
@@ -978,7 +987,8 @@ namespace vk
 		VkImageAspectFlags flags, vk::data_heap &upload_heap, u32 heap_align, rsx::flags32_t image_setup_flags)
 	{
 		const bool requires_depth_processing = (dst_image->aspect() & VK_IMAGE_ASPECT_STENCIL_BIT) || (format == CELL_GCM_TEXTURE_DEPTH16_FLOAT);
-		rsx::texture_uploader_capabilities caps{ .alignment = heap_align };
+		auto pdev = vk::get_current_renderer();
+		rsx::texture_uploader_capabilities caps{ .supports_dxt = pdev->get_texture_compression_bc_support(), .alignment = heap_align };
 		rsx::texture_memory_info opt{};
 		bool check_caps = true;
 
@@ -998,11 +1008,11 @@ namespace vk
 
 		for (const rsx::subresource_layout &layout : subresource_layout)
 		{
-			const auto [row_pitch, upload_pitch_in_texel] = calculate_upload_pitch(format, heap_align, dst_image, layout);
+			const auto [row_pitch, upload_pitch_in_texel] = calculate_upload_pitch(format, heap_align, dst_image, layout, caps);
 			caps.alignment = row_pitch;
 
 			// Calculate estimated memory utilization for this subresource
-			image_linear_size = row_pitch * layout.height_in_block * layout.depth;
+			image_linear_size = row_pitch * layout.depth * (rsx::is_compressed_host_format(caps, format) ? layout.height_in_block : layout.height_in_texel);
 
 			// Only do GPU-side conversion if occupancy is good
 			if (check_caps)
@@ -1173,6 +1183,13 @@ namespace vk
 		{
 			ensure(scratch_buf);
 
+			// WAW hazard - complete previous work before executing any transfers
+			insert_buffer_memory_barrier(
+				cmd2, scratch_buf->value, 0, scratch_offset,
+				VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+				VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+				VK_ACCESS_TRANSFER_WRITE_BIT);
+
 			if (upload_commands.size() > 1)
 			{
 				auto range_ptr = buffer_copies.data();
@@ -1187,8 +1204,11 @@ namespace vk
 				vkCmdCopyBuffer(cmd2, upload_buffer->value, scratch_buf->value, static_cast<u32>(buffer_copies.size()), buffer_copies.data());
 			}
 
-			insert_buffer_memory_barrier(cmd2, scratch_buf->value, 0, scratch_offset, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-				VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+			insert_buffer_memory_barrier(
+				cmd2, scratch_buf->value, 0, scratch_offset,
+				VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+				VK_ACCESS_TRANSFER_WRITE_BIT,
+				VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
 		}
 
 		// Swap and deswizzle if requested
@@ -1247,7 +1267,7 @@ namespace vk
 	}
 
 	std::pair<buffer*, u32> detile_memory_block(const vk::command_buffer& cmd, const rsx::GCM_tile_reference& tiled_region,
-		const utils::address_range& range, u16 width, u16 height, u8 bpp)
+		const utils::address_range32& range, u16 width, u16 height, u8 bpp)
 	{
 		// Calculate the true length of the usable memory section
 		const auto available_tile_size = tiled_region.tile->size - (range.start - tiled_region.base_address);

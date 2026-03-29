@@ -132,22 +132,7 @@ std::pair<PPUDisAsm::const_op, u64> PPUDisAsm::try_get_const_op_gpr_value(u32 re
 		switch (type)
 		{
 		case ppu_itype::ADDI:
-		{
-			if (op.rd != reg)
-			{
-				// Destination register is not relevant to us
-				break;
-			}
-
-			u64 reg_ra = 0;
-
-			if (op.ra)
-			{
-				GET_CONST_REG(reg_ra, op.ra);
-			}
-
-			return { form, reg_ra + op.simm16 };
-		}
+		case ppu_itype::ADDIC:
 		case ppu_itype::ADDIS:
 		{
 			if (op.rd != reg)
@@ -157,12 +142,12 @@ std::pair<PPUDisAsm::const_op, u64> PPUDisAsm::try_get_const_op_gpr_value(u32 re
 
 			u64 reg_ra = 0;
 
-			if (op.ra)
+			if (op.ra || type == ppu_itype::ADDIC)
 			{
 				GET_CONST_REG(reg_ra, op.ra);
 			}
 
-			return { form, reg_ra + op.simm16 * 65536 };
+			return { form, reg_ra + (type == ppu_itype::ADDIS ? op.simm16 * 65536 : op.simm16) };
 		}
 		case ppu_itype::ORI:
 		{
@@ -236,7 +221,7 @@ std::pair<PPUDisAsm::const_op, u64> PPUDisAsm::try_get_const_op_gpr_value(u32 re
 
 			GET_CONST_REG(reg_rs, op.rs);
 
-			return { form, utils::rol64(reg_rs, op.sh64) & (~0ull << (op.mbe64 ^ 63)) };
+			return {form, std::rotl<u64>(reg_rs, op.sh64) & (~0ull << (op.mbe64 ^ 63))};
 		}
 		case ppu_itype::OR:
 		{
@@ -345,7 +330,7 @@ void comment_constant(std::string& last_opcode, u64 value, bool print_float = fa
 	// Comment constant formation
 	fmt::append(last_opcode, " #0x%xh", value);
 
-	if (print_float && ((value >> 31) <= 1u || (value >> 31) == 0x1'ffff'ffffu))
+	if (print_float && ((value >> 31) <= 1u || (value >> 31) == 0x1'ffff'ffffu) && (value > 0x3fffff && (value << 32 >> 32) < 0xffc00000))
 	{
 		const f32 float_val = std::bit_cast<f32>(static_cast<u32>(value));
 
@@ -1286,6 +1271,12 @@ void PPUDisAsm::CMPI(ppu_opcode_t op)
 void PPUDisAsm::ADDIC(ppu_opcode_t op)
 {
 	DisAsm_R2_IMM(op.main & 1 ? "addic." : "addic", op.rd, op.ra, op.simm16);
+
+	if (auto [is_const, value] = try_get_const_gpr_value(op.ra); is_const)
+	{
+		// Comment constant formation
+		comment_constant(last_opcode, value + op.simm16);
+	}
 }
 
 void PPUDisAsm::ADDI(ppu_opcode_t op)

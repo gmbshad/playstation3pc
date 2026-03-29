@@ -82,6 +82,14 @@ namespace rsx
 					rcount = 0;
 			}
 
+			if (rcount == 0)
+			{
+				// Out-of-bounds write is a NOP
+				rsx_log.trace("Out of bounds write for transform constant block.");
+				RSX(ctx)->fifo_ctrl->skip_methods(fifo_args_cnt - 1);
+				return;
+			}
+
 			if (RSX(ctx)->in_begin_end && !REGS(ctx)->current_draw_clause.empty())
 			{
 				// Updating constants mid-draw is messy. Defer the writes
@@ -98,7 +106,7 @@ namespace rsx
 
 			const auto values = &REGS(ctx)->transform_constants[load + constant_id][subreg];
 
-			const auto fifo_span = RSX(ctx)->fifo_ctrl->get_current_arg_ptr();
+			const auto fifo_span = RSX(ctx)->fifo_ctrl->get_current_arg_ptr(rcount);
 
 			if (fifo_span.size() < rcount)
 			{
@@ -148,16 +156,53 @@ namespace rsx
 				rcount -= max - (max_vertex_program_instructions * 4);
 			}
 
-			const auto fifo_span = RSX(ctx)->fifo_ctrl->get_current_arg_ptr();
+			if (!rcount)
+			{
+				// Out-of-bounds write is a NOP
+				rsx_log.trace("Out of bounds write for transform program block.");
+				RSX(ctx)->fifo_ctrl->skip_methods(fifo_args_cnt - 1);
+				return;
+			}
+
+			const auto fifo_span = RSX(ctx)->fifo_ctrl->get_current_arg_ptr(rcount);
 
 			if (fifo_span.size() < rcount)
 			{
 				rcount = ::size32(fifo_span);
 			}
 
-			copy_data_swap_u32(&REGS(ctx)->transform_program[load_pos * 4 + index % 4], fifo_span.data(), rcount);
+			const auto out_ptr = &REGS(ctx)->transform_program[load_pos * 4 + index % 4];
 
-			RSX(ctx)->m_graphics_state |= rsx::pipeline_state::vertex_program_ucode_dirty;
+			pipeline_state to_set_dirty = rsx::pipeline_state::vertex_program_ucode_dirty;
+
+			if (rcount >= 4 && !RSX(ctx)->m_graphics_state.test(rsx::pipeline_state::vertex_program_ucode_dirty))
+			{
+				// Assume clean
+				to_set_dirty = {};
+
+				const usz first_index_off = 0;
+				const usz second_index_off = (((rcount / 4) - 1) / 2) * 4;
+
+				const u64 src_op1_2 = read_from_ptr<be_t<u64>>(fifo_span.data() + first_index_off);
+				const u64 src_op2_2 = read_from_ptr<be_t<u64>>(fifo_span.data() + second_index_off);
+
+				// Fast comparison
+				if (src_op1_2 != read_from_ptr<u64>(out_ptr + first_index_off) || src_op2_2 != read_from_ptr<u64>(out_ptr + second_index_off))
+				{
+					to_set_dirty = rsx::pipeline_state::vertex_program_ucode_dirty;
+				}
+			}
+
+			if (to_set_dirty)
+			{
+				copy_data_swap_u32(out_ptr, fifo_span.data(), rcount);
+			}
+			else if (copy_data_swap_u32_cmp(out_ptr, fifo_span.data(), rcount))
+			{
+				to_set_dirty = rsx::pipeline_state::vertex_program_ucode_dirty;
+			}
+
+			RSX(ctx)->m_graphics_state |= to_set_dirty;
 			REGS(ctx)->transform_program_load_set(load_pos + ((rcount + index % 4) / 4));
 			RSX(ctx)->fifo_ctrl->skip_methods(rcount - 1);
 		}
@@ -205,8 +250,12 @@ namespace rsx
 			const auto current = REGS(ctx)->decode<NV4097_SET_SURFACE_FORMAT>(arg);
 			const auto previous = REGS(ctx)->decode<NV4097_SET_SURFACE_FORMAT>(REGS(ctx)->latch);
 
-			if (*current.antialias() != *previous.antialias() ||                         // Antialias control has changed, update ROP parameters
-				current.is_integer_color_format() != previous.is_integer_color_format()) // The type of color format also requires ROP control update
+			if (current.is_integer_color_format() != previous.is_integer_color_format()) // Different ROP emulation
+			{
+				RSX(ctx)->m_graphics_state |= rsx::pipeline_state::fragment_program_state_dirty;
+			}
+
+			if (*current.antialias() != *previous.antialias()) // Antialias control has changed, update ROP parameters
 			{
 				RSX(ctx)->m_graphics_state |= rsx::pipeline_state::fragment_state_dirty;
 			}
@@ -255,6 +304,34 @@ namespace rsx
 
 			// Rollback
 			REGS(ctx)->decode(reg, REGS(ctx)->latch);
+		}
+
+		void set_aa_control(context* ctx, u32 /*reg*/, u32 arg)
+		{
+			const auto latch = REGS(ctx)->latch;
+			if (arg == latch)
+			{
+				return;
+			}
+
+			// Reconfigure pipeline.
+			RSX(ctx)->m_graphics_state |= rsx::pipeline_config_dirty;
+
+			// If we support A2C in hardware, leave the rest upto the hardware. The pipeline config should take care of it.
+			const auto& backend_config = RSX(ctx)->get_backend_config();
+			if (backend_config.supports_hw_a2c &&
+				backend_config.supports_hw_a2c_1spp)
+			{
+				return;
+			}
+
+			// No A2C hardware support or partial hardware support. Invalidate the current program if A2C state changed.
+			const auto a2c_old = REGS(ctx)->decode<NV4097_SET_ANTI_ALIASING_CONTROL>(latch).msaa_alpha_to_coverage();
+			const auto a2c_new = REGS(ctx)->decode<NV4097_SET_ANTI_ALIASING_CONTROL>(arg).msaa_alpha_to_coverage();
+			if (a2c_old != a2c_new)
+			{
+				RSX(ctx)->m_graphics_state |= rsx::fragment_program_state_dirty;
+			}
 		}
 
 		///// Draw call setup (vertex, etc)
@@ -521,7 +598,7 @@ namespace rsx
 			default:
 				rsx_log.error("NV4097_GET_REPORT: Bad type %d", type);
 
-				vm::_ref<atomic_t<CellGcmReportData>>(address_ptr).atomic_op([&](CellGcmReportData& data)
+				vm::_ptr<atomic_t<CellGcmReportData>>(address_ptr)->atomic_op([&](CellGcmReportData& data)
 				{
 					data.timer = RSX(ctx)->timestamp();
 					data.padding = 0;
@@ -606,14 +683,14 @@ namespace rsx
 
 			ensure(addr != umax);
 
-			vm::_ref<atomic_t<RsxNotify>>(addr).store(
+			vm::_ptr<atomic_t<RsxNotify>>(addr)->store(
 			{
 				RSX(ctx)->timestamp(),
 				0
 			});
 		}
 
-		void texture_read_semaphore_release(context* ctx, u32 /*reg*/, u32 arg)
+		void texture_read_semaphore_release(context* ctx, u32 reg, u32 arg)
 		{
 			// Pipeline barrier seems to be equivalent to a SHADER_READ stage barrier.
 			// Ideally the GPU only needs to have cached all textures declared up to this point before writing the label.
@@ -638,15 +715,15 @@ namespace rsx
 
 			if (g_cfg.video.strict_rendering_mode) [[ unlikely ]]
 			{
-				util::write_gcm_label<true, true>(ctx, addr, arg);
+				util::write_gcm_label<true, true>(ctx, reg, addr, arg);
 			}
 			else
 			{
-				util::write_gcm_label<true, false>(ctx, addr, arg);
+				util::write_gcm_label<true, false>(ctx, reg, addr, arg);
 			}
 		}
 
-		void back_end_write_semaphore_release(context* ctx, u32 /*reg*/, u32 arg)
+		void back_end_write_semaphore_release(context* ctx, u32 reg, u32 arg)
 		{
 			// Full pipeline barrier. GPU must flush pipeline before writing the label
 
@@ -667,7 +744,7 @@ namespace rsx
 			}
 
 			const u32 val = (arg & 0xff00ff00) | ((arg & 0xff) << 16) | ((arg >> 16) & 0xff);
-			util::write_gcm_label<true, true>(ctx, addr, val);
+			util::write_gcm_label<true, true>(ctx, reg, addr, val);
 		}
 
 		void sync(context* ctx, u32, u32)

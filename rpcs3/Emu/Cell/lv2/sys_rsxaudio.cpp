@@ -4,10 +4,8 @@
 #include "Emu/System.h"
 #include "Emu/system_config.h"
 #include "Emu//Audio/audio_utils.h"
-#include "Emu//Cell/Modules/cellAudioOut.h"
 #include "util/video_provider.h"
 
-#include "sys_process.h"
 #include "sys_rsxaudio.h"
 
 #include <cmath>
@@ -48,14 +46,14 @@ namespace rsxaudio_ringbuf_reader
 	static void set_timestamp(rsxaudio_shmem::ringbuf_t& ring_buf, u64 timestamp)
 	{
 		const s32 entry_idx_raw = (ring_buf.read_idx + ring_buf.rw_max_idx - (ring_buf.rw_max_idx > 2) - 1) % ring_buf.rw_max_idx;
-		const s32 entry_idx = std::clamp<s32>(entry_idx_raw, 0, SYS_RSXAUDIO_RINGBUF_SZ);
+		const s32 entry_idx = std::clamp<s32>(entry_idx_raw, 0, SYS_RSXAUDIO_RINGBUF_SZ - 1);
 
 		ring_buf.entries[entry_idx].timestamp = convert_to_timebased_time(timestamp);
 	}
 
 	static std::tuple<bool /*notify*/, u64 /*blk_idx*/, u64 /*timestamp*/> update_status(rsxaudio_shmem::ringbuf_t& ring_buf)
 	{
-		const s32 read_idx = std::clamp<s32>(ring_buf.read_idx, 0, SYS_RSXAUDIO_RINGBUF_SZ);
+		const s32 read_idx = std::clamp<s32>(ring_buf.read_idx, 0, SYS_RSXAUDIO_RINGBUF_SZ - 1);
 
 		if ((ring_buf.entries[read_idx].valid & 1) == 0U)
 		{
@@ -63,7 +61,7 @@ namespace rsxaudio_ringbuf_reader
 		}
 
 		const s32 entry_idx_raw = (ring_buf.read_idx + ring_buf.rw_max_idx - (ring_buf.rw_max_idx > 2)) % ring_buf.rw_max_idx;
-		const s32 entry_idx = std::clamp<s32>(entry_idx_raw, 0, SYS_RSXAUDIO_RINGBUF_SZ);
+		const s32 entry_idx = std::clamp<s32>(entry_idx_raw, 0, SYS_RSXAUDIO_RINGBUF_SZ - 1);
 
 		ring_buf.entries[read_idx].valid = 0;
 		ring_buf.queue_notify_idx = (ring_buf.queue_notify_idx + 1) % ring_buf.queue_notify_step;
@@ -74,7 +72,7 @@ namespace rsxaudio_ringbuf_reader
 
 	static std::pair<bool /*entry_valid*/, u32 /*addr*/> get_addr(const rsxaudio_shmem::ringbuf_t& ring_buf)
 	{
-		const s32 read_idx = std::clamp<s32>(ring_buf.read_idx, 0, SYS_RSXAUDIO_RINGBUF_SZ);
+		const s32 read_idx = std::clamp<s32>(ring_buf.read_idx, 0, SYS_RSXAUDIO_RINGBUF_SZ - 1);
 
 		if (ring_buf.entries[read_idx].valid & 1)
 		{
@@ -825,7 +823,7 @@ void rsxaudio_data_thread::extract_audio_data()
 		return rsxaudio_obj_ptr;
 	}();
 
-	if (Emu.IsPaused() || !rsxaudio_obj)
+	if (Emu.IsPausedOrReady() || !rsxaudio_obj)
 	{
 		advance_all_timers();
 		return;
@@ -1394,9 +1392,9 @@ void rsxaudio_backend_thread::operator()()
 		return;
 	}
 
-	static rsxaudio_state ra_state{};
-	static emu_audio_cfg emu_cfg{};
-	static bool backend_failed = false;
+	rsxaudio_state ra_state{};
+	emu_audio_cfg emu_cfg{};
+	bool backend_failed = false;
 
 	for (;;)
 	{
@@ -1533,7 +1531,7 @@ void rsxaudio_backend_thread::operator()()
 			backend_failed = false;
 		}
 
-		if (!Emu.IsPaused() || !use_aux_ringbuf) // Don't pause if thread is in direct mode
+		if (!Emu.IsPausedOrReady() || !use_aux_ringbuf) // Don't pause if thread is in direct mode
 		{
 			if (!backend_playing())
 			{
@@ -1860,7 +1858,7 @@ u32 rsxaudio_backend_thread::write_data_callback(u32 bytes, void* buf)
 		if (g_recording_mode != recording_mode::stopped)
 		{
 			utils::video_provider& provider = g_fxo->get<utils::video_provider>();
-			provider.present_samples(reinterpret_cast<u8*>(callback_tmp_buf.data()), sample_cnt / cb_cfg.input_ch_cnt, cb_cfg.input_ch_cnt);
+			provider.present_samples(reinterpret_cast<const u8*>(callback_tmp_buf.data()), sample_cnt / cb_cfg.input_ch_cnt, cb_cfg.input_ch_cnt);
 		}
 
 		// Downmix if necessary
@@ -2020,7 +2018,7 @@ void rsxaudio_periodic_tmr::cancel_timer_unlocked()
 	{
 		const u64 flag = 1;
 		const auto wr_res = write(cancel_event, &flag, sizeof(flag));
-		ensure(wr_res == sizeof(flag) || wr_res == -EAGAIN);
+		ensure(wr_res == sizeof(flag) || errno == EAGAIN);
 	}
 #elif defined(BSD) || defined(__APPLE__)
 	handle[TIMER_ID].flags = (handle[TIMER_ID].flags & ~EV_ENABLE) | EV_DISABLE;

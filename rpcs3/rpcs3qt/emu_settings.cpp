@@ -8,7 +8,6 @@
 
 #include "Emu/System.h"
 #include "Emu/system_config.h"
-#include "Emu/vfs_config.h"
 #include "Emu/system_utils.hpp"
 #include "Emu/Cell/Modules/cellSysutil.h"
 #include "Emu/Io/Keyboard.h"
@@ -26,7 +25,37 @@ namespace
 {
 	static NEVER_INLINE void emit_data(YAML::Emitter& out, const YAML::Node& node)
 	{
-		// TODO
+		if (!node || node.IsNull())
+		{
+			// I chose to output a null when nothing is present so that recursive YAML Value calls can be matched to a null value instead of nothing
+			out << YAML::Null;
+			return;
+		}
+
+		if (node.IsMap())
+		{
+			std::vector<std::string> keys;
+			keys.reserve(node.size());
+
+			// generate vector of strings to be sorted using the as function from YAML documentation
+			for (const auto& pair : node)
+			{
+				keys.push_back(pair.first.Scalar());
+			}
+			std::sort(keys.begin(), keys.end());
+
+			// recursively generate sorted maps
+			out << YAML::BeginMap;
+			for (const std::string& key : keys)
+			{
+				out << YAML::Key << key;
+				out << YAML::Value;
+				emit_data(out, node[key]);
+			}
+			out << YAML::EndMap;
+			return;
+		}
+
 		out << node;
 	}
 
@@ -93,7 +122,7 @@ void emu_settings::LoadSettings(const std::string& title_id, bool create_config_
 	m_title_id = title_id;
 
 	// Create config path if necessary
-	fs::create_path(title_id.empty() ? fs::get_config_dir() : rpcs3::utils::get_custom_config_dir());
+	fs::create_path(title_id.empty() ? fs::get_config_dir(true) : rpcs3::utils::get_custom_config_dir());
 
 	// Load default config
 	auto [default_config, default_error] = yaml_load(g_cfg_defaults);
@@ -113,7 +142,7 @@ void emu_settings::LoadSettings(const std::string& title_id, bool create_config_
 	if (create_config_from_global)
 	{
 		// Add global config
-		const std::string global_config_path = fs::get_config_dir() + "config.yml";
+		const std::string global_config_path = fs::get_config_dir(true) + "config.yml";
 		fs::g_tls_error = fs::error::ok;
 		fs::file config(global_config_path, fs::read + fs::create);
 		auto [global_config, global_error] = yaml_load(config ? config.to_string() : "");
@@ -376,7 +405,7 @@ void emu_settings::EnhanceComboBox(QComboBox* combobox, emu_settings_type type, 
 
 	combobox->setCurrentIndex(index);
 
-	connect(combobox, QOverload<int>::of(&QComboBox::currentIndexChanged), combobox, [this, is_ranged, combobox, type](int index)
+	connect(combobox, &QComboBox::currentIndexChanged, combobox, [this, is_ranged, combobox, type](int index)
 	{
 		if (index < 0) return;
 
@@ -669,10 +698,9 @@ void emu_settings::EnhanceSpinBox(QSpinBox* spinbox, emu_settings_type type, con
 	spinbox->setRange(min, max);
 	spinbox->setValue(val);
 
-	connect(spinbox, &QSpinBox::textChanged, this, [type, spinbox, this](const QString& /* text*/)
+	connect(spinbox, &QSpinBox::valueChanged, this, [type, this](int value)
 	{
-		if (!spinbox) return;
-		SetSetting(type, spinbox->cleanText().toStdString());
+		SetSetting(type, fmt::format("%d", value));
 	});
 
 	connect(this, &emu_settings::RestoreDefaultsSignal, spinbox, [def, spinbox]()
@@ -725,10 +753,9 @@ void emu_settings::EnhanceDoubleSpinBox(QDoubleSpinBox* spinbox, emu_settings_ty
 	spinbox->setRange(min, max);
 	spinbox->setValue(val);
 
-	connect(spinbox, &QDoubleSpinBox::textChanged, this, [type, spinbox, this](const QString& /* text*/)
+	connect(spinbox, &QDoubleSpinBox::valueChanged, this, [type, this](double value)
 	{
-		if (!spinbox) return;
-		SetSetting(type, spinbox->cleanText().toStdString());
+		SetSetting(type, fmt::format("%f", value));
 	});
 
 	connect(this, &emu_settings::RestoreDefaultsSignal, spinbox, [def, spinbox]()
@@ -880,7 +907,34 @@ std::string emu_settings::GetSetting(emu_settings_type type) const
 	return "";
 }
 
+std::map<std::string, std::string> emu_settings::GetMapSettingDefault(emu_settings_type type) const
+{
+	if (const auto node = cfg_adapter::get_node(m_default_settings, ::at32(settings_location, type)); node && node.IsMap())
+	{
+		return node.as<std::map<std::string, std::string>>();
+	}
+
+	cfg_log.fatal("GetMapSettingDefault(type=%d) could not retrieve the requested node", static_cast<int>(type));
+	return {};
+}
+
+std::map<std::string, std::string> emu_settings::GetMapSetting(emu_settings_type type) const
+{
+	if (const auto node = cfg_adapter::get_node(m_current_settings, ::at32(settings_location, type)); node && node.IsMap())
+	{
+		return node.as<std::map<std::string, std::string>>();
+	}
+
+	cfg_log.fatal("GetMapSetting(type=%d) could not retrieve the requested node", static_cast<int>(type));
+	return {};
+}
+
 void emu_settings::SetSetting(emu_settings_type type, const std::string& val) const
+{
+	cfg_adapter::get_node(m_current_settings, ::at32(settings_location, type)) = val;
+}
+
+void emu_settings::SetMapSetting(emu_settings_type type, const std::map<std::string, std::string>& val) const
 {
 	cfg_adapter::get_node(m_current_settings, ::at32(settings_location, type)) = val;
 }
@@ -989,14 +1043,6 @@ QString emu_settings::GetLocalizedSetting(const QString& original, emu_settings_
 		case thread_scheduler_mode::os: return tr("Operating System", "Thread Scheduler Mode");
 		}
 		break;
-	case emu_settings_type::EnableTSX:
-		switch (static_cast<tsx_usage>(index))
-		{
-		case tsx_usage::disabled: return tr("Disabled", "Enable TSX");
-		case tsx_usage::enabled: return tr("Enabled", "Enable TSX");
-		case tsx_usage::forced: return tr("Forced", "Enable TSX");
-		}
-		break;
 	case emu_settings_type::Renderer:
 		switch (static_cast<video_renderer>(index))
 		{
@@ -1008,9 +1054,9 @@ QString emu_settings::GetLocalizedSetting(const QString& original, emu_settings_
 	case emu_settings_type::ShaderMode:
 		switch (static_cast<shader_mode>(index))
 		{
-		case shader_mode::recompiler: return tr("Legacy (single threaded)", "Shader Mode");
-		case shader_mode::async_recompiler: return tr("Async (multi threaded)", "Shader Mode");
-		case shader_mode::async_with_interpreter: return tr("Async with Shader Interpreter", "Shader Mode");
+		case shader_mode::recompiler: return tr("Legacy Recompiler (single-threaded)", "Shader Mode");
+		case shader_mode::async_recompiler: return tr("Async Recompiler (multi-threaded)", "Shader Mode");
+		case shader_mode::async_with_interpreter: return tr("Async Recompiler with Shader Interpreter", "Shader Mode");
 		case shader_mode::interpreter_only: return tr("Shader Interpreter only", "Shader Mode");
 		}
 		break;
@@ -1065,7 +1111,7 @@ QString emu_settings::GetLocalizedSetting(const QString& original, emu_settings_
 		{
 		case output_scaling_mode::nearest: return tr("Nearest", "Output Scaling Mode");
 		case output_scaling_mode::bilinear: return tr("Bilinear", "Output Scaling Mode");
-		case output_scaling_mode::fsr: return tr("FidelityFX Super Resolution", "Output Scaling Mode");
+		case output_scaling_mode::fsr: return tr("FidelityFX Super Resolution 1", "Output Scaling Mode");
 		}
 		break;
 	case emu_settings_type::AudioRenderer:
@@ -1130,6 +1176,9 @@ QString emu_settings::GetLocalizedSetting(const QString& original, emu_settings_
 		case camera_handler::null: return tr("Null", "Camera handler");
 		case camera_handler::fake: return tr("Fake", "Camera handler");
 		case camera_handler::qt: return tr("Qt", "Camera handler");
+#ifdef HAVE_SDL3
+		case camera_handler::sdl: return tr("SDL", "Camera handler");
+#endif
 		}
 		break;
 	case emu_settings_type::MusicHandler:
@@ -1209,10 +1258,10 @@ QString emu_settings::GetLocalizedSetting(const QString& original, emu_settings_
 	case emu_settings_type::FIFOAccuracy:
 		switch (static_cast<rsx_fifo_mode>(index))
 		{
-		case rsx_fifo_mode::fast: return tr("Fast", "RSX FIFO Accuracy");
-		case rsx_fifo_mode::atomic: return tr("Atomic", "RSX FIFO Accuracy");
-		case rsx_fifo_mode::atomic_ordered: return tr("Ordered & Atomic", "RSX FIFO Accuracy");
-		case rsx_fifo_mode::as_ps3: return tr("PS3", "RSX FIFO Accuracy");
+		case rsx_fifo_mode::fast: return tr("Fast", "RSX FIFO Fetch Accuracy");
+		case rsx_fifo_mode::atomic: return tr("Atomic", "RSX FIFO Fetch Accuracy");
+		case rsx_fifo_mode::atomic_ordered: return tr("Ordered & Atomic", "RSX FIFO Fetch Accuracy");
+		case rsx_fifo_mode::as_ps3: return tr("PS3", "RSX FIFO Fetch Accuracy");
 		}
 		break;
 	case emu_settings_type::PerfOverlayDetailLevel:
@@ -1337,6 +1386,21 @@ QString emu_settings::GetLocalizedSetting(const QString& original, emu_settings_
 		case vk_gpu_scheduler_mode::fast: return tr("Fast", "Asynchronous Queue Scheduler");
 		}
 		break;
+	case emu_settings_type::DateFormat:
+		switch (static_cast<date_format>(index))
+		{
+		case date_format::yyyymmdd: return tr("Year/Month/Day", "Date Format");
+		case date_format::ddmmyyyy: return tr("Day/Month/Year", "Date Format");
+		case date_format::mmddyyyy: return tr("Month/Day/Year", "Date Format");
+		}
+		break;
+	case emu_settings_type::TimeFormat:
+		switch (static_cast<time_format>(index))
+		{
+		case time_format::clock12: return tr("12-hour clock", "Time Format");
+		case time_format::clock24: return tr("24-hour clock", "Time Format");
+		}
+		break;
 	case emu_settings_type::Language:
 		switch (static_cast<CellSysutilLang>(index))
 		{
@@ -1435,6 +1499,13 @@ QString emu_settings::GetLocalizedSetting(const QString& original, emu_settings_
 		case xfloat_accuracy::inaccurate: return tr("Inaccurate XFloat");
 		}
 		break;
+	case emu_settings_type::VSync:
+		switch (static_cast<vsync_mode>(index))
+		{
+		case vsync_mode::off: return tr("Disabled", "VSync Mode");
+		case vsync_mode::adaptive: return tr("Adaptive", "VSync Mode");
+		case vsync_mode::full: return tr("Full", "VSync Mode");
+		}
 	default:
 		break;
 	}

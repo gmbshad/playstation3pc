@@ -3,11 +3,22 @@
 #include "state_tracker.hpp"
 
 #include "../GLTexture.h" // TODO: This system also needs to be refactored
-#include "../GLOverlays.h"
 
 namespace gl
 {
 	blitter* g_hw_blitter = nullptr;
+
+	void blitter::init()
+	{
+		blit_src.create();
+		blit_dst.create();
+	}
+
+	void blitter::destroy()
+	{
+		blit_dst.remove();
+		blit_src.remove();
+	}
 
 	void blitter::copy_image(gl::command_context&, const texture* src, const texture* dst, int src_level, int dst_level, const position3i& src_offset, const position3i& dst_offset, const size3i& size) const
 	{
@@ -67,7 +78,7 @@ namespace gl
 			if (static_cast<gl::texture::internal_format>(internal_fmt) != src->get_internal_format())
 			{
 				const u16 internal_width = static_cast<u16>(src->width() * xfer_info.src_scaling_hint);
-				typeless_src = std::make_unique<texture>(GL_TEXTURE_2D, internal_width, src->height(), 1, 1, internal_fmt);
+				typeless_src = std::make_unique<texture>(GL_TEXTURE_2D, internal_width, src->height(), 1, 1, 1, internal_fmt, RSX_FORMAT_CLASS_DONT_CARE);
 				copy_typeless(cmd, typeless_src.get(), src);
 
 				real_src = typeless_src.get();
@@ -85,7 +96,7 @@ namespace gl
 			if (static_cast<gl::texture::internal_format>(internal_fmt) != dst->get_internal_format())
 			{
 				const auto internal_width = static_cast<u16>(dst->width() * xfer_info.dst_scaling_hint);
-				typeless_dst = std::make_unique<texture>(GL_TEXTURE_2D, internal_width, dst->height(), 1, 1, internal_fmt);
+				typeless_dst = std::make_unique<texture>(GL_TEXTURE_2D, internal_width, dst->height(), 1, 1, 1, internal_fmt, RSX_FORMAT_CLASS_DONT_CARE);
 				copy_typeless(cmd, typeless_dst.get(), dst);
 
 				real_dst = typeless_dst.get();
@@ -147,6 +158,9 @@ namespace gl
 
 			gl::fbo::attachment dst_att{ blit_dst, static_cast<fbo::attachment::type>(attachment) };
 			dst_att = *real_dst;
+
+			blit_src.check();
+			blit_dst.check();
 
 			blit_src.blit(blit_dst, src_rect, dst_rect, target, interp);
 

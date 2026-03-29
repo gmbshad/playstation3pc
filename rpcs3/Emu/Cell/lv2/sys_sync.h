@@ -1,18 +1,13 @@
 #pragma once
 
 #include "Utilities/mutex.h"
-#include "Utilities/sema.h"
 
 #include "Emu/CPU/CPUThread.h"
 #include "Emu/Cell/ErrorCodes.h"
-#include "Emu/Cell/timers.hpp"
-#include "Emu/Memory/vm_reservation.h"
 #include "Emu/IdManager.h"
 #include "Emu/IPC.h"
 
 #include "util/shared_ptr.hpp"
-
-#include <thread>
 
 // attr_protocol (waiting scheduling policy)
 enum lv2_protocol : u8
@@ -458,6 +453,7 @@ public:
 
 	// Can be called before the actual sleep call in order to move it out of mutex scope
 	static void prepare_for_sleep(cpu_thread& cpu);
+	static ppu_thread* get_running_ppu(u32 index);
 
 	struct notify_all_t
 	{
@@ -486,6 +482,12 @@ public:
 					cpu = &g_to_notify;
 				}
 			}
+		}
+
+		static void enqueue_on_top(const void* waiter)
+		{
+			g_to_notify[0] = waiter;
+			g_to_notify[1] = nullptr;
 		}
 
 		~notify_all_t() noexcept

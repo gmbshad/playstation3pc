@@ -1,17 +1,9 @@
 #pragma once
 
 #include "util/types.hpp"
-#include <string>
-#include <functional>
 #include <vector>
-#include <memory>
-#include <unordered_map>
-#include <variant>
-#include <stack>
-#include <deque>
 
 #include "VulkanAPI.h"
-#include "vkutils/chip_class.h"
 #include "Utilities/geometry.h"
 #include "Emu/RSX/Common/TextureUtils.h"
 #include "Emu/RSX/rsx_utils.h"
@@ -94,7 +86,7 @@ namespace vk
 		VkImageAspectFlags flags, vk::data_heap &upload_heap, u32 heap_align, rsx::flags32_t image_setup_flags);
 
 	std::pair<buffer*, u32> detile_memory_block(
-		const vk::command_buffer& cmd, const rsx::GCM_tile_reference& tiled_region, const utils::address_range& range,
+		const vk::command_buffer& cmd, const rsx::GCM_tile_reference& tiled_region, const utils::address_range32& range,
 		u16 width, u16 height, u8 bpp);
 
 	// Other texture management helpers

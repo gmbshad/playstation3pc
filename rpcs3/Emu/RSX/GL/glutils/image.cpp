@@ -19,8 +19,72 @@ namespace gl
 		}
 	}
 
-	texture::texture(GLenum target, GLuint width, GLuint height, GLuint depth, GLuint mipmaps, GLenum sized_format, rsx::format_class format_class)
+	static const char* gl_type_to_str(texture::type type)
 	{
+		switch (type)
+		{
+		case texture::type::ubyte: return "GL_UNSIGNED_BYTE";
+		case texture::type::ushort: return "GL_UNSIGNED_SHORT";
+		case texture::type::uint: return "GL_UNSIGNED_INT";
+		case texture::type::ubyte_3_3_2: return "GL_UNSIGNED_BYTE_3_3_2";
+		case texture::type::ubyte_2_3_3_rev: return "GL_UNSIGNED_BYTE_2_3_3_REV";
+		case texture::type::ushort_5_6_5: return "GL_UNSIGNED_SHORT_5_6_5";
+		case texture::type::ushort_5_6_5_rev: return "GL_UNSIGNED_SHORT_5_6_5_REV";
+		case texture::type::ushort_4_4_4_4: return "GL_UNSIGNED_SHORT_4_4_4_4";
+		case texture::type::ushort_4_4_4_4_rev: return "GL_UNSIGNED_SHORT_4_4_4_4_REV";
+		case texture::type::ushort_5_5_5_1: return "GL_UNSIGNED_SHORT_5_5_5_1";
+		case texture::type::ushort_1_5_5_5_rev: return "GL_UNSIGNED_SHORT_1_5_5_5_REV";
+		case texture::type::uint_8_8_8_8: return "GL_UNSIGNED_INT_8_8_8_8";
+		case texture::type::uint_8_8_8_8_rev: return "GL_UNSIGNED_INT_8_8_8_8_REV";
+		case texture::type::uint_10_10_10_2: return "GL_UNSIGNED_INT_10_10_10_2";
+		case texture::type::uint_2_10_10_10_rev: return "GL_UNSIGNED_INT_2_10_10_10_REV";
+		case texture::type::uint_24_8: return "GL_UNSIGNED_INT_24_8";
+		case texture::type::float32_uint8: return "GL_FLOAT_32_UNSIGNED_INT_24_8_REV";
+		case texture::type::sbyte: return "GL_BYTE";
+		case texture::type::sshort: return "GL_SHORT";
+		case texture::type::sint: return "GL_INT";
+		case texture::type::f16: return "GL_HALF_FLOAT";
+		case texture::type::f32: return "GL_FLOAT";
+		case texture::type::f64: return "GL_DOUBLE";
+		default: return "UNKNOWN";
+		}
+	}
+
+	static const char* gl_format_to_str(texture::format format)
+	{
+		switch (format)
+		{
+		case texture::format::r: return "GL_RED";
+		case texture::format::rg: return "GL_RG";
+		case texture::format::rgb: return "GL_RGB";
+		case texture::format::rgba: return "GL_RGBA";
+		case texture::format::bgr: return "GL_BGR";
+		case texture::format::bgra: return "GL_BGRA";
+		case texture::format::stencil: return "GL_STENCIL_INDEX";
+		case texture::format::depth: return "GL_DEPTH_COMPONENT";
+		case texture::format::depth_stencil: return "GL_DEPTH_STENCIL";
+		default: return "UNKNOWN";
+		}
+	}
+
+	texture::texture(GLenum target, GLuint width, GLuint height, GLuint depth, GLuint mipmaps, GLubyte samples, GLenum sized_format, rsx::format_class format_class)
+	{
+		// Upgrade targets for MSAA
+		if (samples > 1)
+		{
+			switch (target)
+			{
+			case GL_TEXTURE_2D:
+				target = GL_TEXTURE_2D_MULTISAMPLE;
+				break;
+			case GL_TEXTURE_2D_ARRAY:
+				target = GL_TEXTURE_2D_MULTISAMPLE_ARRAY;
+				break;
+			default:
+				fmt::throw_exception("MSAA is only supported on 2D images. Target=0x%x", target);
+			}
+		}
+
 		glGenTextures(1, &m_id);
 
 		// Must bind to initialize the new texture
@@ -40,9 +104,18 @@ namespace gl
 			glTexStorage2D(target, mipmaps, storage_fmt, width, height);
 			depth = 1;
 			break;
+		case GL_TEXTURE_2D_MULTISAMPLE:
+			ensure(mipmaps == 1);
+			glTexStorage2DMultisample(target, samples, storage_fmt, width, height, GL_TRUE);
+			depth = 1;
+			break;
 		case GL_TEXTURE_3D:
 		case GL_TEXTURE_2D_ARRAY:
 			glTexStorage3D(target, mipmaps, storage_fmt, width, height, depth);
+			break;
+		case GL_TEXTURE_2D_MULTISAMPLE_ARRAY:
+			ensure(mipmaps == 1);
+			glTexStorage3DMultisample(target, samples, storage_fmt, width, height, depth, GL_TRUE);
 			break;
 		case GL_TEXTURE_BUFFER:
 			break;
@@ -50,19 +123,25 @@ namespace gl
 
 		if (target != GL_TEXTURE_BUFFER)
 		{
-			glTexParameteri(target, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-			glTexParameteri(target, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-			glTexParameteri(target, GL_TEXTURE_WRAP_S, GL_REPEAT);
-			glTexParameteri(target, GL_TEXTURE_WRAP_T, GL_REPEAT);
-			glTexParameteri(target, GL_TEXTURE_WRAP_R, GL_REPEAT);
-			glTexParameteri(target, GL_TEXTURE_BASE_LEVEL, 0);
-			glTexParameteri(target, GL_TEXTURE_MAX_LEVEL, mipmaps - 1);
+			if (samples == 1)
+			{
+				glTexParameteri(target, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+				glTexParameteri(target, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+				glTexParameteri(target, GL_TEXTURE_WRAP_S, GL_REPEAT);
+				glTexParameteri(target, GL_TEXTURE_WRAP_T, GL_REPEAT);
+				glTexParameteri(target, GL_TEXTURE_WRAP_R, GL_REPEAT);
+				glTexParameteri(target, GL_TEXTURE_BASE_LEVEL, 0);
+				glTexParameteri(target, GL_TEXTURE_MAX_LEVEL, mipmaps - 1);
+			}
 
 			m_width = width;
 			m_height = height;
 			m_depth = depth;
 			m_mipmaps = mipmaps;
+			m_samples = samples;
 			m_aspect_flags = image_aspect::color;
+
+			ensure(width > 0 && height > 0 && depth > 0 && mipmaps > 0 && samples > 0, "Invalid OpenGL texture definition.");
 
 			switch (storage_fmt)
 			{
@@ -144,38 +223,40 @@ namespace gl
 		m_id = GL_NONE;
 	}
 
-	void texture::copy_from(const void* src, texture::format format, texture::type type, int level, const coord3u region, const pixel_unpack_settings& pixel_settings)
+	void texture::copy_from(const rsx::io_buffer& src, texture::format format, texture::type type, int level, const coord3u region, const pixel_unpack_settings& pixel_settings)
 	{
+		ensure(m_samples <= 1, "Transfer operations are unsupported on multisampled textures.");
+
 		pixel_settings.apply();
 
 		switch (const auto target_ = static_cast<GLenum>(m_target))
 		{
 		case GL_TEXTURE_1D:
 		{
-			DSA_CALL(TextureSubImage1D, m_id, GL_TEXTURE_1D, level, region.x, region.width, static_cast<GLenum>(format), static_cast<GLenum>(type), src);
+			DSA_CALL(TextureSubImage1D, m_id, GL_TEXTURE_1D, level, region.x, region.width, static_cast<GLenum>(format), static_cast<GLenum>(type), src.data());
 			break;
 		}
 		case GL_TEXTURE_2D:
 		{
-			DSA_CALL(TextureSubImage2D, m_id, GL_TEXTURE_2D, level, region.x, region.y, region.width, region.height, static_cast<GLenum>(format), static_cast<GLenum>(type), src);
+			DSA_CALL(TextureSubImage2D, m_id, GL_TEXTURE_2D, level, region.x, region.y, region.width, region.height, static_cast<GLenum>(format), static_cast<GLenum>(type), src.data());
 			break;
 		}
 		case GL_TEXTURE_3D:
 		case GL_TEXTURE_2D_ARRAY:
 		{
-			DSA_CALL(TextureSubImage3D, m_id, target_, level, region.x, region.y, region.z, region.width, region.height, region.depth, static_cast<GLenum>(format), static_cast<GLenum>(type), src);
+			DSA_CALL(TextureSubImage3D, m_id, target_, level, region.x, region.y, region.z, region.width, region.height, region.depth, static_cast<GLenum>(format), static_cast<GLenum>(type), src.data());
 			break;
 		}
 		case GL_TEXTURE_CUBE_MAP:
 		{
-			if (get_driver_caps().ARB_dsa_supported)
+			if (get_driver_caps().ARB_direct_state_access_supported)
 			{
-				glTextureSubImage3D(m_id, level, region.x, region.y, region.z, region.width, region.height, region.depth, static_cast<GLenum>(format), static_cast<GLenum>(type), src);
+				glTextureSubImage3D(m_id, level, region.x, region.y, region.z, region.width, region.height, region.depth, static_cast<GLenum>(format), static_cast<GLenum>(type), src.data());
 			}
 			else
 			{
 				rsx_log.warning("Cubemap upload via texture::copy_from is halfplemented!");
-				auto ptr = static_cast<const u8*>(src);
+				auto ptr = static_cast<const u8*>(src.data());
 				const auto end = std::min(6u, region.z + region.depth);
 				for (unsigned face = region.z; face < end; ++face)
 				{
@@ -188,48 +269,73 @@ namespace gl
 		}
 	}
 
-	void texture::copy_from(buffer& buf, u32 gl_format_type, u32 offset, u32 length)
+	void texture::copy_from(buffer& buf, GLsizeiptr offset, texture::format format, texture::type type, int level, const coord3u region, const pixel_unpack_settings& pixel_settings)
 	{
-		if (get_target() != target::textureBuffer)
-			fmt::throw_exception("OpenGL error: texture cannot copy from buffer");
+		ensure(m_samples <= 1, "Transfer operations are unsupported on multisampled textures.");
 
-		DSA_CALL(TextureBufferRange, m_id, GL_TEXTURE_BUFFER, gl_format_type, buf.id(), offset, length);
+		buf.bind(buffer::target::pixel_unpack);
+
+		const rsx::io_buffer src{ reinterpret_cast<void*>(static_cast<uintptr_t>(offset)), buf.size() - offset };
+		copy_from(src, format, type, level, region, pixel_settings);
 	}
 
 	void texture::copy_from(buffer_view& view)
 	{
-		copy_from(*view.value(), view.format(), view.offset(), view.range());
+		if (get_target() != target::textureBuffer)
+			fmt::throw_exception("OpenGL error: texture cannot copy from buffer");
+
+		DSA_CALL(TextureBufferRange, m_id, GL_TEXTURE_BUFFER, view.format(), view.value()->id(), view.offset(), view.range());
 	}
 
-	void texture::copy_to(void* dst, texture::format format, texture::type type, int level, const coord3u& region, const pixel_pack_settings& pixel_settings) const
+	void texture::copy_to(const rsx::io_buffer& dst, texture::format format, texture::type type, int level, const coord3u& region, const pixel_pack_settings& pixel_settings) const
 	{
+		ensure(m_samples <= 1, "Transfer operations are unsupported on multisampled textures.");
+
 		pixel_settings.apply();
 		const auto& caps = get_driver_caps();
+
+		if (caps.RENDERDOC_debug)
+		{
+			const auto msg = fmt::format("glGetTextureSubImage('[%u] %s', %u, %u, %u, %u, %u, %u, %u, %s, %s, %d, %p)",
+				m_id, m_name.c_str(), level, region.x, region.y, region.z, region.width, region.height, region.depth,
+				gl_format_to_str(format), gl_type_to_str(type), s32{ smax }, dst.data());
+			push_debug_label(msg);
+		}
 
 		if (!region.x && !region.y && !region.z &&
 			region.width == m_width && region.height == m_height && region.depth == m_depth)
 		{
-			if (caps.ARB_dsa_supported)
-				glGetTextureImage(m_id, level, static_cast<GLenum>(format), static_cast<GLenum>(type), s32{ smax }, dst);
+			if (caps.ARB_direct_state_access_supported)
+				glGetTextureImage(m_id, level, static_cast<GLenum>(format), static_cast<GLenum>(type), dst.size<GLsizei>(), dst.data());
 			else
-				glGetTextureImageEXT(m_id, static_cast<GLenum>(m_target), level, static_cast<GLenum>(format), static_cast<GLenum>(type), dst);
+				glGetTextureImageEXT(m_id, static_cast<GLenum>(m_target), level, static_cast<GLenum>(format), static_cast<GLenum>(type), dst.data());
 		}
-		else if (caps.ARB_dsa_supported)
+		else if (caps.ARB_direct_state_access_supported)
 		{
 			glGetTextureSubImage(m_id, level, region.x, region.y, region.z, region.width, region.height, region.depth,
-				static_cast<GLenum>(format), static_cast<GLenum>(type), s32{ smax }, dst);
+				static_cast<GLenum>(format), static_cast<GLenum>(type), s32{ smax }, dst.data());
 		}
 		else
 		{
 			// Worst case scenario. For some reason, EXT_dsa does not have glGetTextureSubImage
 			const auto target_ = static_cast<GLenum>(m_target);
-			texture tmp{ target_, region.width, region.height, region.depth, 1, static_cast<GLenum>(m_internal_format) };
+			texture tmp{ target_, region.width, region.height, region.depth, 1, 1, static_cast<GLenum>(m_internal_format), m_format_class };
 			glCopyImageSubData(m_id, target_, level, region.x, region.y, region.z, tmp.id(), target_, 0, 0, 0, 0,
 				region.width, region.height, region.depth);
 
 			const coord3u region2 = { {0, 0, 0}, region.size };
 			tmp.copy_to(dst, format, type, 0, region2, pixel_settings);
 		}
+	}
+
+	void texture::copy_to(buffer& buf, GLsizeiptr offset, texture::format format, texture::type type, int level, const coord3u& region, const pixel_pack_settings& pixel_settings) const
+	{
+		ensure(offset < buf.size(), "PBO write is out of range");
+
+		buf.bind(buffer::target::pixel_pack);
+
+		const rsx::io_buffer dst{ reinterpret_cast<void*>(static_cast<uintptr_t>(offset)), buf.size() - offset };
+		copy_to(dst, format, type, level, region, pixel_settings);
 	}
 
 	void texture_view::create(texture* data, GLenum target, GLenum sized_format, const subresource_range& range, const GLenum* argb_swizzle)
@@ -279,6 +385,34 @@ namespace gl
 			glDeleteTextures(1, &m_id);
 			m_id = GL_NONE;
 		}
+	}
+
+	texture_view* texture_view::as(GLenum format)
+	{
+		if (format == this->m_view_format)
+		{
+			return this;
+		}
+
+		auto self = m_root_view ? m_root_view : this;
+		if (auto found = self->m_subviews.find(format);
+			found != self->m_subviews.end())
+		{
+			return found->second.get();
+		}
+
+		GLenum swizzle_argb[4] =
+		{
+			component_swizzle[3],
+			component_swizzle[0],
+			component_swizzle[1],
+			component_swizzle[2],
+		};
+
+		auto view = std::make_unique<texture_view>(m_image_data, m_target, format, swizzle_argb, m_aspect_flags);
+		auto ret = view.get();
+		self->m_subviews.emplace(format, std::move(view));
+		return ret;
 	}
 
 	void texture_view::bind(gl::command_context& cmd, GLuint layer) const
@@ -332,6 +466,8 @@ namespace gl
 		auto view = std::make_unique<texture_view>(this, swizzle, aspect_flags);
 		auto result = view.get();
 		views.emplace(key, std::move(view));
+
+		result->set_name(fmt::format("%s, remap=%x", name(), remap.encoded));
 		return result;
 	}
 

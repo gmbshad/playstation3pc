@@ -2,10 +2,7 @@
 #include "ps_move_handler.h"
 #include "ps_move_calibration.h"
 #include "Emu/Io/pad_config.h"
-#include "Emu/System.h"
-#include "Emu/system_config.h"
 #include "Emu/Cell/Modules/cellGem.h"
-#include "Input/ps_move_config.h"
 
 LOG_CHANNEL(move_log, "Move");
 
@@ -155,7 +152,7 @@ void ps_move_handler::init_config(cfg_pad* cfg)
 	cfg->rs_up.def    = ::at32(button_list, ps_move_key_codes::none);
 	cfg->start.def    = ::at32(button_list, ps_move_key_codes::start);
 	cfg->select.def   = ::at32(button_list, ps_move_key_codes::select);
-	cfg->ps.def       = ::at32(button_list, ps_move_key_codes::ps);
+	cfg->ps.def       = cfg_pad::make_button_string(button_list, {{ps_move_key_codes::ps}, {ps_move_key_codes::start, ps_move_key_codes::select}});
 	cfg->square.def   = ::at32(button_list, ps_move_key_codes::square);
 	cfg->cross.def    = ::at32(button_list, ps_move_key_codes::cross);
 	cfg->circle.def   = ::at32(button_list, ps_move_key_codes::circle);
@@ -178,6 +175,9 @@ void ps_move_handler::init_config(cfg_pad* cfg)
 	cfg->rstickdeadzone.def    = 40; // between 0 and 255
 	cfg->ltriggerthreshold.def = 0;  // between 0 and 255
 	cfg->rtriggerthreshold.def = 0;  // between 0 and 255
+
+	// We have to enable orientation by default
+	cfg->orientation_enabled.def = true;
 
 	// apply defaults
 	cfg->from_default();
@@ -268,7 +268,7 @@ hid_device* ps_move_handler::connect_move_device(ps_move_device* device, std::st
 }
 #endif
 
-void ps_move_handler::check_add_device(hid_device* hidDevice, std::string_view path, std::wstring_view wide_serial)
+void ps_move_handler::check_add_device(hid_device* hidDevice, hid_enumerated_device_view path, std::wstring_view wide_serial)
 {
 #ifndef _WIN32
 	if (!hidDevice)
@@ -306,7 +306,7 @@ void ps_move_handler::check_add_device(hid_device* hidDevice, std::string_view p
 	if (hid_set_nonblocking(hidDevice, 1) == -1)
 	{
 		move_log.error("check_add_device: hid_set_nonblocking failed! Reason: %s", hid_error(hidDevice));
-		hid_close(hidDevice);
+		HidDevice::close(hidDevice);
 		return;
 	}
 #endif
@@ -425,7 +425,7 @@ ps_move_handler::DataStatus ps_move_handler::get_data(ps_move_device* device)
 PadHandlerBase::connection ps_move_handler::update_connection(const std::shared_ptr<PadDevice>& device)
 {
 	ps_move_device* move_device = static_cast<ps_move_device*>(device.get());
-	if (!move_device || move_device->path.empty())
+	if (!move_device || move_device->path == hid_enumerated_device_default)
 		return connection::disconnected;
 
 	if (move_device->hidDevice == nullptr)
@@ -437,13 +437,12 @@ PadHandlerBase::connection ps_move_handler::update_connection(const std::shared_
 			move_device->hidDevice = dev;
 		}
 #else
-		if (hid_device* dev = hid_open_path(move_device->path.c_str()))
+		if (hid_device* dev = move_device->open())
 		{
 			if (hid_set_nonblocking(dev, 1) == -1)
 			{
 				move_log.error("Reconnecting Device %s: hid_set_nonblocking failed with error %s", move_device->path, hid_error(dev));
 			}
-			move_device->hidDevice = dev;
 		}
 #endif
 		else
@@ -581,21 +580,21 @@ void ps_move_handler::handle_external_device(const pad_ensemble& binding)
 	move_data.external_device_write_requested = false;
 }
 
-bool ps_move_handler::get_is_left_trigger(const std::shared_ptr<PadDevice>& /*device*/, u64 keyCode)
+bool ps_move_handler::get_is_left_trigger(const std::shared_ptr<PadDevice>& /*device*/, u32 keyCode)
 {
 	// We also report the T button as left trigger
 	return keyCode == ps_move_key_codes::L2 || keyCode == ps_move_key_codes::t;
 }
 
-bool ps_move_handler::get_is_right_trigger(const std::shared_ptr<PadDevice>& /*device*/, u64 keyCode)
+bool ps_move_handler::get_is_right_trigger(const std::shared_ptr<PadDevice>& /*device*/, u32 keyCode)
 {
 	// We also report the Throttle button as right trigger
 	return keyCode == ps_move_key_codes::R2 || keyCode == ps_move_key_codes::throttle;
 }
 
-std::unordered_map<u64, u16> ps_move_handler::get_button_values(const std::shared_ptr<PadDevice>& device)
+std::unordered_map<u32, u16> ps_move_handler::get_button_values(const std::shared_ptr<PadDevice>& device)
 {
-	std::unordered_map<u64, u16> key_buf;
+	std::unordered_map<u32, u16> key_buf;
 	ps_move_device* dev = static_cast<ps_move_device*>(device.get());
 	if (!dev)
 		return key_buf;
@@ -612,7 +611,17 @@ std::unordered_map<u64, u16> ps_move_handler::get_button_values(const std::share
 	const u16 extra_buttons = input.sequence_number << 8 | input.buttons_3;
 	key_buf[ps_move_key_codes::ps]   = (extra_buttons & button_flags::ps)   ? 255 : 0;
 	key_buf[ps_move_key_codes::move] = (extra_buttons & button_flags::move) ? 255 : 0;
-	key_buf[ps_move_key_codes::t]    = (extra_buttons & button_flags::t)    ? input.trigger_2 : 0;
+
+	u16 trigger = 0;
+	if (extra_buttons & button_flags::t)
+	{
+		switch (dev->model)
+		{
+		case ps_move_model::ZCM1: trigger = (input.trigger_1 + input.trigger_2) / 2; break;
+		case ps_move_model::ZCM2: trigger = input.trigger_1; break;
+		}
+	}
+	key_buf[ps_move_key_codes::t] = trigger;
 
 	dev->battery_level = input.battery_level;
 
@@ -679,12 +688,20 @@ void ps_move_handler::get_extended_info(const pad_ensemble& binding)
 
 	if (dev->model == ps_move_model::ZCM1)
 	{
-		accel_x -= static_cast<f32>(zero_shift);
-		accel_y -= static_cast<f32>(zero_shift);
-		accel_z -= static_cast<f32>(zero_shift);
-		gyro_x -= static_cast<f32>(zero_shift);
-		gyro_y -= static_cast<f32>(zero_shift);
-		gyro_z -= static_cast<f32>(zero_shift);
+		const auto decode_16bit = [](s16 val)
+		{
+			const u8* data = reinterpret_cast<const u8*>(&val);
+			const u8 low = data[0] & 0xFF;
+			const u8 high = data[1] & 0xFF;
+			const s32 res = (low | (high << 8)) - zero_shift;
+			return static_cast<f32>(res);
+		};
+		accel_x = decode_16bit(input.accel_x_1);
+		accel_y = decode_16bit(input.accel_y_1);
+		accel_z = decode_16bit(input.accel_z_1);
+		gyro_x  = decode_16bit(input.gyro_x_1);
+		gyro_y  = decode_16bit(input.gyro_y_1);
+		gyro_z  = decode_16bit(input.gyro_z_1);
 	}
 
 	if (!device->config || !device->config->orientation_enabled)
@@ -715,21 +732,21 @@ void ps_move_handler::get_extended_info(const pad_ensemble& binding)
 			gyro_z /= MOVE_ONE_G;
 		}
 
-		pad->move_data.accelerometer_x = accel_x;
-		pad->move_data.accelerometer_y = accel_y;
-		pad->move_data.accelerometer_z = accel_z;
-		pad->move_data.gyro_x = gyro_x;
-		pad->move_data.gyro_y = gyro_y;
-		pad->move_data.gyro_z = gyro_z;
+		pad->move_data.accelerometer.x() = accel_x;
+		pad->move_data.accelerometer.y() = accel_y;
+		pad->move_data.accelerometer.z() = accel_z;
+		pad->move_data.gyro.x() = gyro_x;
+		pad->move_data.gyro.y() = gyro_y;
+		pad->move_data.gyro.z() = gyro_z;
 
 		if (dev->model == ps_move_model::ZCM1)
 		{
 			const ps_move_input_report_ZCM1& input_zcm1 = dev->input_report_ZCM1;
 
 			#define TWELVE_BIT_SIGNED(x) (((x) & 0x800) ? (-(((~(x)) & 0xFFF) + 1)) : (x))
-			pad->move_data.magnetometer_x = static_cast<f32>(TWELVE_BIT_SIGNED(((input.magnetometer_x & 0x0F) << 8) | input_zcm1.magnetometer_x2));
-			pad->move_data.magnetometer_y = static_cast<f32>(TWELVE_BIT_SIGNED((input_zcm1.magnetometer_y << 4) | (input_zcm1.magnetometer_yz & 0xF0) >> 4));
-			pad->move_data.magnetometer_z = static_cast<f32>(TWELVE_BIT_SIGNED(((input_zcm1.magnetometer_yz & 0x0F) << 8) | input_zcm1.magnetometer_z));
+			pad->move_data.magnetometer.x() = static_cast<f32>(TWELVE_BIT_SIGNED(((input.magnetometer_x & 0x0F) << 8) | input_zcm1.magnetometer_x2));
+			pad->move_data.magnetometer.y() = static_cast<f32>(TWELVE_BIT_SIGNED((input_zcm1.magnetometer_y << 4) | (input_zcm1.magnetometer_yz & 0xF0) >> 4));
+			pad->move_data.magnetometer.z() = static_cast<f32>(TWELVE_BIT_SIGNED(((input_zcm1.magnetometer_yz & 0x0F) << 8) | input_zcm1.magnetometer_z));
 		}
 	}
 
@@ -743,7 +760,7 @@ void ps_move_handler::get_extended_info(const pad_ensemble& binding)
 	handle_external_device(binding);
 }
 
-pad_preview_values ps_move_handler::get_preview_values(const std::unordered_map<u64, u16>& data)
+pad_preview_values ps_move_handler::get_preview_values(const std::unordered_map<u32, u16>& data, const std::vector<std::string>& /*buttons*/)
 {
 	return {
 		std::max(::at32(data, ps_move_key_codes::L2), ::at32(data, ps_move_key_codes::t)),
@@ -820,9 +837,7 @@ void ps_move_handler::apply_pad_data(const pad_ensemble& binding)
 
 	cfg_pad* config = dev->config;
 
-	const int idx_l = config->switch_vibration_motors ? 1 : 0;
-
-	const u8 speed_large = config->enable_vibration_motor_large ? pad->m_vibrateMotors[idx_l].m_value : 0;
+	const u8 speed_large = config->get_large_motor_speed(pad->m_vibrate_motors);
 
 	dev->new_output_data |= dev->large_motor != speed_large;
 	dev->large_motor = speed_large;

@@ -1,14 +1,12 @@
+#include "Emu/NP/rpcn_types.h"
 #include "stdafx.h"
-#include "Emu/Cell/PPUModule.h"
-#include "Emu/Cell/lv2/sys_sync.h"
-#include "Emu/Cell/Modules/cellSysutil.h"
+#include "Emu/Cell/PPUCallback.h"
 #include "Emu/Memory/vm_ptr.h"
 #include "Emu/IdManager.h"
 #include "np_handler.h"
 #include "np_contexts.h"
-#include "np_helpers.h"
 #include "np_structs_extra.h"
-#include "fb_helpers.h"
+#include "pb_helpers.h"
 
 LOG_CHANNEL(rpcn_log, "rpcn");
 
@@ -159,24 +157,20 @@ namespace np
 		return CELL_OK;
 	}
 
-	bool np_handler::reply_create_room_gui(u32 req_id, std::vector<u8>& reply_data)
+	void np_handler::reply_create_room_gui(u32 req_id, rpcn::ErrorType error, vec_stream& reply)
 	{
 		auto ctx = take_pending_gui_request(req_id);
 
 		if (!ctx)
-			return true;
+			return;
 
-		ensure(!rpcn::is_error(static_cast<rpcn::ErrorType>(reply_data[0])), "Unexpected error in CreateRoomGUI reply");
-
-		vec_stream reply(reply_data, 1);
-		const auto* resp = reply.get_flatbuffer<MatchingRoomStatus>();
-
-		if (reply.is_error())
-			return error_and_disconnect("Malformed reply to CreateRoomGUI command");
+		ensure(error == rpcn::ErrorType::NoError, "Unexpected error in CreateRoomGUI reply");
+		const auto resp = reply.get_protobuf<np2_structs::MatchingRoomStatus>();
+		ensure(!reply.is_error(), "Malformed reply to CreateRoomGUI command");
 
 		event_data edata(np_memory.allocate(MAX_SceNpMatchingJoinedRoomInfo_SIZE), sizeof(SceNpMatchingJoinedRoomInfo), MAX_SceNpMatchingJoinedRoomInfo_SIZE);
 		auto* room_info = reinterpret_cast<SceNpMatchingJoinedRoomInfo*>(edata.data());
-		MatchingRoomStatus_to_SceNpMatchingJoinedRoomInfo(edata, resp, room_info);
+		MatchingRoomStatus_to_SceNpMatchingJoinedRoomInfo(edata, *resp, room_info);
 		np_memory.shrink_allocation(edata.addr(), edata.size());
 
 		gui_cache.add_room(room_info->room_status.id);
@@ -185,8 +179,6 @@ namespace np
 		set_gui_result(SCE_NP_MATCHING_GUI_EVENT_CREATE_ROOM, std::move(edata));
 		ctx->queue_gui_callback(SCE_NP_MATCHING_GUI_EVENT_CREATE_ROOM, 0);
 		gui_epilog(ctx);
-
-		return true;
 	}
 
 	error_code np_handler::join_room_gui(u32 ctx_id, vm::ptr<SceNpRoomId> roomid, vm::ptr<SceNpMatchingGUIHandler> handler, vm::ptr<void> arg)
@@ -204,48 +196,46 @@ namespace np
 		return CELL_OK;
 	}
 
-	bool np_handler::reply_join_room_gui(u32 req_id, std::vector<u8>& reply_data)
+	void np_handler::reply_join_room_gui(u32 req_id, rpcn::ErrorType error, vec_stream& reply)
 	{
 		auto ctx = take_pending_gui_request(req_id);
 
 		if (!ctx)
-			return true;
+			return;
 
-		if (rpcn::is_error(static_cast<rpcn::ErrorType>(reply_data[0])))
+		s32 error_code = CELL_OK;
+
+		switch (error)
 		{
-			s32 error = -1;
-
-			switch (static_cast<rpcn::ErrorType>(reply_data[0]))
-			{
-			case rpcn::ErrorType::RoomMissing:
-				error = SCE_NP_MATCHING_SERVER_ERROR_NO_SUCH_ROOM;
-				break;
-			case rpcn::ErrorType::RoomFull:
-				// Might also be SCE_NP_MATCHING_SERVER_ERROR_ACCESS_FORBIDDEN or SCE_NP_MATCHING_SERVER_ERROR_NOT_ALLOWED ?
-				error = SCE_NP_MATCHING_SERVER_ERROR_ROOM_CLOSED;
-				break;
-			case rpcn::ErrorType::RoomAlreadyJoined:
-				error = SCE_NP_MATCHING_SERVER_ERROR_ACCESS_FORBIDDEN;
-				break;
-			default:
-				fmt::throw_exception("Unexpected error in JoinRoomGUI reply: %d", reply_data[0]);
-				break;
-			}
-
-			ctx->queue_gui_callback(SCE_NP_MATCHING_GUI_EVENT_JOIN_ROOM, error);
-			gui_epilog(ctx);
-			return true;
+		case rpcn::ErrorType::NoError: break;
+		case rpcn::ErrorType::RoomMissing:
+			error_code = SCE_NP_MATCHING_SERVER_ERROR_NO_SUCH_ROOM;
+			break;
+		case rpcn::ErrorType::RoomFull:
+			// Might also be SCE_NP_MATCHING_SERVER_ERROR_ACCESS_FORBIDDEN or SCE_NP_MATCHING_SERVER_ERROR_NOT_ALLOWED ?
+			error_code = SCE_NP_MATCHING_SERVER_ERROR_ROOM_CLOSED;
+			break;
+		case rpcn::ErrorType::RoomAlreadyJoined:
+			error_code = SCE_NP_MATCHING_SERVER_ERROR_ACCESS_FORBIDDEN;
+			break;
+		default:
+			fmt::throw_exception("Unexpected error in JoinRoomGUI reply: %d", static_cast<u8>(error));
+			break;
 		}
 
-		vec_stream reply(reply_data, 1);
-		const auto* resp = reply.get_flatbuffer<MatchingRoomStatus>();
+		if (error_code != 0)
+		{
+			ctx->queue_gui_callback(SCE_NP_MATCHING_GUI_EVENT_JOIN_ROOM, error_code);
+			gui_epilog(ctx);
+			return;
+		}
 
-		if (reply.is_error())
-			return error_and_disconnect("Malformed reply to JoinRoomGUI command");
+		const auto resp = reply.get_protobuf<np2_structs::MatchingRoomStatus>();
+		ensure(!reply.is_error(), "Malformed reply to JoinRoomGUI command");
 
 		event_data edata(np_memory.allocate(MAX_SceNpMatchingJoinedRoomInfo_SIZE), sizeof(SceNpMatchingJoinedRoomInfo), MAX_SceNpMatchingJoinedRoomInfo_SIZE);
 		auto* room_info = reinterpret_cast<SceNpMatchingJoinedRoomInfo*>(edata.data());
-		MatchingRoomStatus_to_SceNpMatchingJoinedRoomInfo(edata, resp, room_info);
+		MatchingRoomStatus_to_SceNpMatchingJoinedRoomInfo(edata, *resp, room_info);
 		np_memory.shrink_allocation(edata.addr(), edata.size());
 
 		extra_nps::print_SceNpMatchingJoinedRoomInfo(room_info);
@@ -260,8 +250,6 @@ namespace np
 		set_gui_result(SCE_NP_MATCHING_GUI_EVENT_JOIN_ROOM, std::move(edata));
 		ctx->queue_gui_callback(SCE_NP_MATCHING_GUI_EVENT_JOIN_ROOM, 0);
 		gui_epilog(ctx);
-
-		return true;
 	}
 
 	error_code np_handler::leave_room_gui(u32 ctx_id, vm::cptr<SceNpRoomId> roomid)
@@ -281,49 +269,46 @@ namespace np
 		return not_an_error(req_id);
 	}
 
-	bool np_handler::reply_leave_room_gui(u32 req_id, std::vector<u8>& reply_data)
+	void np_handler::reply_leave_room_gui(u32 req_id, rpcn::ErrorType error, vec_stream& reply)
 	{
 		auto ctx = take_pending_gui_request(req_id);
 
 		if (!ctx)
-			return true;
+			return;
 
-		if (rpcn::is_error(static_cast<rpcn::ErrorType>(reply_data[0])))
+		s32 error_code = CELL_OK;
+
+		switch (error)
 		{
-			s32 error = -1;
-
-			switch (static_cast<rpcn::ErrorType>(reply_data[0]))
-			{
-			case rpcn::ErrorType::NotFound:
-				error = SCE_NP_MATCHING_SERVER_ERROR_NO_SUCH_ROOM;
-				break;
-			default:
-				fmt::throw_exception("Unexpected error in LeaveRoomGUI reply: %d", reply_data[0]);
-				break;
-			}
-
-			ctx->queue_callback(req_id, SCE_NP_MATCHING_EVENT_LEAVE_ROOM_DONE, error);
-			return true;
+		case rpcn::ErrorType::NoError: break;
+		case rpcn::ErrorType::RoomMissing: error_code = SCE_NP_MATCHING_SERVER_ERROR_NO_SUCH_ROOM; break;
+		default: fmt::throw_exception("Unexpected error in LeaveRoomGUI reply: %d", static_cast<u8>(error));
 		}
 
-		vec_stream reply(reply_data, 1);
-		const auto* resp = reply.get_flatbuffer<MatchingRoomStatus>();
+		if (error_code != CELL_OK)
+		{
+			ctx->queue_callback(req_id, SCE_NP_MATCHING_EVENT_LEAVE_ROOM_DONE, error_code);
+			return;
+		}
 
-		if (reply.is_error())
-			return error_and_disconnect("Malformed reply to LeaveRoomGUI command");
+		const auto resp = reply.get_protobuf<np2_structs::MatchingRoomStatus>();
+		ensure(!reply.is_error(), "Malformed reply to LeaveRoomGUI command");
 
 		event_data edata(np_memory.allocate(MAX_SceNpMatchingRoomStatus_SIZE), sizeof(SceNpMatchingRoomStatus), MAX_SceNpMatchingRoomStatus_SIZE);
 		auto* room_status = reinterpret_cast<SceNpMatchingRoomStatus*>(edata.data());
-		MatchingRoomStatus_to_SceNpMatchingRoomStatus(edata, resp, room_status);
+		MatchingRoomStatus_to_SceNpMatchingRoomStatus(edata, *resp, room_status);
 		np_memory.shrink_allocation(edata.addr(), edata.size());
 
 		extra_nps::print_SceNpMatchingRoomStatus(room_status);
 
 		gui_cache.del_room(room_status->id);
 
-		gui_notifications.list.emplace(std::make_pair(gui_notifications.current_gui_ctx_id, req_id), gui_notification{.event = SCE_NP_MATCHING_EVENT_LEAVE_ROOM_DONE, .edata = std::move(edata)});
+		{
+			std::lock_guard lock(gui_notifications.mutex);
+			gui_notifications.list.emplace(std::make_pair(gui_notifications.current_gui_ctx_id, req_id), gui_notification{.event = SCE_NP_MATCHING_EVENT_LEAVE_ROOM_DONE, .edata = std::move(edata)});
+		}
+
 		ctx->queue_callback(req_id, SCE_NP_MATCHING_EVENT_LEAVE_ROOM_DONE, 0);
-		return true;
 	}
 
 	error_code np_handler::get_room_list_gui(u32 ctx_id, vm::cptr<SceNpCommunicationId> communicationId, vm::ptr<SceNpMatchingReqRange> range, vm::ptr<SceNpMatchingSearchCondition> cond, vm::ptr<SceNpMatchingAttr> attr, vm::ptr<SceNpMatchingGUIHandler> handler, vm::ptr<void> arg, bool limit)
@@ -354,24 +339,20 @@ namespace np
 		return CELL_OK;
 	}
 
-	bool np_handler::reply_get_room_list_gui(u32 req_id, std::vector<u8>& reply_data)
+	void np_handler::reply_get_room_list_gui(u32 req_id, rpcn::ErrorType error, vec_stream& reply)
 	{
 		auto ctx = take_pending_gui_request(req_id);
 
 		if (!ctx)
-			return true;
+			return;
 
-		ensure(!rpcn::is_error(static_cast<rpcn::ErrorType>(reply_data[0])), "Unexpected error in GetRoomListGUI reply");
-
-		vec_stream reply(reply_data, 1);
-		const auto* resp = reply.get_flatbuffer<MatchingRoomList>();
-
-		if (reply.is_error())
-			return error_and_disconnect("Malformed reply to GetRoomListGUI command");
+		ensure(error == rpcn::ErrorType::NoError, "Unexpected error in GetRoomListGUI reply");
+		const auto resp = reply.get_protobuf<np2_structs::MatchingRoomList>();
+		ensure(!reply.is_error(), "Malformed reply to GetRoomListGUI command");
 
 		event_data edata(np_memory.allocate(MAX_SceNpMatchingRoomList_SIZE), sizeof(SceNpMatchingRoomList), MAX_SceNpMatchingRoomList_SIZE);
 		auto* room_list = reinterpret_cast<SceNpMatchingRoomList*>(edata.data());
-		MatchingRoomList_to_SceNpMatchingRoomList(edata, resp, room_list);
+		MatchingRoomList_to_SceNpMatchingRoomList(edata, *resp, room_list);
 		np_memory.shrink_allocation(edata.addr(), edata.size());
 
 		extra_nps::print_SceNpMatchingRoomList(room_list);
@@ -388,7 +369,6 @@ namespace np
 		}
 
 		gui_epilog(ctx);
-		return true;
 	}
 
 	error_code np_handler::set_room_search_flag_gui(u32 ctx_id, vm::ptr<SceNpLobbyId> /* lobby_id */, vm::ptr<SceNpRoomId> room_id, s32 flag)
@@ -408,33 +388,24 @@ namespace np
 		return not_an_error(req_id);
 	}
 
-	bool np_handler::reply_set_room_search_flag_gui(u32 req_id, std::vector<u8>& reply_data)
+	void np_handler::reply_set_room_search_flag_gui(u32 req_id, rpcn::ErrorType error)
 	{
 		auto ctx = take_pending_gui_request(req_id);
 
 		if (!ctx)
-			return true;
+			return;
 
-		s32 error = 0;
+		s32 error_code = CELL_OK;
 
-		if (rpcn::is_error(static_cast<rpcn::ErrorType>(reply_data[0])))
+		switch (error)
 		{
-			switch (static_cast<rpcn::ErrorType>(reply_data[0]))
-			{
-			case rpcn::ErrorType::NotFound:
-				error = SCE_NP_MATCHING_SERVER_ERROR_NO_SUCH_ROOM;
-				break;
-			case rpcn::ErrorType::Unauthorized:
-				error = SCE_NP_MATCHING_SERVER_ERROR_NOT_ALLOWED;
-				break;
-			default:
-				fmt::throw_exception("Unexpected error in SetRoomSearchFlagGUI reply: %d", reply_data[0]);
-				break;
-			}
+		case rpcn::ErrorType::NoError: break;
+		case rpcn::ErrorType::RoomMissing: error_code = SCE_NP_MATCHING_SERVER_ERROR_NO_SUCH_ROOM; break;
+		case rpcn::ErrorType::Unauthorized: error_code = SCE_NP_MATCHING_SERVER_ERROR_NOT_ALLOWED; break;
+		default: fmt::throw_exception("Unexpected error in SetRoomSearchFlagGUI reply: %d", static_cast<u8>(error));
 		}
 
-		ctx->queue_callback(req_id, SCE_NP_MATCHING_EVENT_SET_ROOM_SEARCH_FLAG_DONE, error);
-		return true;
+		ctx->queue_callback(req_id, SCE_NP_MATCHING_EVENT_SET_ROOM_SEARCH_FLAG_DONE, error_code);
 	}
 
 	error_code np_handler::get_room_search_flag_gui(u32 ctx_id, vm::ptr<SceNpLobbyId> /* lobby_id */, vm::ptr<SceNpRoomId> room_id)
@@ -454,47 +425,44 @@ namespace np
 		return not_an_error(req_id);
 	}
 
-	bool np_handler::reply_get_room_search_flag_gui(u32 req_id, std::vector<u8>& reply_data)
+	void np_handler::reply_get_room_search_flag_gui(u32 req_id, rpcn::ErrorType error, vec_stream& reply)
 	{
 		auto ctx = take_pending_gui_request(req_id);
 
 		if (!ctx)
-			return true;
+			return;
 
-		if (rpcn::is_error(static_cast<rpcn::ErrorType>(reply_data[0])))
+		s32 error_code = CELL_OK;
+
+		switch (error)
 		{
-			s32 error = -1;
-
-			switch (static_cast<rpcn::ErrorType>(reply_data[0]))
-			{
-			case rpcn::ErrorType::NotFound:
-				error = SCE_NP_MATCHING_SERVER_ERROR_NO_SUCH_ROOM;
-				break;
-			default:
-				fmt::throw_exception("Unexpected error in GetRoomSearchFlagGUI reply: %d", reply_data[0]);
-				break;
-			}
-
-			ctx->queue_callback(req_id, SCE_NP_MATCHING_EVENT_GET_ROOM_SEARCH_FLAG_DONE, error);
-			return true;
+		case rpcn::ErrorType::NoError: break;
+		case rpcn::ErrorType::RoomMissing: error_code = SCE_NP_MATCHING_SERVER_ERROR_NO_SUCH_ROOM; break;
+		default: fmt::throw_exception("Unexpected error in GetRoomSearchFlagGUI reply: %d", static_cast<u8>(error));
 		}
 
-		vec_stream reply(reply_data, 1);
-		const auto* resp = reply.get_flatbuffer<MatchingRoom>();
+		if (error_code != CELL_OK)
+		{
+			ctx->queue_callback(req_id, SCE_NP_MATCHING_EVENT_GET_ROOM_SEARCH_FLAG_DONE, error_code);
+			return;
+		}
 
-		if (reply.is_error())
-			return error_and_disconnect("Malformed reply to GetRoomSearchFlagGUI command");
+		const auto resp = reply.get_protobuf<np2_structs::MatchingRoom>();
+		ensure(!reply.is_error(), "Malformed reply to GetRoomSearchFlagGUI command");
 
 		event_data edata(np_memory.allocate(MAX_SceNpMatchingRoom_SIZE), sizeof(SceNpMatchingRoom), MAX_SceNpMatchingRoom_SIZE);
 		auto* room_info = reinterpret_cast<SceNpMatchingRoom*>(edata.data());
-		MatchingRoom_to_SceNpMatchingRoom(edata, resp, room_info);
+		MatchingRoom_to_SceNpMatchingRoom(edata, *resp, room_info);
 		np_memory.shrink_allocation(edata.addr(), edata.size());
 
 		extra_nps::print_SceNpMatchingRoom(room_info);
 
-		gui_notifications.list.emplace(std::make_pair(gui_notifications.current_gui_ctx_id, req_id), gui_notification{.event = SCE_NP_MATCHING_EVENT_GET_ROOM_SEARCH_FLAG_DONE, .edata = std::move(edata)});
+		{
+			std::lock_guard lock(gui_notifications.mutex);
+			gui_notifications.list.emplace(std::make_pair(gui_notifications.current_gui_ctx_id, req_id), gui_notification{.event = SCE_NP_MATCHING_EVENT_GET_ROOM_SEARCH_FLAG_DONE, .edata = std::move(edata)});
+		}
+
 		ctx->queue_callback(req_id, SCE_NP_MATCHING_EVENT_GET_ROOM_SEARCH_FLAG_DONE, 0);
-		return true;
 	}
 
 	error_code np_handler::set_room_info_gui(u32 ctx_id, vm::ptr<SceNpLobbyId> /* lobby_id */, vm::ptr<SceNpRoomId> room_id, vm::ptr<SceNpMatchingAttr> attr)
@@ -519,33 +487,24 @@ namespace np
 		return not_an_error(req_id);
 	}
 
-	bool np_handler::reply_set_room_info_gui(u32 req_id, std::vector<u8>& reply_data)
+	void np_handler::reply_set_room_info_gui(u32 req_id, rpcn::ErrorType error)
 	{
 		auto ctx = take_pending_gui_request(req_id);
 
 		if (!ctx)
-			return true;
+			return;
 
-		s32 error = 0;
+		s32 error_code = CELL_OK;
 
-		if (rpcn::is_error(static_cast<rpcn::ErrorType>(reply_data[0])))
+		switch (error)
 		{
-			switch (static_cast<rpcn::ErrorType>(reply_data[0]))
-			{
-			case rpcn::ErrorType::NotFound:
-				error = SCE_NP_MATCHING_SERVER_ERROR_NO_SUCH_ROOM;
-				break;
-			case rpcn::ErrorType::Unauthorized:
-				error = SCE_NP_MATCHING_SERVER_ERROR_NOT_ALLOWED;
-				break;
-			default:
-				fmt::throw_exception("Unexpected error in SetRoomInfoGUI reply: %d", reply_data[0]);
-				break;
-			}
+		case rpcn::ErrorType::NoError: break;
+		case rpcn::ErrorType::RoomMissing: error_code = SCE_NP_MATCHING_SERVER_ERROR_NO_SUCH_ROOM; break;
+		case rpcn::ErrorType::Unauthorized: error_code = SCE_NP_MATCHING_SERVER_ERROR_NOT_ALLOWED; break;
+		default: fmt::throw_exception("Unexpected error in SetRoomInfoGUI reply: %d", static_cast<u8>(error));
 		}
 
-		ctx->queue_callback(req_id, SCE_NP_MATCHING_EVENT_SET_ROOM_INFO_DONE, error);
-		return true;
+		ctx->queue_callback(req_id, SCE_NP_MATCHING_EVENT_SET_ROOM_INFO_DONE, error_code);
 	}
 
 	error_code np_handler::get_room_info_gui(u32 ctx_id, vm::ptr<SceNpLobbyId> /* lobby_id */, vm::ptr<SceNpRoomId> room_id, vm::ptr<SceNpMatchingAttr> attr)
@@ -565,47 +524,44 @@ namespace np
 		return not_an_error(req_id);
 	}
 
-	bool np_handler::reply_get_room_info_gui(u32 req_id, std::vector<u8>& reply_data)
+	void np_handler::reply_get_room_info_gui(u32 req_id, rpcn::ErrorType error, vec_stream& reply)
 	{
 		auto ctx = take_pending_gui_request(req_id);
 
 		if (!ctx)
-			return true;
+			return;
 
-		if (rpcn::is_error(static_cast<rpcn::ErrorType>(reply_data[0])))
+		s32 error_code = CELL_OK;
+
+		switch (error)
 		{
-			s32 error = -1;
-
-			switch (static_cast<rpcn::ErrorType>(reply_data[0]))
-			{
-			case rpcn::ErrorType::NotFound:
-				error = SCE_NP_MATCHING_SERVER_ERROR_NO_SUCH_ROOM;
-				break;
-			default:
-				fmt::throw_exception("Unexpected error in GetRoomInfoGUI reply: %d", reply_data[0]);
-				break;
-			}
-
-			ctx->queue_callback(req_id, SCE_NP_MATCHING_EVENT_GET_ROOM_INFO_DONE, error);
-			return true;
+		case rpcn::ErrorType::NoError: break;
+		case rpcn::ErrorType::RoomMissing: error_code = SCE_NP_MATCHING_SERVER_ERROR_NO_SUCH_ROOM; break;
+		default: fmt::throw_exception("Unexpected error in GetRoomInfoGUI reply: %d", static_cast<u8>(error));
 		}
 
-		vec_stream reply(reply_data, 1);
-		const auto* resp = reply.get_flatbuffer<MatchingRoom>();
+		if (error_code != CELL_OK)
+		{
+			ctx->queue_callback(req_id, SCE_NP_MATCHING_EVENT_GET_ROOM_INFO_DONE, error_code);
+			return;
+		}
 
-		if (reply.is_error())
-			return error_and_disconnect("Malformed reply to GetRoomInfoGUI command");
+		const auto resp = reply.get_protobuf<np2_structs::MatchingRoom>();
+		ensure(!reply.is_error(), "Malformed reply to GetRoomInfoGUI command");
 
 		event_data edata(np_memory.allocate(MAX_SceNpMatchingRoom_SIZE), sizeof(SceNpMatchingRoom), MAX_SceNpMatchingRoom_SIZE);
 		auto* room_info = reinterpret_cast<SceNpMatchingRoom*>(edata.data());
-		MatchingRoom_to_SceNpMatchingRoom(edata, resp, room_info);
+		MatchingRoom_to_SceNpMatchingRoom(edata, *resp, room_info);
 		np_memory.shrink_allocation(edata.addr(), edata.size());
 
 		extra_nps::print_SceNpMatchingRoom(room_info);
 
-		gui_notifications.list.emplace(std::make_pair(gui_notifications.current_gui_ctx_id, req_id), gui_notification{.event = SCE_NP_MATCHING_EVENT_GET_ROOM_INFO_DONE, .edata = std::move(edata)});
+		{
+			std::lock_guard lock(gui_notifications.mutex);
+			gui_notifications.list.emplace(std::make_pair(gui_notifications.current_gui_ctx_id, req_id), gui_notification{.event = SCE_NP_MATCHING_EVENT_GET_ROOM_INFO_DONE, .edata = std::move(edata)});
+		}
+
 		ctx->queue_callback(req_id, SCE_NP_MATCHING_EVENT_GET_ROOM_INFO_DONE, 0);
-		return true;
 	}
 
 	error_code np_handler::quickmatch_gui(u32 ctx_id, vm::cptr<SceNpCommunicationId> communicationId, vm::cptr<SceNpMatchingSearchCondition> cond, s32 available_num, s32 timeout, vm::ptr<SceNpMatchingGUIHandler> handler, vm::ptr<void> arg)
@@ -624,26 +580,26 @@ namespace np
 		return CELL_OK;
 	}
 
-	bool np_handler::reply_quickmatch_gui(u32 req_id, std::vector<u8>& reply_data)
+	void np_handler::reply_quickmatch_gui(u32 req_id, rpcn::ErrorType error, vec_stream& reply)
 	{
 		auto ctx = take_pending_gui_request(req_id);
 
 		if (!ctx)
-			return true;
+			return;
 
-		ensure(!rpcn::is_error(static_cast<rpcn::ErrorType>(reply_data[0])), "Unexpected error in QuickMatchGUI reply");
-
-		vec_stream reply(reply_data, 1);
-		const auto* resp = reply.get_flatbuffer<MatchingGuiRoomId>();
-
-		if (reply.is_error())
-			return error_and_disconnect("Malformed reply to QuickMatchGUI command");
+		ensure(error == rpcn::ErrorType::NoError, "Unexpected error in QuickMatchGUI reply");
+		const auto resp = reply.get_protobuf<np2_structs::MatchingGuiRoomId>();
+		ensure(!reply.is_error(), "Malformed reply to QuickMatchGUI command");
 
 		SceNpRoomId room_id{};
-		ensure(resp->id() && resp->id()->size() == sizeof(SceNpRoomId::opt));
-		std::memcpy(room_id.opt, resp->id()->data(), sizeof(SceNpRoomId::opt));
-		const auto [_, inserted] = pending_quickmatching.insert_or_assign(room_id, ctx->ctx_id);
-		ensure(inserted);
+		ensure(!resp->id().empty() && resp->id().size() == sizeof(SceNpRoomId::opt));
+		ctx->wakey = 0;
+		std::memcpy(room_id.opt, resp->id().data(), sizeof(SceNpRoomId::opt));
+		{
+			std::lock_guard lock(this->mutex_quickmatching);
+			const auto [_, inserted] = pending_quickmatching.insert_or_assign(room_id, ctx->ctx_id);
+			ensure(inserted);
+		}
 
 		// Now that the reply has been received, we start the wait for the notification
 		ctx->thread = std::make_unique<named_thread<std::function<void(SceNpRoomId)>>>("NP GUI Timeout Worker", [ctx, req_id, this](SceNpRoomId room_id)
@@ -675,10 +631,8 @@ namespace np
 				}
 			});
 
-		ctx->wakey = 0;
 		auto& thread = *ctx->thread;
 		thread(room_id);
-		return true;
 	}
 
 	error_code np_handler::searchjoin_gui(u32 ctx_id, vm::cptr<SceNpCommunicationId> communicationId, vm::cptr<SceNpMatchingSearchCondition> cond, vm::cptr<SceNpMatchingAttr> attr, vm::ptr<SceNpMatchingGUIHandler> handler, vm::ptr<void> arg)
@@ -695,41 +649,35 @@ namespace np
 		return CELL_OK;
 	}
 
-	bool np_handler::reply_searchjoin_gui(u32 req_id, std::vector<u8>& reply_data)
+	void np_handler::reply_searchjoin_gui(u32 req_id, rpcn::ErrorType error, vec_stream& reply)
 	{
 		auto ctx = take_pending_gui_request(req_id);
 
 		if (!ctx)
-			return true;
+			return;
 
-		if (rpcn::is_error(static_cast<rpcn::ErrorType>(reply_data[0])))
+		s32 error_code = CELL_OK;
+
+		switch (error)
 		{
-			s32 error = -1;
-
-			switch (static_cast<rpcn::ErrorType>(reply_data[0]))
-			{
-			case rpcn::ErrorType::NotFound:
-				error = SCE_NP_MATCHING_ERROR_SEARCH_JOIN_ROOM_NOT_FOUND;
-				break;
-			default:
-				fmt::throw_exception("Unexpected error in SearchJoinRoomGUI reply: %d", reply_data[0]);
-				break;
-			}
-
-			ctx->queue_gui_callback(SCE_NP_MATCHING_GUI_EVENT_SEARCH_JOIN, error);
-			gui_epilog(ctx);
-			return true;
+		case rpcn::ErrorType::NoError: break;
+		case rpcn::ErrorType::NotFound: error_code = SCE_NP_MATCHING_ERROR_SEARCH_JOIN_ROOM_NOT_FOUND; break;
+		default: fmt::throw_exception("Unexpected error in SearchJoinRoomGUI reply: %d", static_cast<u8>(error));
 		}
 
-		vec_stream reply(reply_data, 1);
-		const auto* resp = reply.get_flatbuffer<MatchingSearchJoinRoomInfo>();
+		if (error_code != CELL_OK)
+		{
+			ctx->queue_gui_callback(SCE_NP_MATCHING_GUI_EVENT_SEARCH_JOIN, error_code);
+			gui_epilog(ctx);
+			return;
+		}
 
-		if (reply.is_error())
-			return error_and_disconnect("Malformed reply to SearchJoinRoomGUI command");
+		const auto resp = reply.get_protobuf<np2_structs::MatchingSearchJoinRoomInfo>();
+		ensure(!reply.is_error(), "Malformed reply to SearchJoinRoomGUI command");
 
 		event_data edata(np_memory.allocate(MAX_SceNpMatchingSearchJoinRoomInfo_SIZE), sizeof(SceNpMatchingSearchJoinRoomInfo), MAX_SceNpMatchingSearchJoinRoomInfo_SIZE);
 		auto* room_info = reinterpret_cast<SceNpMatchingSearchJoinRoomInfo*>(edata.data());
-		MatchingSearchJoinRoomInfo_to_SceNpMatchingSearchJoinRoomInfo(edata, resp, room_info);
+		MatchingSearchJoinRoomInfo_to_SceNpMatchingSearchJoinRoomInfo(edata, *resp, room_info);
 		np_memory.shrink_allocation(edata.addr(), edata.size());
 
 		extra_nps::print_SceNpMatchingSearchJoinRoomInfo(room_info);
@@ -744,8 +692,6 @@ namespace np
 		set_gui_result(SCE_NP_MATCHING_GUI_EVENT_SEARCH_JOIN, std::move(edata));
 		ctx->queue_gui_callback(SCE_NP_MATCHING_GUI_EVENT_SEARCH_JOIN, 0);
 		gui_epilog(ctx);
-
-		return true;
 	}
 
 	// Local cache requests

@@ -99,7 +99,7 @@ dualsense_pad_handler::dualsense_pad_handler()
 	m_thumb_threshold   = thumb_max / 2;
 }
 
-void dualsense_pad_handler::check_add_device(hid_device* hidDevice, std::string_view path, std::wstring_view wide_serial)
+void dualsense_pad_handler::check_add_device(hid_device* hidDevice, hid_enumerated_device_view path, std::wstring_view wide_serial)
 {
 	if (!hidDevice)
 	{
@@ -134,7 +134,7 @@ void dualsense_pad_handler::check_add_device(hid_device* hidDevice, std::string_
 	if (res < 0 || buf[0] != 0x09)
 	{
 		dualsense_log.error("check_add_device: hid_get_feature_report 0x09 failed! result=%d, buf[0]=0x%x, error=%s", res, buf[0], hid_error(hidDevice));
-		hid_close(hidDevice);
+		HidDevice::close(hidDevice);
 		return;
 	}
 
@@ -235,7 +235,7 @@ void dualsense_pad_handler::init_config(cfg_pad* cfg)
 	cfg->rs_up.def    = ::at32(button_list, DualSenseKeyCodes::RSYPos);
 	cfg->start.def    = ::at32(button_list, DualSenseKeyCodes::Options);
 	cfg->select.def   = ::at32(button_list, DualSenseKeyCodes::Share);
-	cfg->ps.def       = ::at32(button_list, DualSenseKeyCodes::PSButton);
+	cfg->ps.def       = cfg_pad::make_button_string(button_list, {{DualSenseKeyCodes::PSButton}, {DualSenseKeyCodes::Options, DualSenseKeyCodes::Share}});
 	cfg->square.def   = ::at32(button_list, DualSenseKeyCodes::Square);
 	cfg->cross.def    = ::at32(button_list, DualSenseKeyCodes::Cross);
 	cfg->circle.def   = ::at32(button_list, DualSenseKeyCodes::Circle);
@@ -262,8 +262,6 @@ void dualsense_pad_handler::init_config(cfg_pad* cfg)
 	cfg->rstickdeadzone.def    = 40; // between 0 and 255
 	cfg->ltriggerthreshold.def = 0;  // between 0 and 255
 	cfg->rtriggerthreshold.def = 0;  // between 0 and 255
-	cfg->lpadsquircling.def    = 8000;
-	cfg->rpadsquircling.def    = 8000;
 
 	// Set default color value
 	cfg->colorR.def = 0;
@@ -507,17 +505,17 @@ bool dualsense_pad_handler::get_calibration_data(DualSenseDevice* dev) const
 	return true;
 }
 
-bool dualsense_pad_handler::get_is_left_trigger(const std::shared_ptr<PadDevice>& /*device*/, u64 keyCode)
+bool dualsense_pad_handler::get_is_left_trigger(const std::shared_ptr<PadDevice>& /*device*/, u32 keyCode)
 {
 	return keyCode == DualSenseKeyCodes::L2;
 }
 
-bool dualsense_pad_handler::get_is_right_trigger(const std::shared_ptr<PadDevice>& /*device*/, u64 keyCode)
+bool dualsense_pad_handler::get_is_right_trigger(const std::shared_ptr<PadDevice>& /*device*/, u32 keyCode)
 {
 	return keyCode == DualSenseKeyCodes::R2;
 }
 
-bool dualsense_pad_handler::get_is_left_stick(const std::shared_ptr<PadDevice>& /*device*/, u64 keyCode)
+bool dualsense_pad_handler::get_is_left_stick(const std::shared_ptr<PadDevice>& /*device*/, u32 keyCode)
 {
 	switch (keyCode)
 	{
@@ -531,7 +529,7 @@ bool dualsense_pad_handler::get_is_left_stick(const std::shared_ptr<PadDevice>& 
 	}
 }
 
-bool dualsense_pad_handler::get_is_right_stick(const std::shared_ptr<PadDevice>& /*device*/, u64 keyCode)
+bool dualsense_pad_handler::get_is_right_stick(const std::shared_ptr<PadDevice>& /*device*/, u32 keyCode)
 {
 	switch (keyCode)
 	{
@@ -545,7 +543,7 @@ bool dualsense_pad_handler::get_is_right_stick(const std::shared_ptr<PadDevice>&
 	}
 }
 
-bool dualsense_pad_handler::get_is_touch_pad_motion(const std::shared_ptr<PadDevice>& /*device*/, u64 keyCode)
+bool dualsense_pad_handler::get_is_touch_pad_motion(const std::shared_ptr<PadDevice>& /*device*/, u32 keyCode)
 {
 	switch (keyCode)
 	{
@@ -562,20 +560,18 @@ bool dualsense_pad_handler::get_is_touch_pad_motion(const std::shared_ptr<PadDev
 PadHandlerBase::connection dualsense_pad_handler::update_connection(const std::shared_ptr<PadDevice>& device)
 {
 	DualSenseDevice* dev = static_cast<DualSenseDevice*>(device.get());
-	if (!dev || dev->path.empty())
+	if (!dev || dev->path == hid_enumerated_device_default)
 		return connection::disconnected;
 
 	if (dev->hidDevice == nullptr)
 	{
 		// try to reconnect
-		if (hid_device* hid_dev = hid_open_path(dev->path.c_str()))
+		if (hid_device* hid_dev = dev->open())
 		{
 			if (hid_set_nonblocking(hid_dev, 1) == -1)
 			{
 				dualsense_log.error("Reconnecting Device %s: hid_set_nonblocking failed with error %s", dev->path, hid_error(hid_dev));
 			}
-
-			dev->hidDevice = hid_dev;
 
 			if (!dev->has_calib_data)
 			{
@@ -639,9 +635,9 @@ void dualsense_pad_handler::get_extended_info(const pad_ensemble& binding)
 	set_raw_orientation(pad->move_data, accel_x, accel_y, accel_z, gyro_x, gyro_y, gyro_z);
 }
 
-std::unordered_map<u64, u16> dualsense_pad_handler::get_button_values(const std::shared_ptr<PadDevice>& device)
+std::unordered_map<u32, u16> dualsense_pad_handler::get_button_values(const std::shared_ptr<PadDevice>& device)
 {
-	std::unordered_map<u64, u16> keyBuffer;
+	std::unordered_map<u32, u16> keyBuffer;
 	DualSenseDevice* dev = static_cast<DualSenseDevice*>(device.get());
 	if (!dev)
 		return keyBuffer;
@@ -727,7 +723,12 @@ std::unordered_map<u64, u16> dualsense_pad_handler::get_button_values(const std:
 		keyBuffer[DualSenseKeyCodes::Right] = 0;
 		break;
 	default:
-		fmt::throw_exception("dualsense dpad state encountered unexpected input");
+		keyBuffer[DualSenseKeyCodes::Up]    = 0;
+		keyBuffer[DualSenseKeyCodes::Down]  = 0;
+		keyBuffer[DualSenseKeyCodes::Left]  = 0;
+		keyBuffer[DualSenseKeyCodes::Right] = 0;
+		dualsense_log.warning("dpad state encountered unexpected input: 0x%x", data);
+		break;
 	}
 
 	data = (is_simple_mode ? input.z : input.buttons[0]) >> 4;
@@ -781,7 +782,7 @@ std::unordered_map<u64, u16> dualsense_pad_handler::get_button_values(const std:
 	return keyBuffer;
 }
 
-pad_preview_values dualsense_pad_handler::get_preview_values(const std::unordered_map<u64, u16>& data)
+pad_preview_values dualsense_pad_handler::get_preview_values(const std::unordered_map<u32, u16>& data, const std::vector<std::string>& /*buttons*/)
 {
 	return {
 		::at32(data, L2),
@@ -941,11 +942,8 @@ void dualsense_pad_handler::apply_pad_data(const pad_ensemble& binding)
 	cfg_pad* config = dev->config;
 
 	// Attempt to send rumble no matter what
-	const int idx_l = config->switch_vibration_motors ? 1 : 0;
-	const int idx_s  = config->switch_vibration_motors ? 0 : 1;
-
-	const u8 speed_large = config->enable_vibration_motor_large ? pad->m_vibrateMotors[idx_l].m_value : 0;
-	const u8 speed_small = config->enable_vibration_motor_small ? pad->m_vibrateMotors[idx_s].m_value : 0;
+	const u8 speed_large = config->get_large_motor_speed(pad->m_vibrate_motors);
+	const u8 speed_small = config->get_small_motor_speed(pad->m_vibrate_motors);
 
 	const bool wireless    = dev->cable_state == 0;
 	const bool low_battery = dev->battery_level <= 1;

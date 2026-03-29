@@ -1,11 +1,8 @@
 #pragma once
 #include "VKVertexProgram.h"
 #include "VKFragmentProgram.h"
-#include "VKRenderPass.h"
 #include "VKPipelineCompiler.h"
 #include "../Program/ProgramStateCache.h"
-
-#include "util/fnv_hash.hpp"
 
 namespace vk
 {
@@ -49,15 +46,16 @@ namespace vk
 				const fragment_program_type& fragmentProgramData,
 				const vk::pipeline_props& pipelineProperties,
 				bool compile_async,
-				std::function<pipeline_type*(pipeline_storage_type&)> callback,
-				VkPipelineLayout common_pipeline_layout)
+				std::function<pipeline_type*(pipeline_storage_type&)> callback)
 		{
-			const auto compiler_flags = compile_async ? vk::pipe_compiler::COMPILE_DEFERRED : vk::pipe_compiler::COMPILE_INLINE;
-			VkShaderModule modules[2] = { vertexProgramData.handle, fragmentProgramData.handle };
+			vk::pipe_compiler::op_flags compiler_flags = compile_async ? vk::pipe_compiler::COMPILE_DEFERRED : vk::pipe_compiler::COMPILE_INLINE;
+			compiler_flags |= vk::pipe_compiler::SEPARATE_SHADER_OBJECTS;
 
 			auto compiler = vk::get_pipe_compiler();
 			auto result = compiler->compile(
-				pipelineProperties, modules, common_pipeline_layout,
+				pipelineProperties,
+				vertexProgramData.handle,
+				fragmentProgramData.handle,
 				compiler_flags, callback,
 				vertexProgramData.uniforms,
 				fragmentProgramData.uniforms);
@@ -91,13 +89,13 @@ namespace vk
 		template <typename... Args>
 		void add_pipeline_entry(RSXVertexProgram& vp, RSXFragmentProgram& fp, vk::pipeline_props& props, Args&& ...args)
 		{
-			get_graphics_pipeline(vp, fp, props, false, false, std::forward<Args>(args)...);
+			get_graphics_pipeline(nullptr, vp, fp, props, false, false, std::forward<Args>(args)...);
 		}
 
-		void preload_programs(RSXVertexProgram& vp, RSXFragmentProgram& fp)
+		void preload_programs(rsx::program_cache_hint_t* cache_hint, const RSXVertexProgram& vp, const RSXFragmentProgram& fp)
 		{
-			search_vertex_program(vp);
-			search_fragment_program(fp);
+			search_vertex_program(cache_hint, vp);
+			search_fragment_program(cache_hint, fp);
 		}
 
 		bool check_cache_missed() const

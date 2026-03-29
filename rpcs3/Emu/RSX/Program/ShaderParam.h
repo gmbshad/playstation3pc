@@ -190,7 +190,7 @@ struct ParamArray
 
 	bool HasParam(const ParamFlag flag, const std::string& type, const std::string& name)
 	{
-		ParamType* t = SearchParam(flag, type);
+		const ParamType* t = SearchParam(flag, type);
 		return t && t->HasItem(name);
 	}
 
@@ -227,6 +227,14 @@ struct ParamArray
 
 		return name;
 	}
+
+	void Clear()
+	{
+		for (auto& param : params)
+		{
+			param.clear();
+		}
+	}
 };
 
 class ShaderVariable
@@ -236,10 +244,10 @@ public:
 	std::vector<std::string> swizzles;
 
 	ShaderVariable() = default;
-	ShaderVariable(const std::string& var)
+	ShaderVariable(std::string_view var)
 	{
 		// Separate 'double destination' variables 'X=Y=SRC'
-		std::string simple_var;
+		std::string_view simple_var;
 		const auto eq_pos = var.find('=');
 
 		if (eq_pos != umax)
@@ -259,11 +267,11 @@ public:
 			simple_var = simple_var.substr(brace_pos);
 		}
 
-		auto var_blocks = fmt::split(simple_var, { "." });
+		const auto var_blocks = fmt::split_sv(simple_var, { "." });
 
 		ensure((!var_blocks.empty()));
 
-		name = prefix + var_blocks[0];
+		name = prefix + std::string(var_blocks[0]);
 
 		if (var_blocks.size() == 1)
 		{
@@ -292,7 +300,7 @@ public:
 			{ 3, 'w' }
 		};
 
-		for (auto& p : pos_to_swizzle)
+		for (const auto& p : pos_to_swizzle)
 		{
 			swizzle[p.second] = swizzles[0].length() > p.first ? swizzles[0][p.first] : 0;
 		}
@@ -301,7 +309,7 @@ public:
 		{
 			std::unordered_map<char, char> new_swizzle;
 
-			for (auto& p : pos_to_swizzle)
+			for (const auto& p : pos_to_swizzle)
 			{
 				new_swizzle[p.second] = swizzle[swizzles[i].length() <= p.first ? '\0' : swizzles[i][p.first]];
 			}
@@ -312,7 +320,7 @@ public:
 		swizzles.clear();
 		std::string new_swizzle;
 
-		for (auto& p : pos_to_swizzle)
+		for (const auto& p : pos_to_swizzle)
 		{
 			if (swizzle[p.second] != '\0')
 				new_swizzle += swizzle[p.second];

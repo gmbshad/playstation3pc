@@ -2,7 +2,6 @@
 
 #include "util/serialization.hpp"
 #include "Emu/IdManager.h"
-#include "Emu/IPC.h"
 #include "Emu/System.h"
 
 #include "Emu/Cell/ErrorCodes.h"
@@ -60,6 +59,7 @@ CellError lv2_cond::on_id_create()
 		if (!mutex)
 		{
 			_mutex = static_cast<shared_ptr<lv2_obj>>(ensure(idm::get_unlocked<lv2_obj, lv2_mutex>(mtx_id)));
+			mutex = static_cast<lv2_mutex*>(_mutex.get());
 		}
 
 		// Defer function

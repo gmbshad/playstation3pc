@@ -7,7 +7,6 @@
 #include "Emu/Cell/PPUThread.h" // for vm_var
 #include "Emu/Memory/vm_var.h"
 #include "Emu/Io/interception.h"
-#include "Utilities/Thread.h"
 
 namespace rsx
 {
@@ -83,7 +82,7 @@ namespace rsx
 				if (m_list->m_items.empty() || is_auto_repeat)
 					break;
 
-				Emu.GetCallbacks().play_sound(fs::get_config_dir() + "sounds/snd_decide.wav");
+				play_sound(sound_effect::accept);
 
 				if (!get_current_selection().empty())
 				{
@@ -96,7 +95,7 @@ namespace rsx
 				close_dialog = true;
 				break;
 			case pad_button::circle:
-				Emu.GetCallbacks().play_sound(fs::get_config_dir() + "sounds/snd_cancel.wav");
+				play_sound(sound_effect::cancel);
 				close_dialog = true;
 				break;
 			case pad_button::dpad_up:
@@ -132,7 +131,7 @@ namespace rsx
 			// Play a sound unless this is a fast auto repeat which would induce a nasty noise
 			else if (!is_auto_repeat || m_auto_repeat_ms_interval >= m_auto_repeat_ms_interval_default)
 			{
-				Emu.GetCallbacks().play_sound(fs::get_config_dir() + "sounds/snd_cursor.wav");
+				play_sound(sound_effect::cursor);
 			}
 		}
 
@@ -184,7 +183,7 @@ namespace rsx
 				break; // Title already set in constructor
 			}
 
-			m_rpcn = rpcn::rpcn_client::get_instance(true);
+			m_rpcn = rpcn::rpcn_client::get_instance(0, true);
 
 			// Get list of messages
 			rpcn::friend_data data;
@@ -384,7 +383,7 @@ namespace rsx
 			}
 		}
 
-		void sendmessage_dialog::callback_handler(u16 ntype, const std::string& username, bool status)
+		void sendmessage_dialog::callback_handler(rpcn::NotificationType ntype, const std::string& username, bool status)
 		{
 			std::lock_guard lock(m_mutex);
 

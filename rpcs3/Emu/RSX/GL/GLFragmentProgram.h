@@ -1,7 +1,6 @@
 #pragma once
 #include "../Program/FragmentProgramDecompiler.h"
 #include "../Program/GLSLTypes.h"
-#include "GLHelpers.h"
 #include "glutils/program.h"
 
 namespace glsl
@@ -59,7 +58,7 @@ public:
 	ParamArray parr;
 	u32 id;
 	gl::glsl::shader shader;
-	std::vector<usz> FragmentConstantOffsetCache;
+	std::vector<u32> constant_offsets;
 
 	/**
 	 * Decompile a fragment shader located in the PS3's Memory.  This function operates synchronously.

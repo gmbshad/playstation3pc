@@ -12,8 +12,6 @@
 #include <vector>
 #include <set>
 
-#include "Emu/Cell/timers.hpp"
-
 void init_fxo_for_exec(utils::serial*, bool);
 
 enum class localized_string_id;
@@ -53,6 +51,7 @@ enum class game_boot_result : u32
 	decryption_error,
 	file_creation_error,
 	firmware_missing,
+	firmware_version,
 	unsupported_disc_type,
 	savestate_corrupted,
 	savestate_version_unsupported,
@@ -102,18 +101,29 @@ struct EmuCallbacks
 	std::function<std::string(localized_string_id, const char*)> get_localized_string;
 	std::function<std::u32string(localized_string_id, const char*)> get_localized_u32string;
 	std::function<std::string(const cfg::_base*, u32)> get_localized_setting;
-	std::function<void(const std::string&)> play_sound;
+	std::function<std::string(std::string_view)> get_photo_path;
+	std::function<void(const std::string&, std::optional<f32>)> play_sound;
 	std::function<bool(const std::string&, std::string&, s32&, s32&, s32&)> get_image_info; // (filename, sub_type, width, height, CellSearchOrientation)
 	std::function<bool(const std::string&, s32, s32, s32&, s32&, u8*, bool)> get_scaled_image; // (filename, target_width, target_height, width, height, dst, force_fit)
 	std::string(*resolve_path)(std::string_view) = [](std::string_view arg){ return std::string{arg}; }; // Resolve path using Qt
 	std::function<std::vector<std::string>()> get_font_dirs;
 	std::function<bool(const std::vector<std::string>&)> on_install_pkgs;
 	std::function<void(u32)> add_breakpoint;
+	std::function<bool()> display_sleep_control_supported;
+	std::function<void(bool)> enable_display_sleep;
+	std::function<void()> check_microphone_permissions;
+	std::function<std::unique_ptr<class video_source>()> make_video_source;
+	std::function<void(bool)> enable_gamemode;
 };
 
 namespace utils
 {
 	struct serial;
+};
+
+struct emu_precompilation_option_t
+{
+	bool is_fast = false;
 };
 
 class Emulator final
@@ -138,8 +148,10 @@ class Emulator final
 	std::string m_path;
 	std::string m_path_old;
 	std::string m_path_original;
+	std::string m_path_real;
 	std::string m_title_id;
 	std::string m_title;
+	std::string m_localized_title;
 	std::string m_app_version;
 	std::string m_hash;
 	std::string m_cat;
@@ -183,6 +195,7 @@ class Emulator final
 	};
 
 	bs_t<SaveStateExtentionFlags1> m_savestate_extension_flags1{};
+	emu_precompilation_option_t m_precompilation_option{};
 
 public:
 	static constexpr std::string_view game_id_boot_prefix = "%RPCS3_GAMEID%:";
@@ -206,7 +219,7 @@ public:
 		std::source_location src_loc = std::source_location::current()) const;
 
 	// Blocking call from the GUI thread
-	void BlockingCallFromMainThread(std::function<void()>&& func, std::source_location src_loc = std::source_location::current()) const;
+	void BlockingCallFromMainThread(std::function<void()>&& func, bool track_emu_state = true, std::source_location src_loc = std::source_location::current()) const;
 
 	enum class stop_counter_t : u64{};
 
@@ -238,6 +251,11 @@ public:
 	void SetTestMode()
 	{
 		m_state = system_state::running;
+	}
+
+	void SetPrecompileCacheOption(emu_precompilation_option_t option)
+	{
+		m_precompilation_option = option;
 	}
 
 	void Init();
@@ -276,6 +294,11 @@ public:
 	const std::string& GetTitle() const
 	{
 		return m_title;
+	}
+
+	const std::string& GetLocalizedTitle() const
+	{
+		return m_localized_title;
 	}
 
 	const std::string GetTitleAndTitleID() const
@@ -331,8 +354,6 @@ public:
 
 	void SetUsr(const std::string& user);
 
-	std::string GetBackgroundPicturePath() const;
-
 	u64 GetPauseTime() const
 	{
 		return m_pause_amend_time;
@@ -373,7 +394,7 @@ public:
 		{
 			if (active)
 			{
-				_this->m_restrict_emu_state_change--;
+				_this->m_restrict_emu_state_change.try_dec(0);
 			}
 		}
 
@@ -421,15 +442,17 @@ public:
 	void Resume();
 	void GracefulShutdown(bool allow_autoexit = true, bool async_op = false, bool savestate = false, bool continuous_mode = false);
 	void Kill(bool allow_autoexit = true, bool savestate = false, savestate_stage* stage = nullptr);
-	game_boot_result Restart(bool graceful = true);
+	game_boot_result Restart(bool graceful = true, bool reset_path = true);
 	bool Quit(bool force_quit);
 	static void CleanUp();
 
 	bool IsRunning() const { return m_state == system_state::running; }
-	bool IsPaused()  const { return m_state >= system_state::paused; } // ready/starting are also considered paused by this function
+	bool IsPaused() const { system_state state = m_state; return state >= system_state::paused && state <= system_state::frozen; }
+	bool IsPausedOrReady() const { return m_state >= system_state::paused; }
 	bool IsStopped(bool test_fully = false) const { return test_fully ? m_state == system_state::stopped : m_state <= system_state::stopping; }
 	bool IsReady()   const { return m_state == system_state::ready; }
 	bool IsStarting() const { return m_state == system_state::starting; }
+	void WaitReady() const { m_state.wait(system_state::ready); }
 	auto GetStatus(bool fixup = true) const { system_state state = m_state; return fixup && state == system_state::frozen ? system_state::paused : fixup && state == system_state::stopping ? system_state::stopped : state; }
 
 	bool HasGui() const { return m_has_gui; }
@@ -446,6 +469,7 @@ public:
 	u32 AddGamesFromDir(const std::string& path);
 	game_boot_result AddGame(const std::string& path);
 	game_boot_result AddGameToYml(const std::string& path);
+	u32 RemoveGamesFromDir(const std::string& games_dir, const std::vector<std::string>& serials_to_remove_from_yml = {}, bool save_on_disk = true);
 	u32 RemoveGames(const std::vector<std::string>& title_id_list, bool save_on_disk = true);
 	game_boot_result RemoveGameFromYml(const std::string& title_id);
 
@@ -467,7 +491,3 @@ public:
 };
 
 extern Emulator Emu;
-
-extern bool g_use_rtm;
-extern u64 g_rtm_tx_limit1;
-extern u64 g_rtm_tx_limit2;

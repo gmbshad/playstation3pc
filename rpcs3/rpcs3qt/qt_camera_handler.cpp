@@ -1,15 +1,11 @@
 #include "stdafx.h"
 #include "qt_camera_handler.h"
+#include "permissions.h"
 #include "Emu/system_config.h"
 #include "Emu/System.h"
 #include "Emu/Io/camera_config.h"
 
 #include <QMediaDevices>
-
-#if QT_CONFIG(permissions)
-#include <QGuiApplication>
-#include <QPermissions>
-#endif
 
 LOG_CHANNEL(camera_log, "Camera");
 
@@ -113,6 +109,7 @@ void qt_camera_handler::handle_camera_active(bool is_active)
 void qt_camera_handler::handle_camera_error(QCamera::Error error, const QString& errorString)
 {
 	camera_log.error("Error event: \"%s\" (error=%d)", errorString, static_cast<int>(error));
+	set_state(camera_handler_state::closed);
 }
 
 void qt_camera_handler::open_camera()
@@ -214,25 +211,10 @@ void qt_camera_handler::start_camera()
 		return;
 	}
 
-#if QT_CONFIG(permissions)
-	const QCameraPermission permission;
-	switch (qApp->checkPermission(permission))
+	if (!gui::utils::check_camera_permission(this, [this](){ start_camera(); }, nullptr))
 	{
-	case Qt::PermissionStatus::Undetermined:
-		camera_log.notice("Requesting camera permission");
-		qApp->requestPermission(permission, this, [this]()
-		{
-			start_camera();
-		});
 		return;
-	case Qt::PermissionStatus::Denied:
-		camera_log.error("RPCS3 has no permissions to access cameras on this device.");
-		return;
-	case Qt::PermissionStatus::Granted:
-		camera_log.notice("Camera permission granted");
-		break;
 	}
-#endif
 
 	// Start camera. We will start receiving frames now.
 	set_expected_state(camera_handler_state::running);
@@ -359,14 +341,14 @@ void qt_camera_handler::update_camera_settings()
 
 		// Load selected settings from config file
 		bool success = false;
-		cfg_camera::camera_setting cfg_setting = g_cfg_camera.get_camera_setting(camera_id, success);
+		cfg_camera::camera_setting cfg_setting = g_cfg_camera.get_camera_setting(fmt::format("%s", camera_handler::qt), camera_id, success);
 
 		if (success)
 		{
 			camera_log.notice("Found config entry for camera \"%s\" (m_camera_id='%s')", camera_id, m_camera_id);
 
 			// List all available settings and choose the proper value if possible.
-			const double epsilon = 0.001;
+			constexpr double epsilon = 0.001;
 			success = false;
 			for (const QCameraFormat& supported_setting : m_camera->cameraDevice().videoFormats())
 			{

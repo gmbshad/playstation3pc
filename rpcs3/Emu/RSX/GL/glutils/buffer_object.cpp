@@ -1,5 +1,6 @@
 #include "stdafx.h"
 #include "buffer_object.h"
+#include "common.h"
 
 namespace gl
 {
@@ -130,6 +131,11 @@ namespace gl
 		DSA_CALL2(NamedBufferSubData, m_id, offset, length, data);
 	}
 
+	void buffer::fill(GLsizeiptr offset, GLsizeiptr length, GLuint pattern)
+	{
+		DSA_CALL2(ClearNamedBufferSubData, m_id, GL_R32UI, offset, length, GL_RED, GL_UNSIGNED_INT, &pattern);
+	}
+
 	GLubyte* buffer::map(GLsizeiptr offset, GLsizeiptr length, access access_)
 	{
 		ensure(m_memory_type == memory_type::host_visible);
@@ -161,7 +167,7 @@ namespace gl
 
 	void buffer::copy_to(buffer* other, u64 src_offset, u64 dst_offset, u64 size)
 	{
-		if (get_driver_caps().ARB_dsa_supported)
+		if (get_driver_caps().ARB_direct_state_access_supported)
 		{
 			glCopyNamedBufferSubData(this->id(), other->id(), src_offset, dst_offset, size);
 		}

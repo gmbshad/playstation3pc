@@ -1,7 +1,9 @@
 #pragma once
 
+#include "Emu/NP/rpcn_types.h"
 #include "cellRtc.h"
 #include "Emu/Cell/ErrorCodes.h"
+#include "util/shared_ptr.hpp"
 
 #include <set>
 
@@ -30,6 +32,7 @@ using SceNpBasicMessageRecvAction = u32;
 
 using SceNpClanId = u32;
 using SceNpClansMessageId = u32;
+using SceNpClansMemberRole = u32;
 using SceNpClansMemberStatus = s32;
 
 using SceNpCustomMenuIndexMask = u32;
@@ -1262,8 +1265,13 @@ struct SceNpCommunicationId
 // OnlineId structure
 struct SceNpOnlineId
 {
-	char data[16 + 1]; // char term;
+	char data[SCE_NET_NP_ONLINEID_MAX_LENGTH + 1]; // char term;
 	char dummy[3];
+
+	bool operator<(const SceNpOnlineId& other) const
+	{
+		return memcmp(data, other.data, sizeof(data)) < 0;
+	}
 };
 
 // NP ID structure
@@ -1280,6 +1288,11 @@ struct SceNpId
 	};
 
 	u8 reserved[8];
+
+	bool operator<(const SceNpId& other) const
+	{
+		return handle < other.handle;
+	}
 };
 
 CHECK_SIZE_ALIGN(SceNpId, 0x24, 1);
@@ -1394,9 +1407,9 @@ struct SceNpBasicMessageDetails
 // Presence details of an user
 struct SceNpBasicPresenceDetails
 {
-	s8 title[SCE_NP_BASIC_PRESENCE_TITLE_SIZE_MAX];
-	s8 status[SCE_NP_BASIC_PRESENCE_STATUS_SIZE_MAX];
-	s8 comment[SCE_NP_BASIC_PRESENCE_COMMENT_SIZE_MAX];
+	char title[SCE_NP_BASIC_PRESENCE_TITLE_SIZE_MAX];
+	char status[SCE_NP_BASIC_PRESENCE_STATUS_SIZE_MAX];
+	char comment[SCE_NP_BASIC_PRESENCE_COMMENT_SIZE_MAX];
 	u8 data[SCE_NP_BASIC_MAX_PRESENCE_SIZE];
 	be_t<u32> size;
 	be_t<s32> state;
@@ -1407,9 +1420,9 @@ struct SceNpBasicPresenceDetails2
 {
 	be_t<u32> struct_size;
 	be_t<s32> state;
-	s8 title[SCE_NP_BASIC_PRESENCE_TITLE_SIZE_MAX];
-	s8 status[SCE_NP_BASIC_PRESENCE_EXTENDED_STATUS_SIZE_MAX];
-	s8 comment[SCE_NP_BASIC_PRESENCE_COMMENT_SIZE_MAX];
+	char title[SCE_NP_BASIC_PRESENCE_TITLE_SIZE_MAX];
+	char status[SCE_NP_BASIC_PRESENCE_EXTENDED_STATUS_SIZE_MAX];
+	char comment[SCE_NP_BASIC_PRESENCE_COMMENT_SIZE_MAX];
 	u8 data[SCE_NP_BASIC_MAX_PRESENCE_SIZE];
 	be_t<u32> size;
 };
@@ -1417,9 +1430,9 @@ struct SceNpBasicPresenceDetails2
 // Country/region code
 struct SceNpCountryCode
 {
-	s8 data[2];
-	s8 term;
-	s8 padding[1];
+	char data[2];
+	char term;
+	char padding[1];
 };
 
 // Date information
@@ -1448,8 +1461,8 @@ struct SceNpScoreGameInfo
 // Ranking comment structure
 struct SceNpScoreComment
 {
-	s8 data[SCE_NP_SCORE_COMMENT_MAXLEN];
-	s8 term[1];
+	char data[SCE_NP_SCORE_COMMENT_MAXLEN];
+	char term[1];
 };
 
 // Ranking information structure
@@ -1521,15 +1534,15 @@ struct SceNpScoreNpIdPcId
 // Basic clan information to be used in raking
 struct SceNpScoreClanBasicInfo
 {
-	s8 clanName[SCE_NP_CLANS_CLAN_NAME_MAX_LENGTH + 1];
-	s8 clanTag[SCE_NP_CLANS_CLAN_TAG_MAX_LENGTH + 1];
+	char clanName[SCE_NP_CLANS_CLAN_NAME_MAX_LENGTH + 1];
+	char clanTag[SCE_NP_CLANS_CLAN_TAG_MAX_LENGTH + 1];
 	u8 reserved[10];
 };
 
 // Clan member information handled in ranking
 struct SceNpScoreClansMemberDescription
 {
-	s8 description[SCE_NP_CLANS_CLAN_DESCRIPTION_MAX_LENGTH + 1];
+	char description[SCE_NP_CLANS_CLAN_DESCRIPTION_MAX_LENGTH + 1];
 };
 
 // Clan ranking information
@@ -1580,6 +1593,16 @@ struct SceNpSignalingNetInfo
 	be_t<s32> upnp_status;
 	be_t<s32> npport_status;
 	be_t<u16> npport;
+};
+
+struct SceNpSignalingNetInfoDeprecated
+{
+	be_t<u32> size;
+	be_t<u32> local_addr; // in_addr
+	be_t<u32> mapped_addr; // in_addr
+	be_t<s32> nat_status;
+	be_t<s32> upnp_status;
+	be_t<s32> npport_status;
 };
 
 struct SceNpCustomMenuAction
@@ -1676,12 +1699,22 @@ struct SceNpLobbyId
 {
 	u8 opt[28];
 	u8 reserved[8];
+
+	bool operator<(const SceNpLobbyId& other) const
+	{
+		return memcmp(opt, other.opt, sizeof(opt)) < 0;
+	}
 };
 
 struct SceNpRoomId
 {
 	u8 opt[28];
 	u8 reserved[8];
+
+	bool operator<(const SceNpRoomId& other) const
+	{
+		return memcmp(opt, other.opt, sizeof(opt)) < 0;
+	}
 };
 
 struct SceNpMatchingAttr
@@ -1825,7 +1858,7 @@ public:
 	virtual ~SendMessageDialogBase() = default;
 
 	virtual error_code Exec(message_data& msg_data, std::set<std::string>& npids) = 0;
-	virtual void callback_handler(u16 ntype, const std::string& username, bool status) = 0;
+	virtual void callback_handler(rpcn::NotificationType ntype, const std::string& username, bool status) = 0;
 
 protected:
 	std::shared_ptr<rpcn::rpcn_client> m_rpcn;

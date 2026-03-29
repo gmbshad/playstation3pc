@@ -1,13 +1,11 @@
 #include "stdafx.h"
 #include "rsx_methods.h"
 #include "RSXThread.h"
-#include "rsx_utils.h"
-#include "rsx_decode.h"
-#include "Common/time.hpp"
-#include "Emu/Cell/PPUCallback.h"
+#include "Emu/Cell/PPUThread.h"
 #include "Emu/Cell/lv2/sys_rsx.h"
-#include "Emu/RSX/Common/BufferUtils.h"
 
+
+#include "Emu/System.h"
 #include "Emu/RSX/NV47/HW/nv47.h"
 #include "Emu/RSX/NV47/HW/nv47_sync.hpp"
 #include "Emu/RSX/NV47/HW/context_accessors.define.h" // TODO: Context objects belong in FW not HW
@@ -64,7 +62,7 @@ namespace rsx
 		RSX(ctx)->reset();
 		RSX(ctx)->on_frame_end(arg);
 		RSX(ctx)->request_emu_flip(arg);
-		vm::_ref<atomic_t<u128>>(RSX(ctx)->label_addr + 0x10).store(u128{});
+		vm::_ptr<atomic_t<u128>>(RSX(ctx)->label_addr + 0x10)->store(u128{});
 	}
 
 	void user_command(context* ctx, u32, u32 arg)
@@ -718,9 +716,8 @@ namespace rsx
 			state_signals[NV4097_SET_POINT_SIZE] = rsx::vertex_state_dirty;
 			state_signals[NV4097_SET_ALPHA_FUNC] = rsx::fragment_state_dirty;
 			state_signals[NV4097_SET_ALPHA_REF] = rsx::fragment_state_dirty;
-			state_signals[NV4097_SET_ALPHA_TEST_ENABLE] = rsx::fragment_state_dirty;
-			state_signals[NV4097_SET_ANTI_ALIASING_CONTROL] = rsx::fragment_state_dirty | rsx::pipeline_config_dirty;
-			state_signals[NV4097_SET_SHADER_PACKER] = rsx::fragment_state_dirty;
+			state_signals[NV4097_SET_ALPHA_TEST_ENABLE] = rsx::fragment_program_state_dirty;
+			state_signals[NV4097_SET_SHADER_PACKER] = rsx::fragment_program_state_dirty;
 			state_signals[NV4097_SET_SHADER_WINDOW] = rsx::fragment_state_dirty;
 			state_signals[NV4097_SET_FOG_MODE] = rsx::fragment_state_dirty;
 			state_signals[NV4097_SET_SCISSOR_HORIZONTAL] = rsx::scissor_config_state_dirty;
@@ -735,7 +732,7 @@ namespace rsx
 			state_signals[NV4097_SET_VIEWPORT_OFFSET + 0] = rsx::vertex_state_dirty;
 			state_signals[NV4097_SET_VIEWPORT_OFFSET + 1] = rsx::vertex_state_dirty;
 			state_signals[NV4097_SET_VIEWPORT_OFFSET + 2] = rsx::vertex_state_dirty;
-			state_signals[NV4097_SET_POLYGON_STIPPLE] = rsx::fragment_state_dirty;
+			state_signals[NV4097_SET_POLYGON_STIPPLE] = rsx::fragment_program_state_dirty;
 			state_signals[NV4097_SET_POLYGON_STIPPLE_PATTERN + 0] = rsx::polygon_stipple_pattern_dirty;
 			state_signals[NV4097_SET_POLYGON_STIPPLE_PATTERN + 1] = rsx::polygon_stipple_pattern_dirty;
 			state_signals[NV4097_SET_POLYGON_STIPPLE_PATTERN + 2] = rsx::polygon_stipple_pattern_dirty;
@@ -1665,16 +1662,16 @@ namespace rsx
 		bind(NV4097_SET_SURFACE_PITCH_D, nv4097::set_surface_dirty_bit);
 		bind(NV4097_SET_SURFACE_PITCH_Z, nv4097::set_surface_dirty_bit);
 		bind(NV4097_SET_WINDOW_OFFSET, nv4097::set_surface_dirty_bit);
-		bind_range<NV4097_SET_TEXTURE_OFFSET, 8, 16, nv4097::set_texture_dirty_bit>();
-		bind_range<NV4097_SET_TEXTURE_FORMAT, 8, 16, nv4097::set_texture_dirty_bit>();
-		bind_range<NV4097_SET_TEXTURE_ADDRESS, 8, 16, nv4097::set_texture_dirty_bit>();
-		bind_range<NV4097_SET_TEXTURE_CONTROL0, 8, 16, nv4097::set_texture_dirty_bit>();
-		bind_range<NV4097_SET_TEXTURE_CONTROL1, 8, 16, nv4097::set_texture_dirty_bit>();
-		bind_range<NV4097_SET_TEXTURE_CONTROL2, 1, 16, nv4097::set_texture_dirty_bit>();
-		bind_range<NV4097_SET_TEXTURE_CONTROL3, 1, 16, nv4097::set_texture_dirty_bit>();
-		bind_range<NV4097_SET_TEXTURE_FILTER, 8, 16, nv4097::set_texture_dirty_bit>();
-		bind_range<NV4097_SET_TEXTURE_IMAGE_RECT, 8, 16, nv4097::set_texture_dirty_bit>();
-		bind_range<NV4097_SET_TEXTURE_BORDER_COLOR, 8, 16, nv4097::set_texture_dirty_bit>();
+		bind_range<NV4097_SET_TEXTURE_OFFSET, 8, 16, nv4097::set_fragment_texture_dirty_bit>();
+		bind_range<NV4097_SET_TEXTURE_FORMAT, 8, 16, nv4097::set_fragment_texture_dirty_bit>();
+		bind_range<NV4097_SET_TEXTURE_ADDRESS, 8, 16, nv4097::set_fragment_texture_dirty_bit>();
+		bind_range<NV4097_SET_TEXTURE_CONTROL0, 8, 16, nv4097::set_fragment_texture_dirty_bit>();
+		bind_range<NV4097_SET_TEXTURE_CONTROL1, 8, 16, nv4097::set_fragment_texture_dirty_bit>();
+		bind_range<NV4097_SET_TEXTURE_FILTER, 8, 16, nv4097::set_fragment_texture_dirty_bit>();
+		bind_range<NV4097_SET_TEXTURE_IMAGE_RECT, 8, 16, nv4097::set_fragment_texture_dirty_bit>();
+		bind_range<NV4097_SET_TEXTURE_BORDER_COLOR, 8, 16, nv4097::set_fragment_texture_dirty_bit>();
+		bind_range<NV4097_SET_TEXTURE_CONTROL2, 1, 16, nv4097::set_fragment_texture_dirty_bit>();
+		bind_range<NV4097_SET_TEXTURE_CONTROL3, 1, 16, nv4097::set_fragment_texture_dirty_bit>();
 		bind_range<NV4097_SET_VERTEX_TEXTURE_OFFSET, 8, 4, nv4097::set_vertex_texture_dirty_bit>();
 		bind_range<NV4097_SET_VERTEX_TEXTURE_FORMAT, 8, 4, nv4097::set_vertex_texture_dirty_bit>();
 		bind_range<NV4097_SET_VERTEX_TEXTURE_ADDRESS, 8, 4, nv4097::set_vertex_texture_dirty_bit>();
@@ -1716,6 +1713,7 @@ namespace rsx
 		bind(NV4097_SET_BLEND_EQUATION, nv4097::set_blend_equation);
 		bind(NV4097_SET_BLEND_FUNC_SFACTOR, nv4097::set_blend_factor);
 		bind(NV4097_SET_BLEND_FUNC_DFACTOR, nv4097::set_blend_factor);
+		bind(NV4097_SET_ANTI_ALIASING_CONTROL, nv4097::set_aa_control);
 
 		//NV308A (0xa400..0xbffc!)
 		bind_array(NV308A_COLOR, 1, 256 * 7, nv308a::color::impl);

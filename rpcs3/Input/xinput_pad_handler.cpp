@@ -3,6 +3,7 @@
 #include "stdafx.h"
 #include "xinput_pad_handler.h"
 #include "Emu/Io/pad_config.h"
+#include "util/dyn_lib.hpp"
 
 namespace XINPUT_INFO
 {
@@ -77,8 +78,6 @@ xinput_pad_handler::~xinput_pad_handler()
 {
 	if (library)
 	{
-		FreeLibrary(library);
-		library = nullptr;
 		xinputGetExtended = nullptr;
 		xinputGetCustomData = nullptr;
 		xinputGetState = nullptr;
@@ -102,7 +101,7 @@ void xinput_pad_handler::init_config(cfg_pad* cfg)
 	cfg->rs_up.def    = ::at32(button_list, XInputKeyCodes::RSYPos);
 	cfg->start.def    = ::at32(button_list, XInputKeyCodes::Start);
 	cfg->select.def   = ::at32(button_list, XInputKeyCodes::Back);
-	cfg->ps.def       = ::at32(button_list, XInputKeyCodes::Guide);
+	cfg->ps.def       = cfg_pad::make_button_string(button_list, {{XInputKeyCodes::Guide}, {XInputKeyCodes::Start, XInputKeyCodes::Back}});
 	cfg->square.def   = ::at32(button_list, XInputKeyCodes::X);
 	cfg->cross.def    = ::at32(button_list, XInputKeyCodes::A);
 	cfg->circle.def   = ::at32(button_list, XInputKeyCodes::B);
@@ -129,8 +128,6 @@ void xinput_pad_handler::init_config(cfg_pad* cfg)
 	cfg->rstickdeadzone.def    = XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE; // between 0 and 32767
 	cfg->ltriggerthreshold.def = XINPUT_GAMEPAD_TRIGGER_THRESHOLD;    // between 0 and 255
 	cfg->rtriggerthreshold.def = XINPUT_GAMEPAD_TRIGGER_THRESHOLD;    // between 0 and 255
-	cfg->lpadsquircling.def    = 8000;
-	cfg->rpadsquircling.def    = 8000;
 
 	// apply defaults
 	cfg->from_default();
@@ -204,9 +201,9 @@ int xinput_pad_handler::GetDeviceNumber(const std::string& padId)
 	return device_number;
 }
 
-std::unordered_map<u64, u16> xinput_pad_handler::get_button_values(const std::shared_ptr<PadDevice>& device)
+std::unordered_map<u32, u16> xinput_pad_handler::get_button_values(const std::shared_ptr<PadDevice>& device)
 {
-	PadButtonValues values;
+	std::unordered_map<u32, u16> values;
 	XInputDevice* dev = static_cast<XInputDevice*>(device.get());
 	if (!dev || dev->state != ERROR_SUCCESS) // the state has to be aquired with update_connection before calling this function
 		return values;
@@ -220,9 +217,9 @@ std::unordered_map<u64, u16> xinput_pad_handler::get_button_values(const std::sh
 	return get_button_values_base(dev->state_base, m_trigger_recognition_mode);
 }
 
-xinput_pad_handler::PadButtonValues xinput_pad_handler::get_button_values_base(const XINPUT_STATE& state, trigger_recognition_mode trigger_mode)
+std::unordered_map<u32, u16> xinput_pad_handler::get_button_values_base(const XINPUT_STATE& state, trigger_recognition_mode trigger_mode)
 {
-	PadButtonValues values;
+	std::unordered_map<u32, u16> values;
 
 	// Triggers
 	if (trigger_mode == trigger_recognition_mode::any || trigger_mode == trigger_recognition_mode::one_directional)
@@ -294,9 +291,9 @@ xinput_pad_handler::PadButtonValues xinput_pad_handler::get_button_values_base(c
 	return values;
 }
 
-xinput_pad_handler::PadButtonValues xinput_pad_handler::get_button_values_scp(const SCP_EXTN& state, trigger_recognition_mode trigger_mode)
+std::unordered_map<u32, u16> xinput_pad_handler::get_button_values_scp(const SCP_EXTN& state, trigger_recognition_mode trigger_mode)
 {
-	PadButtonValues values;
+	std::unordered_map<u32, u16> values;
 
 	// Triggers
 	if (trigger_mode == trigger_recognition_mode::any || trigger_mode == trigger_recognition_mode::one_directional)
@@ -362,7 +359,7 @@ xinput_pad_handler::PadButtonValues xinput_pad_handler::get_button_values_scp(co
 	return values;
 }
 
-pad_preview_values xinput_pad_handler::get_preview_values(const std::unordered_map<u64, u16>& data)
+pad_preview_values xinput_pad_handler::get_preview_values(const std::unordered_map<u32, u16>& data, const std::vector<std::string>& /*buttons*/)
 {
 	return {
 		::at32(data, LT),
@@ -374,12 +371,6 @@ pad_preview_values xinput_pad_handler::get_preview_values(const std::unordered_m
 	};
 }
 
-template<class T>
-T getProc(HMODULE hModule, LPCSTR lpProcName)
-{
-	return reinterpret_cast<T>(GetProcAddress(hModule, lpProcName));
-}
-
 bool xinput_pad_handler::Init()
 {
 	if (m_is_init)
@@ -387,17 +378,17 @@ bool xinput_pad_handler::Init()
 
 	for (auto it : XINPUT_INFO::LIBRARY_FILENAMES)
 	{
-		library = LoadLibrary(it);
+		library.load(it);
 		if (library)
 		{
-			xinputGetExtended = getProc<PFN_XINPUTGETEXTENDED>(library, "XInputGetExtended"); // Optional
-			xinputGetCustomData = getProc<PFN_XINPUTGETCUSTOMDATA>(library, "XInputGetCustomData"); // Optional
-			xinputGetState = getProc<PFN_XINPUTGETSTATE>(library, reinterpret_cast<LPCSTR>(100));
+			xinputGetExtended = library.get<PFN_XINPUTGETEXTENDED>("XInputGetExtended");       // Optional
+			xinputGetCustomData = library.get<PFN_XINPUTGETCUSTOMDATA>("XInputGetCustomData"); // Optional
+			xinputGetState = library.get<PFN_XINPUTGETSTATE>(reinterpret_cast<LPCSTR>(100));
 			if (!xinputGetState)
-				xinputGetState = getProc<PFN_XINPUTGETSTATE>(library, "XInputGetState");
+				xinputGetState = library.get<PFN_XINPUTGETSTATE>("XInputGetState");
 
-			xinputSetState = getProc<PFN_XINPUTSETSTATE>(library, "XInputSetState");
-			xinputGetBatteryInformation = getProc<PFN_XINPUTGETBATTERYINFORMATION>(library, "XInputGetBatteryInformation");
+			xinputSetState = library.get<PFN_XINPUTSETSTATE>("XInputSetState");
+			xinputGetBatteryInformation = library.get<PFN_XINPUTGETBATTERYINFORMATION>("XInputGetBatteryInformation");
 
 			if (xinputGetState && xinputSetState && xinputGetBatteryInformation)
 			{
@@ -405,8 +396,6 @@ bool xinput_pad_handler::Init()
 				break;
 			}
 
-			FreeLibrary(library);
-			library = nullptr;
 			xinputGetExtended = nullptr;
 			xinputGetCustomData = nullptr;
 			xinputGetState = nullptr;
@@ -466,17 +455,17 @@ std::shared_ptr<PadDevice> xinput_pad_handler::get_device(const std::string& dev
 	return dev;
 }
 
-bool xinput_pad_handler::get_is_left_trigger(const std::shared_ptr<PadDevice>& /*device*/, u64 keyCode)
+bool xinput_pad_handler::get_is_left_trigger(const std::shared_ptr<PadDevice>& /*device*/, u32 keyCode)
 {
 	return keyCode == XInputKeyCodes::LT;
 }
 
-bool xinput_pad_handler::get_is_right_trigger(const std::shared_ptr<PadDevice>& /*device*/, u64 keyCode)
+bool xinput_pad_handler::get_is_right_trigger(const std::shared_ptr<PadDevice>& /*device*/, u32 keyCode)
 {
 	return keyCode == XInputKeyCodes::RT;
 }
 
-bool xinput_pad_handler::get_is_left_stick(const std::shared_ptr<PadDevice>& /*device*/, u64 keyCode)
+bool xinput_pad_handler::get_is_left_stick(const std::shared_ptr<PadDevice>& /*device*/, u32 keyCode)
 {
 	switch (keyCode)
 	{
@@ -490,7 +479,7 @@ bool xinput_pad_handler::get_is_left_stick(const std::shared_ptr<PadDevice>& /*d
 	}
 }
 
-bool xinput_pad_handler::get_is_right_stick(const std::shared_ptr<PadDevice>& /*device*/, u64 keyCode)
+bool xinput_pad_handler::get_is_right_stick(const std::shared_ptr<PadDevice>& /*device*/, u32 keyCode)
 {
 	switch (keyCode)
 	{
@@ -575,11 +564,8 @@ void xinput_pad_handler::apply_pad_data(const pad_ensemble& binding)
 
 	// The left motor is the low-frequency rumble motor. The right motor is the high-frequency rumble motor.
 	// The two motors are not the same, and they create different vibration effects. Values range between 0 to 65535.
-	const usz idx_l = cfg->switch_vibration_motors ? 1 : 0;
-	const usz idx_s = cfg->switch_vibration_motors ? 0 : 1;
-
-	const u8 speed_large = cfg->enable_vibration_motor_large ? pad->m_vibrateMotors[idx_l].m_value : 0;
-	const u8 speed_small = cfg->enable_vibration_motor_small ? pad->m_vibrateMotors[idx_s].m_value : 0;
+	const u8 speed_large = cfg->get_large_motor_speed(pad->m_vibrate_motors);
+	const u8 speed_small = cfg->get_small_motor_speed(pad->m_vibrate_motors);
 
 	dev->new_output_data |= dev->large_motor != speed_large || dev->small_motor != speed_small;
 

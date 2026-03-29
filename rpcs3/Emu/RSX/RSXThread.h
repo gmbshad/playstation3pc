@@ -1,14 +1,8 @@
 #pragma once
 
-#include <thread>
 #include <queue>
 #include <deque>
-#include <variant>
-#include <stack>
-#include <unordered_map>
 
-#include "GCM.h"
-#include "rsx_cache.h"
 #include "RSXFIFO.h"
 #include "RSXOffload.h"
 #include "RSXZCULL.h"
@@ -16,6 +10,7 @@
 #include "Common/bitfield.hpp"
 #include "Common/profiling_timer.hpp"
 #include "Common/texture_cache_types.h"
+#include "Common/TextureUtils.h"
 #include "Program/RSXVertexProgram.h"
 #include "Program/RSXFragmentProgram.h"
 
@@ -32,7 +27,6 @@
 #include "Core/RSXDriverState.h"
 #include "Core/RSXFrameBuffer.h"
 #include "Core/RSXContext.h"
-#include "Core/RSXIOMap.hpp"
 #include "Core/RSXVertexTypes.h"
 
 #include "NV47/FW/GRAPH_backend.h"
@@ -87,6 +81,7 @@ namespace rsx
 	{
 		bool supports_multidraw;               // Draw call batching
 		bool supports_hw_a2c;                  // Alpha to coverage
+		bool supports_hw_a2c_1spp;             // Alpha to coverage at 1 sample per pixel
 		bool supports_hw_renormalization;      // Should be true on NV hardware which matches PS3 texture renormalization behaviour
 		bool supports_hw_msaa;                 // MSAA support
 		bool supports_hw_a2one;                // Alpha to one
@@ -96,8 +91,6 @@ namespace rsx
 		bool supports_host_gpu_labels;         // Advanced host synchronization
 		bool supports_normalized_barycentrics; // Basically all GPUs except NVIDIA have properly normalized barycentrics
 	};
-
-	class sampled_image_descriptor_base;
 
 	struct desync_fifo_cmd_info
 	{
@@ -129,7 +122,7 @@ namespace rsx
 		std::unique_ptr<FIFO::FIFO_control> fifo_ctrl;
 		atomic_t<bool> rsx_thread_running{ false };
 		std::vector<std::pair<u32, u32>> dump_callstack_list() const override;
-		std::string dump_misc() const override;
+		void dump_misc(std::string& ret, std::any& custom_data) const override;
 
 	protected:
 		FIFO::flattening_helper m_flattener;
@@ -156,7 +149,7 @@ namespace rsx
 		virtual f64 get_display_refresh_rate() const = 0;
 
 		// Invalidated memory range
-		address_range m_invalidated_memory_range;
+		address_range32 m_invalidated_memory_range;
 
 		// Profiler
 		rsx::profiling_timer m_profiler;
@@ -222,6 +215,8 @@ namespace rsx
 		atomic_bitmask_t<flip_request> async_flip_requested{};
 		u8 async_flip_buffer{ 0 };
 
+		surface_scaling_config_t resolution_scaling_config{};
+
 		void capture_frame(const std::string& name);
 		const backend_configuration& get_backend_config() const { return backend_config; }
 
@@ -248,10 +243,14 @@ namespace rsx
 
 		rsx::atomic_bitmask_t<rsx::eng_interrupt_reason> m_eng_interrupt_mask;
 		rsx::bitmask_t<rsx::pipeline_state> m_graphics_state;
+
 		u64 ROP_sync_timestamp = 0;
 
 		program_hash_util::fragment_program_utils::fragment_program_metadata current_fp_metadata = {};
 		program_hash_util::vertex_program_utils::vertex_program_metadata current_vp_metadata = {};
+
+		std::array<std::unique_ptr<rsx::sampled_image_descriptor_base>, rsx::limits::fragment_textures_count> fs_sampler_state = {};
+		std::array<std::unique_ptr<rsx::sampled_image_descriptor_base>, rsx::limits::vertex_textures_count> vs_sampler_state = {};
 
 		std::array<u32, 4> get_color_surface_addresses() const;
 		u32 get_zeta_surface_address() const;
@@ -260,11 +259,17 @@ namespace rsx
 		void get_framebuffer_layout(rsx::framebuffer_creation_context context, framebuffer_layout &layout);
 		bool get_scissor(areau& region, bool clip_viewport);
 
+		// Notify framebuffer layout has been committed.
+		// FIXME: This should not be here
+		void on_framebuffer_layout_updated();
+
 		RSXVertexProgram current_vertex_program = {};
 		RSXFragmentProgram current_fragment_program = {};
 
 		vertex_program_texture_state current_vp_texture_state = {};
 		fragment_program_texture_state current_fp_texture_state = {};
+
+		program_cache_hint_t m_program_cache_hint;
 
 		// Runs shader prefetch and resolves pipeline status flags
 		void analyse_current_rsx_pipeline();
@@ -354,7 +359,7 @@ namespace rsx
 		virtual void flip(const display_flip_info_t& info) = 0;
 		virtual u64 timestamp();
 		virtual bool on_access_violation(u32 /*address*/, bool /*is_writing*/) { return false; }
-		virtual void on_invalidate_memory_range(const address_range & /*range*/, rsx::invalidation_cause) {}
+		virtual void on_invalidate_memory_range(const address_range32 & /*range*/, rsx::invalidation_cause) {}
 		virtual void notify_tile_unbound(u32 /*tile*/) {}
 
 		// control
@@ -375,8 +380,9 @@ namespace rsx
 		// sync
 		void sync();
 		flags32_t read_barrier(u32 memory_address, u32 memory_range, bool unconditional);
+		virtual void write_barrier(u32 /*memory_address*/, u32 /*memory_range*/) {}
 		virtual void sync_hint(FIFO::interrupt_hint hint, reports::sync_hint_payload_t payload);
-		virtual bool release_GCM_label(u32 /*address*/, u32 /*value*/) { return false; }
+		virtual bool release_GCM_label(u32 /*type*/, u32 /*address*/, u32 /*value*/) { return false; }
 
 	protected:
 
@@ -436,6 +442,8 @@ namespace rsx
 
 		bool is_current_vertex_program_instanced() const { return !!(current_vertex_program.ctrl & RSX_SHADER_CONTROL_INSTANCED_CONSTANTS); }
 
+		virtual bool is_current_program_interpreted() const { return false; }
+
 	public:
 		void reset();
 		void init(u32 ctrlAddress);
@@ -463,5 +471,10 @@ namespace rsx
 	inline thread* get_current_renderer()
 	{
 		return g_fxo->try_get<rsx::thread>();
+	}
+
+	inline const backend_configuration& get_renderer_backend_config()
+	{
+		return g_fxo->get<rsx::thread>().get_backend_config();
 	}
 }

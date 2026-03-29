@@ -2,7 +2,6 @@
 #include <util/types.hpp>
 #include <util/bless.hpp>
 #include <span>
-#include <vector>
 #include <functional>
 
 namespace rsx
@@ -10,7 +9,7 @@ namespace rsx
 	template <typename T>
 	concept SpanLike = requires(T t)
 	{
-		{ t.data() } -> std::convertible_to<void*>;
+		{ t.data() } -> std::convertible_to<const void*>;
 		{ t.size_bytes() } -> std::convertible_to<usz>;
 	};
 
@@ -72,15 +71,17 @@ namespace rsx
 			return static_cast<T*>(m_ptr);
 		}
 
-		usz size() const
+		template <Integral T = usz>
+		T size() const
 		{
-			return m_size;
+			return static_cast<T>(m_size);
 		}
 
 		template<typename T>
 		std::span<T> as_span() const
 		{
 			auto bytes = data();
+			ensure((reinterpret_cast<uintptr_t>(bytes) & (sizeof(T) - 1)) == 0, "IO buffer span cast requires naturally aligned pointers.");
 			return { utils::bless<T>(bytes), m_size / sizeof(T) };
 		}
 

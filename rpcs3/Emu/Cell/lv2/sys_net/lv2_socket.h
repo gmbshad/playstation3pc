@@ -6,6 +6,7 @@
 #include "Utilities/mutex.h"
 #include "Emu/IdManager.h"
 #include "Emu/Cell/lv2/sys_net.h"
+#include "Emu/NP/ip_address.h"
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -19,12 +20,6 @@
 #ifdef __clang__
 #pragma GCC diagnostic pop
 #endif
-#endif
-
-#ifdef _WIN32
-using socket_type = uptr;
-#else
-using socket_type = int;
 #endif
 
 enum class thread_state : u32;
@@ -109,7 +104,7 @@ public:
 	virtual void close()          = 0;
 	virtual s32 shutdown(s32 how) = 0;
 
-	virtual s32 poll(sys_net_pollfd& sn_pfd, pollfd& native_pfd)                           = 0;
+	virtual void poll(sys_net_pollfd& sn_pfd, pollfd& native_pfd) = 0;
 	virtual std::tuple<bool, bool, bool> select(bs_t<poll_t> selected, pollfd& native_pfd) = 0;
 
 	error_code abort_socket(s32 flags);
@@ -126,7 +121,7 @@ protected:
 	shared_mutex mutex;
 	s32 lv2_id = 0;
 
-	socket_type socket = 0;
+	socket_type native_socket = 0;
 
 	lv2_socket_family family{};
 	lv2_socket_type type{};

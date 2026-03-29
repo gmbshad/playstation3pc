@@ -4,13 +4,14 @@
 #include <QListWidget>
 
 #include "util/types.hpp"
+#include "util/shared_ptr.hpp"
 #include "custom_dialog.h"
-#include "Emu/NP/rpcn_client.h"
+#include "Emu/Cell/Modules/sceNp.h"
 
 struct recvmessage_signal_struct
 {
 	shared_ptr<std::pair<std::string, message_data>> msg;
-	u64 msg_id;
+	u64 msg_id = 0;
 };
 
 Q_DECLARE_METATYPE(recvmessage_signal_struct);

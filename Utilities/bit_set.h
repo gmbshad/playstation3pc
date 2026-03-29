@@ -23,7 +23,6 @@ Intersection (&) and symmetric difference (^) is also available.
 
 #include "util/types.hpp"
 #include "util/atomic.hpp"
-#include "Utilities/StrFmt.h"
 
 template <typename T>
 concept BitSetEnum = std::is_enum_v<T> && requires(T x)
@@ -385,7 +384,10 @@ public:
 };
 
 template <typename T>
-struct fmt_unveil<bs_t<T>, void>
+struct fmt_unveil;
+
+template <typename T>
+struct fmt_unveil<bs_t<T>>
 {
 	// Format as is
 	using type = bs_t<T>;

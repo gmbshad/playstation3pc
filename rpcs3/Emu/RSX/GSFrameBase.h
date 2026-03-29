@@ -1,7 +1,6 @@
 #pragma once
 
 #include "util/types.hpp"
-#include "util/atomic.hpp"
 #include <vector>
 
 #include "display.h"
@@ -32,6 +31,6 @@ public:
 	virtual display_handle_t handle() const = 0;
 
 	virtual bool can_consume_frame() const = 0;
-	virtual void present_frame(std::vector<u8>& data, u32 pitch, u32 width, u32 height, bool is_bgra) const = 0;
-	virtual void take_screenshot(const std::vector<u8> sshot_data, u32 sshot_width, u32 sshot_height, bool is_bgra) = 0;
+	virtual void present_frame(std::vector<u8>&& data, u32 pitch, u32 width, u32 height, bool is_bgra) const = 0;
+	virtual void take_screenshot(std::vector<u8>&& sshot_data, u32 sshot_width, u32 sshot_height, bool is_bgra) = 0;
 };
