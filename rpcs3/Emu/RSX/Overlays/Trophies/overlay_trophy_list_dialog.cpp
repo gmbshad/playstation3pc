@@ -2,6 +2,7 @@
 #include "../overlay_manager.h"
 #include "overlay_trophy_list_dialog.h"
 #include "Emu/Cell/Modules/sceNpTrophy.h"
+#include "Emu/NP/rpcn_config.h"
 #include "Emu/System.h"
 #include "Emu/VFS.h"
 
@@ -9,7 +10,21 @@ namespace rsx
 {
 	namespace overlays
 	{
-		trophy_list_dialog::trophy_list_entry::trophy_list_entry(const std::string& name, const std::string& description, const std::string& trophy_type, const std::string& icon_path, bool hidden, bool locked, bool platinum_relevant)
+		static constexpr u16 trophy_list_y = 85;
+		static constexpr u16 trophy_list_h = 540;
+
+		struct trophy_list_entry : horizontal_layout
+		{
+		private:
+			std::unique_ptr<image_info> icon_data;
+
+		public:
+			trophy_list_entry(const SceNpTrophyDetails& details, const std::string& icon_path, bool locked, bool platinum_relevant);
+			s32 trophy_id = 0;
+		};
+
+		trophy_list_entry::trophy_list_entry(const SceNpTrophyDetails& details, const std::string& icon_path, bool locked, bool platinum_relevant)
+			: trophy_id(details.trophyId)
 		{
 			std::unique_ptr<overlay_element> image = std::make_unique<image_view>();
 			image->set_size(160, 110);
@@ -17,7 +32,7 @@ namespace rsx
 
 			if (fs::exists(icon_path))
 			{
-				icon_data = std::make_unique<image_info>(icon_path.c_str(), hidden || locked);
+				icon_data = std::make_unique<image_info>(icon_path, locked);
 				static_cast<image_view*>(image.get())->set_raw_image(icon_data.get());
 			}
 			else
@@ -27,10 +42,20 @@ namespace rsx
 				static_cast<image_view*>(image.get())->set_image_resource(resource_config::standard_image_resource::square);
 			}
 
+			std::string trophy_type;
+			switch (details.trophyGrade)
+			{
+			case SCE_NP_TROPHY_GRADE_BRONZE:   trophy_type = get_localized_string(localized_string_id::HOME_MENU_TROPHY_GRADE_BRONZE); break;
+			case SCE_NP_TROPHY_GRADE_SILVER:   trophy_type = get_localized_string(localized_string_id::HOME_MENU_TROPHY_GRADE_SILVER); break;
+			case SCE_NP_TROPHY_GRADE_GOLD:     trophy_type = get_localized_string(localized_string_id::HOME_MENU_TROPHY_GRADE_GOLD); break;
+			case SCE_NP_TROPHY_GRADE_PLATINUM: trophy_type = get_localized_string(localized_string_id::HOME_MENU_TROPHY_GRADE_PLATINUM); break;
+			default: trophy_type = "?"; break;
+			}
+
 			std::unique_ptr<overlay_element> text_stack  = std::make_unique<vertical_layout>();
 			std::unique_ptr<overlay_element> padding     = std::make_unique<spacer>();
-			std::unique_ptr<overlay_element> header_text = std::make_unique<label>(fmt::format("%s (%s%s)", (locked && !hidden) ? get_localized_string(localized_string_id::HOME_MENU_TROPHY_LOCKED_TITLE, name.c_str()) : name, trophy_type, platinum_relevant ? " - " + get_localized_string(localized_string_id::HOME_MENU_TROPHY_PLATINUM_RELEVANT) : ""));
-			std::unique_ptr<overlay_element> subtext     = std::make_unique<label>(description);
+			std::unique_ptr<overlay_element> header_text = std::make_unique<label>(fmt::format("%s (%s%s)", locked ? get_localized_string(localized_string_id::HOME_MENU_TROPHY_LOCKED_TITLE, details.name) : details.name, trophy_type, platinum_relevant ? " - " + get_localized_string(localized_string_id::HOME_MENU_TROPHY_PLATINUM_RELEVANT) : ""));
+			std::unique_ptr<overlay_element> subtext     = std::make_unique<label>(details.description);
 
 			padding->set_size(1, 1);
 			header_text->set_size(800, 40);
@@ -66,13 +91,11 @@ namespace rsx
 
 		trophy_list_dialog::trophy_list_dialog()
 		{
+			m_allow_input_on_pause = true;
+
 			m_dim_background = std::make_unique<overlay_element>();
 			m_dim_background->set_size(virtual_width, virtual_height);
 			m_dim_background->back_color.a = 0.9f;
-
-			m_list = std::make_unique<list_view>(virtual_width - 2 * 20, 540);
-			m_list->set_pos(20, 85);
-			m_list->set_cancel_only(true);
 
 			m_description = std::make_unique<label>();
 			m_description->set_font("Arial", 20);
@@ -80,6 +103,27 @@ namespace rsx
 			m_description->set_text("Select trophy"); // Fallback. I don't think this will ever be used, so I won't localize it.
 			m_description->auto_resize();
 			m_description->back_color.a = 0.f;
+
+			m_sort_button = std::make_unique<image_button>();
+			m_sort_button->set_text(localized_string_id::HOME_MENU_TROPHY_SORT_GAME_DEFAULT);
+			m_sort_button->set_image_resource(resource_config::standard_image_resource::triangle);
+			m_sort_button->set_size(120, 30);
+			m_sort_button->set_pos(460, trophy_list_y + trophy_list_h + 20);
+			m_sort_button->set_font("Arial", 16);
+
+			m_show_hidden_trophies_button = std::make_unique<image_button>();
+			m_show_hidden_trophies_button->set_text(m_show_hidden_trophies ? localized_string_id::HOME_MENU_TROPHY_HIDE_HIDDEN_TROPHIES : localized_string_id::HOME_MENU_TROPHY_SHOW_HIDDEN_TROPHIES);
+			m_show_hidden_trophies_button->set_image_resource(resource_config::standard_image_resource::square);
+			m_show_hidden_trophies_button->set_size(120, 30);
+			m_show_hidden_trophies_button->set_pos(180, trophy_list_y + trophy_list_h + 20);
+			m_show_hidden_trophies_button->set_font("Arial", 16);
+
+			m_sync_trophies_button = std::make_unique<image_button>();
+			m_sync_trophies_button->set_text(localized_string_id::HOME_MENU_TROPHY_SYNC_TROPHIES);
+			m_sync_trophies_button->set_image_resource(resource_config::standard_image_resource::select);
+			m_sync_trophies_button->set_size(120, 30);
+			m_sync_trophies_button->set_pos(700, trophy_list_y + trophy_list_h + 20);
+			m_sync_trophies_button->set_font("Arial", 16);
 
 			fade_animation.duration_sec = 0.15f;
 
@@ -103,8 +147,32 @@ namespace rsx
 			switch (button_press)
 			{
 			case pad_button::circle:
-				Emu.GetCallbacks().play_sound(fs::get_config_dir() + "sounds/snd_cancel.wav");
+				play_sound(sound_effect::cancel);
 				close_dialog = true;
+				break;
+			case pad_button::square:
+				m_show_hidden_trophies = !m_show_hidden_trophies;
+				m_list_dirty = true;
+				break;
+			case pad_button::triangle:
+			{
+				// Cycle through sort modes
+				switch (m_sort_mode)
+				{
+				case trophy_sort_mode::game_default: m_sort_mode = trophy_sort_mode::not_earned; break;
+				case trophy_sort_mode::not_earned:   m_sort_mode = trophy_sort_mode::earned_date; break;
+				case trophy_sort_mode::earned_date:  m_sort_mode = trophy_sort_mode::grade; break;
+				case trophy_sort_mode::grade:        m_sort_mode = trophy_sort_mode::game_default; break;
+				}
+				m_list_dirty = true;
+				break;
+			}
+			case pad_button::select:
+				// Only start a new sync if not already in progress
+				if (m_sync_status.load() != 1)
+				{
+					sync_trophies_async();
+				}
 				break;
 			case pad_button::dpad_up:
 			case pad_button::ls_up:
@@ -139,7 +207,7 @@ namespace rsx
 			// Play a sound unless this is a fast auto repeat which would induce a nasty noise
 			else if (!is_auto_repeat || m_auto_repeat_ms_interval >= m_auto_repeat_ms_interval_default)
 			{
-				Emu.GetCallbacks().play_sound(fs::get_config_dir() + "sounds/snd_cursor.wav");
+				play_sound(sound_effect::cursor);
 			}
 		}
 
@@ -150,10 +218,49 @@ namespace rsx
 				return {};
 			}
 
+			if (m_show_hidden_trophies_last != m_show_hidden_trophies)
+			{
+				m_show_hidden_trophies_button->set_text(m_show_hidden_trophies ? localized_string_id::HOME_MENU_TROPHY_HIDE_HIDDEN_TROPHIES : localized_string_id::HOME_MENU_TROPHY_SHOW_HIDDEN_TROPHIES);
+				m_show_hidden_trophies_last = m_show_hidden_trophies;
+			}
+
+			// Update sync button label based on current sync state
+			switch (m_sync_status.load())
+			{
+			case 1: m_sync_trophies_button->set_text(localized_string_id::HOME_MENU_TROPHY_SYNCING_TROPHIES); break;
+			case 2: m_sync_trophies_button->set_text(localized_string_id::HOME_MENU_TROPHY_SYNC_SUCCESS); break;
+			case 3: m_sync_trophies_button->set_text(localized_string_id::HOME_MENU_TROPHY_SYNC_FAILED); break;
+			default: m_sync_trophies_button->set_text(localized_string_id::HOME_MENU_TROPHY_SYNC_TROPHIES); break;
+			}
+
+			if (m_sort_mode_last != m_sort_mode)
+			{
+				localized_string_id sort_label_id;
+				switch (m_sort_mode)
+				{
+				case trophy_sort_mode::not_earned:  sort_label_id = localized_string_id::HOME_MENU_TROPHY_SORT_NOT_EARNED; break;
+				case trophy_sort_mode::earned_date: sort_label_id = localized_string_id::HOME_MENU_TROPHY_SORT_EARNED_DATE; break;
+				case trophy_sort_mode::grade:       sort_label_id = localized_string_id::HOME_MENU_TROPHY_SORT_GRADE; break;
+				default:                            sort_label_id = localized_string_id::HOME_MENU_TROPHY_SORT_GAME_DEFAULT; break;
+				}
+				m_sort_button->set_text(sort_label_id);
+				m_sort_mode_last = m_sort_mode;
+			}
+
 			compiled_resource result;
 			result.add(m_dim_background->get_compiled());
-			result.add(m_list->get_compiled());
+			if (m_list_dirty.exchange(false))
+			{
+				reload();
+			}
+			if (m_list)
+			{
+				result.add(m_list->get_compiled());
+			}
 			result.add(m_description->get_compiled());
+			result.add(m_sort_button->get_compiled());
+			result.add(m_show_hidden_trophies_button->get_compiled());
+			result.add(m_sync_trophies_button->get_compiled());
 
 			fade_animation.apply(result);
 
@@ -164,108 +271,14 @@ namespace rsx
 		{
 			visible = false;
 
-			std::unique_ptr<trophy_data> data = load_trophies(trop_name);
-			ensure(data && data->trop_usr);
-
-			rsx_log.trace("Populating Trophy List Overlay with %s %s", data->game_name, data->path);
-
-			std::vector<std::unique_ptr<overlay_element>> entries;
-
-			const int all_trophies = data->trop_usr->GetTrophiesCount();
-			const int unlocked_trophies = data->trop_usr->GetUnlockedTrophiesCount();
-			const int percentage = (all_trophies > 0) ? (100 * unlocked_trophies / all_trophies) : 0;
-
-			std::shared_ptr<rXmlNode> trophy_base = data->trop_config.GetRoot();
-			if (!trophy_base)
-			{
-				rsx_log.error("Populating Trophy List Overlay failed (root is null): %s %s", data->game_name, data->path);
-			}
-
-			const std::string hidden_title = get_localized_string(localized_string_id::HOME_MENU_TROPHY_HIDDEN_TITLE);
-			const std::string hidden_description = get_localized_string(localized_string_id::HOME_MENU_TROPHY_HIDDEN_DESCRIPTION);
-
-			for (std::shared_ptr<rXmlNode> n = trophy_base ? trophy_base->GetChildren() : nullptr; n; n = n->GetNext())
-			{
-				// Only show trophies.
-				if (n->GetName() != "trophy")
-				{
-					continue;
-				}
-
-				// Get data (stolen graciously from sceNpTrophy.cpp)
-				SceNpTrophyDetails details{};
-
-				// Get trophy id
-				const s32 trophy_id = atoi(n->GetAttribute("id").c_str());
-				details.trophyId = trophy_id;
-
-				// Get platinum link id (we assume there only exists one platinum trophy per game for now)
-				const s32 platinum_link_id = atoi(n->GetAttribute("pid").c_str());
-				const bool platinum_relevant = platinum_link_id >= 0;
-
-				// Get trophy type
-				std::string trophy_type;
-
-				switch (n->GetAttribute("ttype")[0])
-				{
-				case 'B': details.trophyGrade = SCE_NP_TROPHY_GRADE_BRONZE;   trophy_type = get_localized_string(localized_string_id::HOME_MENU_TROPHY_GRADE_BRONZE); break;
-				case 'S': details.trophyGrade = SCE_NP_TROPHY_GRADE_SILVER;   trophy_type = get_localized_string(localized_string_id::HOME_MENU_TROPHY_GRADE_SILVER); break;
-				case 'G': details.trophyGrade = SCE_NP_TROPHY_GRADE_GOLD;     trophy_type = get_localized_string(localized_string_id::HOME_MENU_TROPHY_GRADE_GOLD); break;
-				case 'P': details.trophyGrade = SCE_NP_TROPHY_GRADE_PLATINUM; trophy_type = get_localized_string(localized_string_id::HOME_MENU_TROPHY_GRADE_PLATINUM); break;
-				default: rsx_log.warning("Unknown trophy grade %s", n->GetAttribute("ttype")); break;
-				}
-
-				// Get hidden state
-				const bool hidden = n->GetAttribute("hidden")[0] == 'y';
-				details.hidden = hidden;
-
-				// Get name and detail
-				if (hidden)
-				{
-					strcpy_trunc(details.name, hidden_title);
-					strcpy_trunc(details.description, hidden_description);
-				}
-				else
-				{
-					for (std::shared_ptr<rXmlNode> n2 = n->GetChildren(); n2; n2 = n2->GetNext())
-					{
-						const std::string name = n2->GetName();
-						if (name == "name")
-						{
-							strcpy_trunc(details.name, n2->GetNodeContent());
-						}
-						else if (name == "detail")
-						{
-							strcpy_trunc(details.description, n2->GetNodeContent());
-						}
-					}
-				}
-
-				const bool unlocked = data->trop_usr->GetTrophyUnlockState(trophy_id);
-				const auto icon_path_it = data->trophy_image_paths.find(trophy_id);
-
-				std::unique_ptr<overlay_element> entry = std::make_unique<trophy_list_entry>(details.name, details.description, trophy_type, icon_path_it != data->trophy_image_paths.cend() ? icon_path_it->second : "", hidden, !unlocked, platinum_relevant);
-				entries.emplace_back(std::move(entry));
-			}
-
-			for (auto& entry : entries)
-			{
-				m_list->add_entry(entry);
-			}
-
-			if (!m_list->m_items.empty())
-			{
-				m_list->select_entry(0);
-			}
-
-			m_description->set_text(get_localized_string(localized_string_id::HOME_MENU_TROPHY_LIST_TITLE, fmt::format("%d%% (%d/%d)", percentage, unlocked_trophies, all_trophies).c_str()));
-			m_description->auto_resize();
+			m_trop_name = trop_name;
+			m_trophy_data = load_trophies(trop_name);
+			ensure(m_trophy_data && m_trophy_data->trop_usr);
 
 			fade_animation.current = color4f(0.f);
 			fade_animation.end = color4f(1.f);
 			fade_animation.active = true;
 
-			this->on_close = std::move(on_close);
 			visible = true;
 
 			const auto notify = std::make_shared<atomic_t<u32>>(0);
@@ -280,6 +293,126 @@ namespace rsx
 			{
 				notify->wait(0, atomic_wait_timeout{1'000'000});
 			}
+		}
+
+		bool trophy_list_dialog::rpcn_configured()
+		{
+			cfg_rpcn cfg;
+			cfg.load();
+			return !cfg.get_npid().empty() && !cfg.get_password().empty();
+		}
+
+		void trophy_list_dialog::sync_trophies_async()
+		{
+			if (!rpcn_configured())
+			{
+				rsx_log.warning("Trophy sync requested but RPCN is not configured.");
+				m_sync_status = 3; // error
+				return;
+			}
+
+			if (!m_trophy_data || !m_trophy_data->trop_usr)
+			{
+				rsx_log.error("Trophy sync requested but trophy data is not loaded.");
+				m_sync_status = 3;
+				return;
+			}
+
+			m_sync_status = 1; // syncing
+
+			const std::string trop_name = m_trop_name;
+			atomic_t<u8>* sync_status = &m_sync_status;
+			atomic_t<bool>* list_dirty = &m_list_dirty;
+
+			SceNpCommunicationId comm_id{};
+			{
+				if (trop_name.size() >= COMMUNICATION_ID_SIZE)
+				{
+					const auto& n = trop_name;
+					std::memcpy(comm_id.data, n.c_str(), COMMUNICATION_ID_COMID_COMPONENT_SIZE);
+					comm_id.data[COMMUNICATION_ID_COMID_COMPONENT_SIZE] = '\0';
+					comm_id.num = static_cast<u8>(std::atoi(n.c_str() + COMMUNICATION_ID_COMID_COMPONENT_SIZE + 1));
+				}
+				else
+				{
+					rsx_log.error("Trophy sync: unexpected trop_name format: %s", trop_name);
+					m_sync_status = 3;
+					return;
+				}
+			}
+
+			const u32 trophy_count = m_trophy_data->trop_usr->GetTrophiesCount();
+			std::vector<std::pair<s32, s64>> local_unlocked;
+			local_unlocked.reserve(trophy_count);
+			for (u32 i = 0; i < trophy_count; i++)
+			{
+				if (m_trophy_data->trop_usr->GetTrophyUnlockState(static_cast<s32>(i)))
+				{
+					local_unlocked.emplace_back(
+						static_cast<s32>(i),
+						static_cast<s64>(m_trophy_data->trop_usr->GetTrophyTimestamp(static_cast<s32>(i))));
+				}
+			}
+
+			const std::string tropusr_vfs_path = "/dev_hdd0/home/" + Emu.GetUsr() + "/trophy/" + trop_name + "/TROPUSR.DAT";
+			const std::string tropconf_vfs_path = "/dev_hdd0/home/" + Emu.GetUsr() + "/trophy/" + trop_name + "/TROPCONF.SFM";
+
+			std::thread([=, local_unlocked = std::move(local_unlocked)]() mutable
+			{
+				g_cfg_rpcn.load();
+
+				auto rpcn = rpcn::rpcn_client::get_instance(0);
+
+				if (auto res = rpcn->wait_for_connection(); res != rpcn::rpcn_state::failure_no_failure)
+				{
+					rsx_log.error("Trophy sync: failed to connect to RPCN: %s", rpcn::rpcn_state_to_string(res));
+					*sync_status = 3;
+					return;
+				}
+
+				if (auto res = rpcn->wait_for_authentified(); res != rpcn::rpcn_state::failure_no_failure)
+				{
+					rsx_log.error("Trophy sync: failed to authenticate with RPCN: %s", rpcn::rpcn_state_to_string(res));
+					*sync_status = 3;
+					return;
+				}
+
+				std::vector<std::pair<s32, s64>> srv_trophies = rpcn->sync_trophies(comm_id, local_unlocked);
+
+				if (!srv_trophies.empty())
+				{
+					auto tropusr = std::make_unique<TROPUSRLoader>();
+					if (tropusr->Load(tropusr_vfs_path, tropconf_vfs_path).success)
+					{
+						const u32 count = tropusr->GetTrophiesCount();
+						bool changed = false;
+						for (const auto& [tid, ts] : srv_trophies)
+						{
+							if (tid >= 0 && tid < static_cast<s32>(count) && ts >= 0 && !tropusr->GetTrophyUnlockState(tid))
+							{
+								(void)tropusr->UnlockTrophy(tid, static_cast<u64>(ts), static_cast<u64>(ts));
+								changed = true;
+							}
+						}
+
+						if (changed)
+						{
+							if (!tropusr->Save(tropusr_vfs_path))
+								rsx_log.error("Trophy sync: failed to save TROPUSR after sync for %s", trop_name);
+
+							*list_dirty = true;
+						}
+					}
+					else
+					{
+						rsx_log.error("Trophy sync: failed to reload TROPUSR for %s", trop_name);
+						*sync_status = 3;
+						return;
+					}
+				}
+
+				*sync_status = 2; // success
+			}).detach();
 		}
 
 		std::unique_ptr<trophy_data> trophy_list_dialog::load_trophies(const std::string& trop_name) const
@@ -351,6 +484,173 @@ namespace rsx
 			config.release();
 
 			return game_trophy_data;
+		}
+
+		void trophy_list_dialog::reload()
+		{
+			ensure(m_trophy_data);
+
+			if (!m_trop_name.empty())
+			{
+				const std::string tropusr_path = "/dev_hdd0/home/" + Emu.GetUsr() + "/trophy/" + m_trop_name + "/TROPUSR.DAT";
+				const std::string tropconf_path = "/dev_hdd0/home/" + Emu.GetUsr() + "/trophy/" + m_trop_name + "/TROPCONF.SFM";
+				auto fresh_usr = std::make_unique<TROPUSRLoader>();
+				if (fresh_usr->Load(tropusr_path, tropconf_path).success)
+					m_trophy_data->trop_usr = std::move(fresh_usr);
+			}
+
+			rsx_log.trace("Reloading Trophy List Overlay with %s %s", m_trophy_data->game_name, m_trophy_data->path);
+
+			s32 selected_index = m_list ? m_list->get_selected_index() : 0;
+			const overlay_element* old_trophy = m_list ? m_list->get_selected_entry() : nullptr;
+			const s32 old_trophy_id = old_trophy ? static_cast<const trophy_list_entry*>(old_trophy)->trophy_id : 0;
+
+			const int all_trophies = m_trophy_data->trop_usr->GetTrophiesCount();
+			const int unlocked_trophies = m_trophy_data->trop_usr->GetUnlockedTrophiesCount();
+			const int percentage = (all_trophies > 0) ? (100 * unlocked_trophies / all_trophies) : 0;
+
+			std::shared_ptr<rXmlNode> trophy_base = m_trophy_data->trop_config.GetRoot();
+			if (!trophy_base)
+			{
+				rsx_log.error("Populating Trophy List Overlay failed (root is null): %s %s", m_trophy_data->game_name, m_trophy_data->path);
+			}
+
+			const std::string hidden_title = get_localized_string(localized_string_id::HOME_MENU_TROPHY_HIDDEN_TITLE);
+			const std::string hidden_description = get_localized_string(localized_string_id::HOME_MENU_TROPHY_HIDDEN_DESCRIPTION);
+
+			struct trophy_entry_data
+			{
+				SceNpTrophyDetails details{};
+				std::string icon_path;
+				bool unlocked = false;
+				bool platinum_relevant = false;
+				u64 timestamp = 0;
+			};
+
+			std::vector<trophy_entry_data> trophy_entries;
+
+			for (std::shared_ptr<rXmlNode> n = trophy_base ? trophy_base->GetChildren() : nullptr; n; n = n->GetNext())
+			{
+				// Only show trophies.
+				if (n->GetName() != "trophy")
+				{
+					continue;
+				}
+
+				// Get data (stolen graciously from sceNpTrophy.cpp)
+				trophy_entry_data entry{};
+				entry.details.trophyId = atoi(n->GetAttribute("id").c_str());
+				entry.details.hidden = n->GetAttribute("hidden")[0] == 'y';
+
+				entry.unlocked = m_trophy_data->trop_usr->GetTrophyUnlockState(entry.details.trophyId);
+				entry.timestamp = m_trophy_data->trop_usr->GetTrophyTimestamp(entry.details.trophyId);
+
+				const bool hide_trophy = entry.details.hidden && !entry.unlocked && !m_show_hidden_trophies;
+				if (hide_trophy)
+				{
+					continue;
+				}
+
+				if (m_sort_mode == trophy_sort_mode::not_earned && entry.unlocked)
+				{
+					continue;
+				}
+
+				// Get platinum link id (we assume there only exists one platinum trophy per game for now)
+				const s32 platinum_link_id = atoi(n->GetAttribute("pid").c_str());
+				entry.platinum_relevant = platinum_link_id >= 0;
+
+				// Get trophy type
+				switch (n->GetAttribute("ttype")[0])
+				{
+				case 'B': entry.details.trophyGrade = SCE_NP_TROPHY_GRADE_BRONZE; break;
+				case 'S': entry.details.trophyGrade = SCE_NP_TROPHY_GRADE_SILVER; break;
+				case 'G': entry.details.trophyGrade = SCE_NP_TROPHY_GRADE_GOLD; break;
+				case 'P': entry.details.trophyGrade = SCE_NP_TROPHY_GRADE_PLATINUM; break;
+				default: rsx_log.warning("Unknown trophy grade %s", n->GetAttribute("ttype")); break;
+				}
+
+				// Get name and detail
+				if (entry.details.hidden && !entry.unlocked)
+				{
+					strcpy_trunc(entry.details.name, hidden_title);
+					strcpy_trunc(entry.details.description, hidden_description);
+				}
+				else
+				{
+					for (std::shared_ptr<rXmlNode> n2 = n->GetChildren(); n2; n2 = n2->GetNext())
+					{
+						const std::string name = n2->GetName();
+						if (name == "name")
+						{
+							strcpy_trunc(entry.details.name, n2->GetNodeContent());
+						}
+						else if (name == "detail")
+						{
+							strcpy_trunc(entry.details.description, n2->GetNodeContent());
+						}
+					}
+				}
+
+				const auto icon_path_it = m_trophy_data->trophy_image_paths.find(entry.details.trophyId);
+				entry.icon_path = (icon_path_it != m_trophy_data->trophy_image_paths.cend()) ? icon_path_it->second : "";
+
+				trophy_entries.emplace_back(std::move(entry));
+			}
+
+			switch (m_sort_mode)
+			{
+			case trophy_sort_mode::earned_date:
+				std::stable_sort(trophy_entries.begin(), trophy_entries.end(), [](const trophy_entry_data& a, const trophy_entry_data& b)
+				{
+					if (a.unlocked != b.unlocked) return a.unlocked > b.unlocked;
+					return a.timestamp > b.timestamp;
+				});
+				break;
+			case trophy_sort_mode::grade:
+				std::stable_sort(trophy_entries.begin(), trophy_entries.end(), [](const trophy_entry_data& a, const trophy_entry_data& b)
+				{
+					return a.details.trophyGrade < b.details.trophyGrade;
+				});
+				break;
+			default:
+				break;
+			}
+
+			std::vector<std::unique_ptr<overlay_element>> entries;
+
+			for (const trophy_entry_data& entry : trophy_entries)
+			{
+				if (entry.details.trophyId == old_trophy_id)
+				{
+					selected_index = static_cast<s32>(entries.size());
+				}
+
+				entries.emplace_back(std::make_unique<trophy_list_entry>(entry.details, entry.icon_path, !entry.unlocked, entry.platinum_relevant));
+			}
+
+			// Recreate list
+			if (m_list)
+			{
+				status_flags |= status_bits::invalidate_image_cache;
+			}
+
+			m_list = std::make_unique<list_view>(virtual_width - 2 * 20, trophy_list_h);
+			m_list->set_pos(20, trophy_list_y);
+			m_list->set_cancel_only(true);
+
+			for (auto& entry : entries)
+			{
+				m_list->add_entry(entry);
+			}
+
+			if (!m_list->m_items.empty())
+			{
+				m_list->select_entry(selected_index);
+			}
+
+			m_description->set_text(get_localized_string(localized_string_id::HOME_MENU_TROPHY_LIST_TITLE, "%d%% (%d/%d)", percentage, unlocked_trophies, all_trophies));
+			m_description->auto_resize();
 		}
 	} // namespace overlays
 } // namespace RSX

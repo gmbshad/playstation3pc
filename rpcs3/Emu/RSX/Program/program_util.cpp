@@ -33,7 +33,7 @@ namespace rsx
 			std::memcpy(dst, src, sizeof(TIU_slot) * 4); return;
 		default:
 			break;
-		};
+		}
 
 		const auto start = std::countr_zero(mask);
 		const auto end = 16 - std::countl_zero(mask);
@@ -110,7 +110,7 @@ namespace rsx
 			multisampled_textures == other.multisampled_textures;
 	}
 
-	int VertexProgramBase::TranslateConstantsRange(int first_index, int count) const
+	int VertexProgramBase::translate_constants_range(int first_index, int count) const
 	{
 		// The constant ids should be sorted, so just find the first one and check for continuity
 		int index = -1;
@@ -156,5 +156,32 @@ namespace rsx
 
 		// OOB or partial match
 		return -1;
+	}
+
+	bool VertexProgramBase::overlaps_constants_range(int first_index, int count) const
+	{
+		if (has_indexed_constants)
+		{
+			return true;
+		}
+
+		const int last_index = first_index + count - 1;
+
+		// Early rejection test
+		if (constant_ids.empty() || first_index > constant_ids.back() || last_index < first_index)
+		{
+			return false;
+		}
+
+		// Check for any hits
+		for (u16 idx : constant_ids)
+		{
+			if (idx >= first_index && idx <= last_index)
+			{
+				return true;
+			}
+		}
+
+		return false;
 	}
 }

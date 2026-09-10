@@ -1,8 +1,6 @@
 #include "File.h"
 #include "mutex.h"
 #include "StrFmt.h"
-#include "StrUtil.h"
-#include "Crypto/sha1.h"
 
 #include <span>
 #include <unordered_map>
@@ -16,12 +14,21 @@
 
 using namespace std::literals::string_literals;
 
+#ifdef ANDROID
+std::string g_android_executable_dir;
+std::string g_android_config_dir;
+std::string g_android_cache_dir;
+#endif
+
 #ifdef _WIN32
+
+#include "Utilities/StrUtil.h"
 
 #include <cwchar>
 #include <Windows.h>
+#include <winioctl.h>
 
-static std::unique_ptr<wchar_t[]> to_wchar(const std::string& source)
+static std::unique_ptr<wchar_t[]> to_wchar(std::string_view source)
 {
 	// String size + null terminator
 	const usz buf_size = source.size() + 1;
@@ -31,6 +38,17 @@ static std::unique_ptr<wchar_t[]> to_wchar(const std::string& source)
 
 	// Buffer for max possible output length
 	std::unique_ptr<wchar_t[]> buffer(new wchar_t[buf_size + 8 + 32768]);
+
+	// If path points to an optical raw device, copy it AS IS
+	if (fs::is_optical_raw_device(std::string(source)))
+	{
+		ensure(MultiByteToWideChar(CP_UTF8, 0, source.data(), size, buffer.get() + 32768, size)); // "to_wchar"
+
+		// Canonicalize wide path (replace '/', ".", "..", \\ repetitions, etc)
+		ensure(GetFullPathNameW(buffer.get() + 32768, 32768, buffer.get(), nullptr) - 1 < 32768 - 1); // "to_wchar"
+
+		return buffer;
+	}
 
 	// Prepend wide path prefix (4 characters)
 	std::memcpy(buffer.get() + 32768, L"\\\\\?\\", 4 * sizeof(wchar_t));
@@ -44,7 +62,7 @@ static std::unique_ptr<wchar_t[]> to_wchar(const std::string& source)
 		std::memcpy(buffer.get() + 32768 + 4, L"UNC\\", 4 * sizeof(wchar_t));
 	}
 
-	ensure(MultiByteToWideChar(CP_UTF8, 0, source.c_str(), size, buffer.get() + 32768 + (unc ? 8 : 4), size)); // "to_wchar"
+	ensure(MultiByteToWideChar(CP_UTF8, 0, source.data(), size, buffer.get() + 32768 + (unc ? 8 : 4), size)); // "to_wchar"
 
 	// Canonicalize wide path (replace '/', ".", "..", \\ repetitions, etc)
 	ensure(GetFullPathNameW(buffer.get() + 32768, 32768, buffer.get(), nullptr) - 1 < 32768 - 1); // "to_wchar"
@@ -111,6 +129,7 @@ static fs::error to_error(DWORD e)
 	case ERROR_NEGATIVE_SEEK: return fs::error::inval;
 	case ERROR_DIRECTORY: return fs::error::inval;
 	case ERROR_INVALID_NAME: return fs::error::inval;
+	case ERROR_INVALID_FUNCTION: return fs::error::inval;
 	case ERROR_SHARING_VIOLATION: return fs::error::acces;
 	case ERROR_DIR_NOT_EMPTY: return fs::error::notempty;
 	case ERROR_NOT_READY: return fs::error::noent;
@@ -129,6 +148,7 @@ static fs::error to_error(DWORD e)
 #include <sys/statvfs.h>
 #include <sys/file.h>
 #include <sys/uio.h>
+#include <sys/ioctl.h>
 #include <dirent.h>
 #include <fcntl.h>
 #include <libgen.h>
@@ -140,12 +160,19 @@ static fs::error to_error(DWORD e)
 #include <copyfile.h>
 #include <mach-o/dyld.h>
 #include <limits.h>
+#include <sys/disk.h>
+#include <sys/param.h>
+#include <sys/mount.h>
 #elif defined(__linux__) || defined(__sun)
 #include <sys/sendfile.h>
 #include <sys/syscall.h>
+#include <sys/sysmacros.h>
 #include <linux/fs.h>
 #else
 #include <fstream>
+#include <sys/disk.h>
+#include <sys/param.h>
+#include <sys/mount.h>
 #endif
 
 static fs::error to_error(int e)
@@ -159,10 +186,101 @@ static fs::error to_error(int e)
 	case ENOTEMPTY: return fs::error::notempty;
 	case EROFS: return fs::error::readonly;
 	case EISDIR: return fs::error::isdir;
+	case ENOTDIR: return fs::error::notdir;
 	case ENOSPC: return fs::error::nospace;
 	case EXDEV: return fs::error::xdev;
 	default: return fs::error::unknown;
 	}
+}
+
+#if defined(__linux__)
+// Major numbers of the block devices an optical disc can be accessed through (see "Documentation/admin-guide/devices.txt")
+constexpr unsigned int s_scsi_cdrom_major = 11; // Optical drive (e.g. "/dev/sr0")
+constexpr unsigned int s_loopback_major = 7; // Disc image attached with "mount"/"losetup" (e.g. "/dev/loop0")
+#endif
+
+// Check whether the provided device node is an optical drive (e.g. a Blu-Ray Disc drive) or a mounted disc image
+static bool is_optical_device_node(const struct ::stat& file_info)
+{
+#if defined(__linux__)
+	// An optical drive is exposed as a block device using the SCSI CD-ROM major number (e.g. "/dev/sr0", "/dev/scd0" or the "/dev/cdrom" link).
+	// A disc image attached through "mount -o loop" (or "losetup") is exposed as a loopback block device instead (e.g. "/dev/loop0"):
+	// it is the counterpart of an ISO file mounted on Windows, where the resulting virtual drive is reported as DRIVE_CDROM
+	if (!S_ISBLK(file_info.st_mode))
+	{
+		return false;
+	}
+
+	const unsigned int device_major = major(file_info.st_rdev);
+
+	return device_major == s_scsi_cdrom_major || device_major == s_loopback_major;
+#elif defined(__APPLE__)
+	// The raw (unbuffered) device is a character device (e.g. "/dev/rdisk2").
+	// NOTE: there is no cheap way to tell an optical drive from any other raw disk here, so any raw disk node is accepted
+	return S_ISCHR(file_info.st_mode);
+#else
+	// On the BSDs an optical drive is a character device (e.g. "/dev/cd0")
+	return S_ISCHR(file_info.st_mode) || S_ISBLK(file_info.st_mode);
+#endif
+}
+
+// Check whether the path is the root of a mounted filesystem (e.g. the mount point of a disc): "st_dev" changes when crossing a mount point
+[[maybe_unused]] static bool is_mount_point(const std::string& path, const struct ::stat& file_info)
+{
+	// A file is never a mount point: discard it without any syscall (the "stat()" below would fail with ENOTDIR anyway)
+	if (!S_ISDIR(file_info.st_mode))
+	{
+		return false;
+	}
+
+	struct ::stat parent_info;
+
+	if (::stat((path + "/..").c_str(), &parent_info) != 0)
+	{
+		return false;
+	}
+
+	return parent_info.st_dev != file_info.st_dev;
+}
+
+// Retrieve the size of a raw device: "fstat()" reports no size (0) on such a device
+static u64 get_raw_device_size(int fd)
+{
+#if defined(__linux__)
+	if (u64 size = 0; ::ioctl(fd, BLKGETSIZE64, &size) == 0)
+	{
+		return size;
+	}
+#elif defined(__APPLE__)
+	u64 block_count = 0;
+	u32 block_size = 0;
+
+	if (::ioctl(fd, DKIOCGETBLOCKCOUNT, &block_count) == 0 && ::ioctl(fd, DKIOCGETBLOCKSIZE, &block_size) == 0)
+	{
+		if (block_size && block_count > u64{umax} / block_size)
+		{
+			fmt::throw_exception("Raw device size overflow (block count: 0x%x, block size: 0x%x)", block_count, block_size);
+		}
+
+		return block_count * block_size;
+	}
+#elif defined(__FreeBSD__) || defined(__DragonFly__)
+	if (off_t media_size = 0; ::ioctl(fd, DIOCGMEDIASIZE, &media_size) == 0)
+	{
+		return static_cast<u64>(media_size);
+	}
+#endif
+
+	// Fallback: seek to the end of the device (restoring the current position afterwards)
+	const off_t old_pos = ::lseek(fd, 0, SEEK_CUR);
+	const off_t end_pos = ::lseek(fd, 0, SEEK_END);
+
+	if (old_pos >= 0)
+	{
+		::lseek(fd, old_pos, SEEK_SET);
+	}
+
+	return end_pos > 0 ? static_cast<u64>(end_pos) : 0;
 }
 
 #endif
@@ -387,6 +505,413 @@ namespace fs
 		g_tls_error = error::readonly;
 		return false;
 	}
+
+#ifdef _WIN32
+	class windows_file final : public file_base
+	{
+		HANDLE m_handle;
+		u64 m_raw_device_size; // Size of the raw device, 0 if it's not one: it never changes, so it's retrieved once when the file is opened
+		atomic_t<u64> m_pos {0};
+
+	public:
+		windows_file(HANDLE handle, u64 raw_device_size = 0)
+			: m_handle(handle), m_raw_device_size(raw_device_size)
+		{
+		}
+
+		~windows_file() override
+		{
+			if (m_handle != nullptr)
+			{
+				CloseHandle(m_handle);
+			}
+		}
+
+		stat_t get_stat() override
+		{
+			FILE_BASIC_INFO basic_info {};
+			ensure(GetFileInformationByHandleEx(m_handle, FileBasicInfo, &basic_info, sizeof(FILE_BASIC_INFO))); // "file::stat"
+
+			stat_t info {};
+			info.is_directory = (basic_info.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+			info.is_writable = (basic_info.FileAttributes & FILE_ATTRIBUTE_READONLY) == 0;
+			info.size = this->size();
+			info.atime = to_time(basic_info.LastAccessTime);
+			info.mtime = to_time(basic_info.LastWriteTime);
+			info.ctime = info.mtime;
+
+			if (info.atime < info.mtime)
+				info.atime = info.mtime;
+
+			return info;
+		}
+
+		void sync() override
+		{
+			ensure(FlushFileBuffers(m_handle)); // "file::sync"
+		}
+
+		bool trunc(u64 length) override
+		{
+			FILE_END_OF_FILE_INFO _eof {};
+			_eof.EndOfFile.QuadPart = length;
+
+			if (!SetFileInformationByHandle(m_handle, FileEndOfFileInfo, &_eof, sizeof(_eof)))
+			{
+				g_tls_error = to_error(GetLastError());
+				return false;
+			}
+
+			return true;
+		}
+
+		u64 read(void* buffer, u64 count) override
+		{
+			u64 nread_sum = 0;
+
+			for (char* data = static_cast<char*>(buffer); count;)
+			{
+				const DWORD size = static_cast<DWORD>(std::min<u64>(count, DWORD{umax} & -4096));
+
+				DWORD nread = 0;
+				OVERLAPPED ovl{};
+				const u64 pos = m_pos;
+				ovl.Offset = DWORD(pos);
+				ovl.OffsetHigh = DWORD(pos >> 32);
+				ensure(ReadFile(m_handle, data, size, &nread, &ovl) || GetLastError() == ERROR_HANDLE_EOF); // "file::read"
+				nread_sum += nread;
+				m_pos += nread;
+
+				if (nread < size)
+				{
+					break;
+				}
+
+				count -= size;
+				data += size;
+			}
+
+			return nread_sum;
+		}
+
+		u64 read_at(u64 offset, void* buffer, u64 count) override
+		{
+			u64 nread_sum = 0;
+
+			for (char* data = static_cast<char*>(buffer); count;)
+			{
+				const DWORD size = static_cast<DWORD>(std::min<u64>(count, DWORD{umax} & -4096));
+
+				DWORD nread = 0;
+				OVERLAPPED ovl{};
+				ovl.Offset = DWORD(offset);
+				ovl.OffsetHigh = DWORD(offset >> 32);
+				ensure(ReadFile(m_handle, data, size, &nread, &ovl) || GetLastError() == ERROR_HANDLE_EOF); // "file::read"
+				nread_sum += nread;
+
+				if (nread < size)
+				{
+					break;
+				}
+
+				count -= size;
+				data += size;
+				offset += size;
+			}
+
+			return nread_sum;
+		}
+
+		u64 write(const void* buffer, u64 count) override
+		{
+			u64 nwritten_sum = 0;
+
+			for (const char* data = static_cast<const char*>(buffer); count;)
+			{
+				const DWORD size = static_cast<DWORD>(std::min<u64>(count, DWORD{umax} & -4096));
+
+				DWORD nwritten = 0;
+				OVERLAPPED ovl{};
+				const u64 pos = m_pos.fetch_add(size);
+				ovl.Offset = DWORD(pos);
+				ovl.OffsetHigh = DWORD(pos >> 32);
+				ensure(WriteFile(m_handle, data, size, &nwritten, &ovl)); // "file::write"
+				ensure(nwritten == size);
+				nwritten_sum += nwritten;
+
+				if (nwritten < size)
+				{
+					break;
+				}
+
+				count -= size;
+				data += size;
+			}
+
+			return nwritten_sum;
+		}
+
+		u64 seek(s64 offset, seek_mode whence) override
+		{
+			if (whence > seek_end)
+			{
+				fmt::throw_exception("Invalid whence (0x%x)", whence);
+			}
+
+			const s64 new_pos =
+				whence == fs::seek_set ? offset :
+				whence == fs::seek_cur ? offset + m_pos :
+				whence == fs::seek_end ? offset + size() : -1;
+
+			if (new_pos < 0)
+			{
+				fs::g_tls_error = fs::error::inval;
+				return -1;
+			}
+
+			m_pos = new_pos;
+			return m_pos;
+		}
+
+		u64 size() override
+		{
+			if (!m_raw_device_size)
+			{
+				// NOTE: this can fail if we access a mounted empty drive (e.g. after unmounting an iso).
+				LARGE_INTEGER size;
+
+				ensure(GetFileSizeEx(m_handle, &size)); // "file::size"
+				return size.QuadPart;
+			}
+
+			// For a raw device, the size was already retrieved with DeviceIoControl() when the file was opened
+			return m_raw_device_size;
+		}
+
+		native_handle get_handle() override
+		{
+			return m_handle;
+		}
+
+		file_id get_id() override
+		{
+			file_id id{"windows_file"};
+			id.data.resize(sizeof(FILE_ID_INFO));
+
+			FILE_ID_INFO info {};
+
+			if (!GetFileInformationByHandleEx(m_handle, FileIdInfo, &info, sizeof(info)))
+			{
+				// Try GetFileInformationByHandle as a fallback
+				BY_HANDLE_FILE_INFORMATION info2{};
+				ensure(GetFileInformationByHandle(m_handle, &info2));
+
+				info = {};
+				info.VolumeSerialNumber = info2.dwVolumeSerialNumber;
+				std::memcpy(&info.FileId, &info2.nFileIndexHigh, 8);
+			}
+
+			std::memcpy(id.data.data(), &info, sizeof(info));
+			return id;
+		}
+
+		void release() override
+		{
+			m_handle = nullptr;
+		}
+	};
+#else
+	class unix_file final : public file_base
+	{
+		int m_fd;
+		u64 m_raw_device_size; // Size of the raw device, 0 if it's not one: it never changes, so it's retrieved once when the file is opened
+
+	public:
+		unix_file(int fd, u64 raw_device_size = 0)
+			: m_fd(fd), m_raw_device_size(raw_device_size)
+		{
+		}
+
+		~unix_file() override
+		{
+			if (m_fd >= 0)
+			{
+				::close(m_fd);
+			}
+		}
+
+		stat_t get_stat() override
+		{
+			struct ::stat file_info;
+			ensure(::fstat(m_fd, &file_info) == 0); // "file::stat"
+
+			stat_t info {};
+			info.is_directory = S_ISDIR(file_info.st_mode);
+			info.is_writable = !m_raw_device_size && (file_info.st_mode & 0200); // HACK: approximation
+			info.size = m_raw_device_size ? m_raw_device_size : static_cast<u64>(file_info.st_size); // A raw device reports no size through "fstat()"
+			info.atime = file_info.st_atime;
+			info.mtime = file_info.st_mtime;
+			info.ctime = info.mtime;
+
+			if (info.atime < info.mtime)
+				info.atime = info.mtime;
+
+			return info;
+		}
+
+		void sync() override
+		{
+			ensure(::fsync(m_fd) == 0); // "file::sync"
+		}
+
+		bool trunc(u64 length) override
+		{
+			if (::ftruncate(m_fd, length) != 0)
+			{
+				g_tls_error = to_error(errno);
+				return false;
+			}
+
+			return true;
+		}
+
+		u64 read(void* buffer, u64 count) override
+		{
+			u64 result = 0;
+
+			// Loop because (huge?) read can be processed partially
+			while (auto r = ::read(m_fd, buffer, count))
+			{
+				ensure(r > 0); // "file::read"
+				count -= r;
+				result += r;
+				buffer = static_cast<u8*>(buffer) + r;
+				if (!count)
+					break;
+			}
+
+			return result;
+		}
+
+		u64 read_at(u64 offset, void* buffer, u64 count) override
+		{
+			u64 result = 0;
+
+			// For safety; see read()
+			while (auto r = ::pread(m_fd, buffer, count, offset))
+			{
+				ensure(r > 0); // "file::read_at"
+				count -= r;
+				offset += r;
+				result += r;
+				buffer = static_cast<u8*>(buffer) + r;
+				if (!count)
+					break;
+			}
+
+			return result;
+		}
+
+		u64 write(const void* buffer, u64 count) override
+		{
+			u64 result = 0;
+
+			// For safety; see read()
+			while (auto r = ::write(m_fd, buffer, count))
+			{
+				ensure(r > 0); // "file::write"
+				count -= r;
+				result += r;
+				buffer = static_cast<const u8*>(buffer) + r;
+				if (!count)
+					break;
+			}
+
+			return result;
+		}
+
+		u64 seek(s64 offset, seek_mode whence) override
+		{
+			if (whence > seek_end)
+			{
+				fmt::throw_exception("Invalid whence (0x%x)", whence);
+			}
+
+			const int mode =
+				whence == seek_set ? SEEK_SET :
+				whence == seek_cur ? SEEK_CUR : SEEK_END;
+
+			const auto result = ::lseek(m_fd, offset, mode);
+
+			if (result == -1)
+			{
+				g_tls_error = to_error(errno);
+				return -1;
+			}
+
+			return result;
+		}
+
+		u64 size() override
+		{
+			if (!m_raw_device_size)
+			{
+				struct ::stat file_info;
+				ensure(::fstat(m_fd, &file_info) == 0); // "file::size"
+
+				return file_info.st_size;
+			}
+
+			// For a raw device, the size was already retrieved with an ioctl when the file was opened
+			return m_raw_device_size;
+		}
+
+		native_handle get_handle() override
+		{
+			return m_fd;
+		}
+
+		file_id get_id() override
+		{
+			struct ::stat file_info;
+			ensure(::fstat(m_fd, &file_info) == 0); // "file::get_id"
+
+			file_id id{"unix_file"};
+			id.data.resize(sizeof(file_info.st_dev) + sizeof(file_info.st_ino));
+
+			std::memcpy(id.data.data(), &file_info.st_dev, sizeof(file_info.st_dev));
+			std::memcpy(id.data.data() + sizeof(file_info.st_dev), &file_info.st_ino, sizeof(file_info.st_ino));
+			return id;
+		}
+
+		u64 write_gather(const iovec_clone* buffers, u64 buf_count) override
+		{
+			static_assert(sizeof(iovec) == sizeof(iovec_clone), "Weird iovec size");
+			static_assert(offsetof(iovec, iov_len) == offsetof(iovec_clone, iov_len), "Weird iovec::iov_len offset");
+
+			u64 result = 0;
+
+			while (buf_count)
+			{
+				iovec arg[256];
+				const auto count = std::min<u64>(buf_count, 256);
+				std::memcpy(&arg, buffers, sizeof(iovec) * count);
+				const auto added = ::writev(m_fd, arg, count);
+				ensure(added != -1); // "file::write_gather"
+				result += added;
+				buf_count -= count;
+				buffers += count;
+			}
+
+			return result;
+		}
+
+		void release() override
+		{
+			m_fd = -1;
+		}
+	};
+#endif
 }
 
 shared_ptr<fs::device_base> fs::device_manager::get_device(const std::string& path)
@@ -500,6 +1025,22 @@ std::string_view fs::get_parent_dir_view(std::string_view path, u32 parent_level
 	}
 
 	return result;
+}
+
+std::string fs::get_path_if_dir(const std::string& path)
+{
+	if (path.empty() || !fs::is_dir(path))
+	{
+		return {};
+	}
+
+	// If delimiters are already present at the end of the string then nothing else to do
+	if (usz sz = path.find_last_of(delim); sz != umax && (sz + 1) == path.size())
+	{
+		return path;
+	}
+
+	return path + '/';
 }
 
 bool fs::get_stat(const std::string& path, stat_t& info)
@@ -672,6 +1213,203 @@ bool fs::is_symlink(const std::string& path)
 	}
 
 	return true;
+}
+
+bool fs::is_optical_raw_device(const std::string& path)
+{
+#ifdef _WIN32
+	if (path.starts_with("\\\\.\\"))
+	{
+		return true;
+	}
+
+	return false;
+#else
+#ifdef __APPLE__
+	// On Mac OS X optical disks will only ever be mounted under /dev/disk(whatever), similar for raw devices,
+	// so reject anything not containing the disk string.
+	if (!path.starts_with("/dev/disk") && !path.starts_with("/dev/rdisk"))
+	{
+		return false;
+	}
+#else
+	// Skip a useless check if the path cannot point to a device node (device nodes always live in "/dev")
+	if (!path.starts_with("/dev/"))
+	{
+		return false;
+	}
+#endif
+	struct ::stat file_info;
+
+	if (::stat(path.c_str(), &file_info) != 0)
+	{
+		return false;
+	}
+
+	return is_optical_device_node(file_info);
+#endif
+}
+
+bool fs::get_optical_raw_device(const std::string& path, std::string* raw_device)
+{
+	if (fs::is_optical_raw_device(path))
+	{
+		if (raw_device)
+		{
+			*raw_device = path;
+		}
+
+		return true;
+	}
+
+#ifdef _WIN32
+	// Skip a useless check to detect an optical raw device if navigating on subfolders (e.g. C:\subfolder_1\subfolder_2\),
+	// it means we are on a HDD/SSD. A path for an optical drive should include only the drive letter (e.g. E:\)
+	const size_t drive_delim_pos = path.find_first_of(":");
+
+	if (drive_delim_pos != 1 || drive_delim_pos != path.find_last_not_of(delim))
+	{
+		return false;
+	}
+
+	const std::string drive_letter = path.substr(0, drive_delim_pos + 1); // e.g. "E:"
+	const std::string drive_path = drive_letter + "\\"; // e.g. "E:\"
+
+	if (GetDriveTypeA(drive_path.c_str()) == DRIVE_CDROM)
+	{
+		if (raw_device)
+		{
+			*raw_device = "\\\\.\\" + drive_letter;
+		}
+
+		return true;
+	}
+
+	return false;
+#elif defined(__linux__)
+	// Here the path points to a mounted optical disc (e.g. "/media/user/PS3_DISC") or to a mounted disc image
+	// (e.g. "mount -o loop game.iso /mnt/game"), so retrieve the device backing the filesystem it belongs to
+	struct ::stat file_info;
+
+	if (::stat(path.c_str(), &file_info) != 0)
+	{
+		return false;
+	}
+
+	// "st_dev" of anything stored on a filesystem backed by a block device matches "st_rdev" of the device itself
+	const dev_t device_id = file_info.st_dev;
+	const unsigned int device_major = major(device_id);
+
+	// Discard at once anything which is not backed by an optical drive or by a loopback device, so that the checks
+	// below (each one costing at least a syscall) only run on an actual candidate
+	if (device_major != s_scsi_cdrom_major && device_major != s_loopback_major)
+	{
+		return false;
+	}
+
+	// Skip a useless check to detect an optical raw device if the path is not the mount point of the disc, it means we are
+	// navigating on subfolders (on Windows, in the same way, only the drive root is accepted)
+	if (!is_mount_point(path, file_info))
+	{
+		return false;
+	}
+
+	const unsigned int device_minor = minor(device_id);
+
+	// Retrieve the device name from sysfs (e.g. "/sys/dev/block/11:0" -> "../../devices/[...]/block/sr0")
+	std::string device_path;
+	char link_target[1024]; // NOTE: "readlink()" never null terminates, so the buffer is used through the returned length only
+
+	if (const ssize_t len = ::readlink(("/sys/dev/block/" + std::to_string(device_major) + ":" + std::to_string(device_minor)).c_str(), link_target, sizeof(link_target)); len > 0)
+	{
+		const std::string_view target{link_target, static_cast<usz>(len)};
+
+		device_path = "/dev/";
+		device_path += target.substr(target.find_last_of('/') + 1);
+	}
+	else if (device_major == s_scsi_cdrom_major)
+	{
+		// Fallback (sysfs not available): the minor number matches the index of the SCSI CD-ROM device
+		device_path = "/dev/sr" + std::to_string(device_minor);
+	}
+	else
+	{
+		return false;
+	}
+
+	// Ensure the resolved node really points to the same optical device
+	struct ::stat device_info;
+
+	if (::stat(device_path.c_str(), &device_info) != 0 || device_info.st_rdev != device_id || !is_optical_device_node(device_info))
+	{
+		return false;
+	}
+
+	if (raw_device)
+	{
+		*raw_device = device_path;
+	}
+
+	return true;
+#elif defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__) || defined(__DragonFly__)
+	// Here the path points to a mounted optical disc or to a mounted disc image (e.g. attached with "hdiutil"/"mdconfig"),
+	// so retrieve the device backing the filesystem it belongs to
+	struct ::stat file_info;
+
+	if (::stat(path.c_str(), &file_info) != 0)
+	{
+		return false;
+	}
+
+	// Skip a useless check to detect an optical raw device if the path is not the mount point of the disc, it means we are
+	// navigating on subfolders (on Windows, in the same way, only the drive root is accepted). There is no cheap way to
+	// discard a device here (unlike the major number on Linux), so this is the filter which must come first: it rejects
+	// any file without a single syscall and any other folder with just one more
+	if (!is_mount_point(path, file_info))
+	{
+		return false;
+	}
+
+	struct ::statfs mount_info;
+
+	if (::statfs(path.c_str(), &mount_info) != 0)
+	{
+		return false;
+	}
+
+	std::string device_path = mount_info.f_mntfromname; // e.g. "/dev/disk2"
+
+	if (!device_path.starts_with("/dev/"))
+	{
+		return false;
+	}
+
+#ifdef __APPLE__
+	// Use the raw (unbuffered) device (e.g. "/dev/disk2" -> "/dev/rdisk2")
+	if (!device_path.starts_with("/dev/r"))
+	{
+		device_path.insert(5, 1, 'r');
+	}
+#endif
+
+	// Ensure the resolved node really points to a raw device
+	struct ::stat device_info;
+
+	if (::stat(device_path.c_str(), &device_info) != 0 || !is_optical_device_node(device_info))
+	{
+		return false;
+	}
+
+	if (raw_device)
+	{
+		*raw_device = device_path;
+	}
+
+	return true;
+#else
+	// Not supported on this platform
+	return false;
+#endif
 }
 
 bool fs::statfs(const std::string& path, fs::device_stat& info)
@@ -1241,207 +1979,70 @@ fs::file::file(const std::string& path, bs_t<open_mode> mode)
 		return;
 	}
 
-	class windows_file final : public file_base
+	// If path points to an optical raw device, complete the file opening
+	// (the following GetFileInformationByHandle() would always fail on a raw device).
+	if (is_optical_raw_device(path))
 	{
-		const HANDLE m_handle;
-		atomic_t<u64> m_pos;
+		DISK_GEOMETRY_EX geometry;
 
-	public:
-		windows_file(HANDLE handle)
-			: m_handle(handle)
-			, m_pos(0)
+		// Try to retrieve information on content. If it fails, no disc is probably mounted so abort the file opening
+		if (!DeviceIoControl(handle, IOCTL_DISK_GET_DRIVE_GEOMETRY_EX, nullptr, 0, &geometry, sizeof(geometry), nullptr, nullptr))
 		{
+			const DWORD last_error = GetLastError();
+			CloseHandle(handle);
+			g_tls_error = to_error(last_error);
+			return;
 		}
 
-		~windows_file() override
+		m_file = std::make_unique<windows_file>(handle, static_cast<u64>(ensure(geometry.DiskSize.QuadPart)));
+		return;
+	}
+
+	// Check if the handle is actually valid.
+	// This can fail on empty mounted drives (e.g. with ERROR_NOT_READY or ERROR_INVALID_FUNCTION).
+	BY_HANDLE_FILE_INFORMATION info{};
+
+	if (!GetFileInformationByHandle(handle, &info))
+	{
+		const DWORD last_error = GetLastError();
+		CloseHandle(handle);
+
+		if (last_error == ERROR_INVALID_FUNCTION)
 		{
-			CloseHandle(m_handle);
+			g_tls_error = fs::error::isdir;
+			return;
 		}
 
-		stat_t get_stat() override
-		{
-			FILE_BASIC_INFO basic_info;
-			ensure(GetFileInformationByHandleEx(m_handle, FileBasicInfo, &basic_info, sizeof(FILE_BASIC_INFO))); // "file::stat"
+		g_tls_error = to_error(last_error);
+		return;
+	}
 
-			stat_t info;
-			info.is_directory = (basic_info.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
-			info.is_writable = (basic_info.FileAttributes & FILE_ATTRIBUTE_READONLY) == 0;
-			info.size = this->size();
-			info.atime = to_time(basic_info.LastAccessTime);
-			info.mtime = to_time(basic_info.LastWriteTime);
-			info.ctime = info.mtime;
+	if (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+	{
+		CloseHandle(handle);
+		g_tls_error = fs::error::isdir;
+		return;
+	}
 
-			if (info.atime < info.mtime)
-				info.atime = info.mtime;
+	if (info.dwFileAttributes & FILE_ATTRIBUTE_SYSTEM)
+	{
+		CloseHandle(handle);
+		g_tls_error = fs::error::acces;
+		return;
+	}
 
-			return info;
-		}
-
-		void sync() override
-		{
-			ensure(FlushFileBuffers(m_handle)); // "file::sync"
-		}
-
-		bool trunc(u64 length) override
-		{
-			FILE_END_OF_FILE_INFO _eof;
-			_eof.EndOfFile.QuadPart = length;
-
-			if (!SetFileInformationByHandle(m_handle, FileEndOfFileInfo, &_eof, sizeof(_eof)))
-			{
-				g_tls_error = to_error(GetLastError());
-				return false;
-			}
-
-			return true;
-		}
-
-		u64 read(void* buffer, u64 count) override
-		{
-			u64 nread_sum = 0;
-
-			for (char* data = static_cast<char*>(buffer); count;)
-			{
-				const DWORD size = static_cast<DWORD>(std::min<u64>(count, DWORD{umax} & -4096));
-
-				DWORD nread = 0;
-				OVERLAPPED ovl{};
-				const u64 pos = m_pos;
-				ovl.Offset = DWORD(pos);
-				ovl.OffsetHigh = DWORD(pos >> 32);
-				ensure(ReadFile(m_handle, data, size, &nread, &ovl) || GetLastError() == ERROR_HANDLE_EOF); // "file::read"
-				nread_sum += nread;
-				m_pos += nread;
-
-				if (nread < size)
-				{
-					break;
-				}
-
-				count -= size;
-				data += size;
-			}
-
-			return nread_sum;
-		}
-
-		u64 read_at(u64 offset, void* buffer, u64 count) override
-		{
-			u64 nread_sum = 0;
-
-			for (char* data = static_cast<char*>(buffer); count;)
-			{
-				const DWORD size = static_cast<DWORD>(std::min<u64>(count, DWORD{umax} & -4096));
-
-				DWORD nread = 0;
-				OVERLAPPED ovl{};
-				ovl.Offset = DWORD(offset);
-				ovl.OffsetHigh = DWORD(offset >> 32);
-				ensure(ReadFile(m_handle, data, size, &nread, &ovl) || GetLastError() == ERROR_HANDLE_EOF); // "file::read"
-				nread_sum += nread;
-
-				if (nread < size)
-				{
-					break;
-				}
-
-				count -= size;
-				data += size;
-				offset += size;
-			}
-
-			return nread_sum;
-		}
-
-		u64 write(const void* buffer, u64 count) override
-		{
-			u64 nwritten_sum = 0;
-
-			for (const char* data = static_cast<const char*>(buffer); count;)
-			{
-				const DWORD size = static_cast<DWORD>(std::min<u64>(count, DWORD{umax} & -4096));
-
-				DWORD nwritten = 0;
-				OVERLAPPED ovl{};
-				const u64 pos = m_pos.fetch_add(size);
-				ovl.Offset = DWORD(pos);
-				ovl.OffsetHigh = DWORD(pos >> 32);
-				ensure(WriteFile(m_handle, data, size, &nwritten, &ovl)); // "file::write"
-				ensure(nwritten == size);
-				nwritten_sum += nwritten;
-
-				if (nwritten < size)
-				{
-					break;
-				}
-
-				count -= size;
-				data += size;
-			}
-
-			return nwritten_sum;
-		}
-
-		u64 seek(s64 offset, seek_mode whence) override
-		{
-			if (whence > seek_end)
-			{
-				fmt::throw_exception("Invalid whence (0x%x)", whence);
-			}
-
-			const s64 new_pos =
-				whence == fs::seek_set ? offset :
-				whence == fs::seek_cur ? offset + m_pos :
-				whence == fs::seek_end ? offset + size() : -1;
-
-			if (new_pos < 0)
-			{
-				fs::g_tls_error = fs::error::inval;
-				return -1;
-			}
-
-			m_pos = new_pos;
-			return m_pos;
-		}
-
-		u64 size() override
-		{
-			LARGE_INTEGER size;
-			ensure(GetFileSizeEx(m_handle, &size)); // "file::size"
-
-			return size.QuadPart;
-		}
-
-		native_handle get_handle() override
-		{
-			return m_handle;
-		}
-
-		file_id get_id() override
-		{
-			file_id id{"windows_file"};
-			id.data.resize(sizeof(FILE_ID_INFO));
-
-			FILE_ID_INFO info;
-
-			if (!GetFileInformationByHandleEx(m_handle, FileIdInfo, &info, sizeof(info)))
-			{
-				// Try GetFileInformationByHandle as a fallback
-				BY_HANDLE_FILE_INFORMATION info2;
-				ensure(GetFileInformationByHandle(m_handle, &info2));
-
-				info = {};
-				info.VolumeSerialNumber = info2.dwVolumeSerialNumber;
-				std::memcpy(&info.FileId, &info2.nFileIndexHigh, 8);
-			}
-
-			std::memcpy(id.data.data(), &info, sizeof(info));
-			return id;
-		}
-	};
+	if ((mode & fs::write) && (info.dwFileAttributes & FILE_ATTRIBUTE_READONLY))
+	{
+		CloseHandle(handle);
+		g_tls_error = fs::error::readonly;
+		return;
+	}
 
 	m_file = std::make_unique<windows_file>(handle);
 #else
+	// An optical raw device can only be read: any write related flag makes the opening fail (handled as any other error)
+	const bool raw_device = is_optical_raw_device(path);
+
 	int flags = O_CLOEXEC; // Ensures all files are closed on execl for auto updater
 
 	if (mode & fs::read && mode & fs::write) flags |= O_RDWR;
@@ -1457,7 +2058,7 @@ fs::file::file(const std::string& path, bs_t<open_mode> mode)
 
 	if (mode & fs::write && mode & fs::unread)
 	{
-		if (!(mode & (fs::excl + fs::lock)) && mode & fs::trunc)
+		if (!raw_device && !(mode & (fs::excl + fs::lock)) && mode & fs::trunc)
 		{
 			// Alternative to truncation for "unread" flag (TODO)
 			if (mode & fs::create)
@@ -1490,181 +2091,22 @@ fs::file::file(const std::string& path, bs_t<open_mode> mode)
 		ensure(::ftruncate(fd, 0) == 0);
 	}
 
-	class unix_file final : public file_base
+	// If path points to an optical raw device, complete the file opening
+	if (raw_device)
 	{
-		const int m_fd;
+		// Try to retrieve the size of the content. If it fails, no disc is probably mounted so abort the file opening
+		const u64 raw_device_size = get_raw_device_size(fd);
 
-	public:
-		unix_file(int fd)
-			: m_fd(fd)
+		if (!raw_device_size)
 		{
+			::close(fd);
+			g_tls_error = fs::error::noent;
+			return;
 		}
 
-		~unix_file() override
-		{
-			::close(m_fd);
-		}
-
-		stat_t get_stat() override
-		{
-			struct ::stat file_info;
-			ensure(::fstat(m_fd, &file_info) == 0); // "file::stat"
-
-			stat_t info;
-			info.is_directory = S_ISDIR(file_info.st_mode);
-			info.is_writable = file_info.st_mode & 0200; // HACK: approximation
-			info.size = file_info.st_size;
-			info.atime = file_info.st_atime;
-			info.mtime = file_info.st_mtime;
-			info.ctime = info.mtime;
-
-			if (info.atime < info.mtime)
-				info.atime = info.mtime;
-
-			return info;
-		}
-
-		void sync() override
-		{
-			ensure(::fsync(m_fd) == 0); // "file::sync"
-		}
-
-		bool trunc(u64 length) override
-		{
-			if (::ftruncate(m_fd, length) != 0)
-			{
-				g_tls_error = to_error(errno);
-				return false;
-			}
-
-			return true;
-		}
-
-		u64 read(void* buffer, u64 count) override
-		{
-			u64 result = 0;
-
-			// Loop because (huge?) read can be processed partially
-			while (auto r = ::read(m_fd, buffer, count))
-			{
-				ensure(r > 0); // "file::read"
-				count -= r;
-				result += r;
-				buffer = static_cast<u8*>(buffer) + r;
-				if (!count)
-					break;
-			}
-
-			return result;
-		}
-
-		u64 read_at(u64 offset, void* buffer, u64 count) override
-		{
-			u64 result = 0;
-
-			// For safety; see read()
-			while (auto r = ::pread(m_fd, buffer, count, offset))
-			{
-				ensure(r > 0); // "file::read_at"
-				count -= r;
-				offset += r;
-				result += r;
-				buffer = static_cast<u8*>(buffer) + r;
-				if (!count)
-					break;
-			}
-
-			return result;
-		}
-
-		u64 write(const void* buffer, u64 count) override
-		{
-			u64 result = 0;
-
-			// For safety; see read()
-			while (auto r = ::write(m_fd, buffer, count))
-			{
-				ensure(r > 0); // "file::write"
-				count -= r;
-				result += r;
-				buffer = static_cast<const u8*>(buffer) + r;
-				if (!count)
-					break;
-			}
-
-			return result;
-		}
-
-		u64 seek(s64 offset, seek_mode whence) override
-		{
-			if (whence > seek_end)
-			{
-				fmt::throw_exception("Invalid whence (0x%x)", whence);
-			}
-
-			const int mode =
-				whence == seek_set ? SEEK_SET :
-				whence == seek_cur ? SEEK_CUR : SEEK_END;
-
-			const auto result = ::lseek(m_fd, offset, mode);
-
-			if (result == -1)
-			{
-				g_tls_error = to_error(errno);
-				return -1;
-			}
-
-			return result;
-		}
-
-		u64 size() override
-		{
-			struct ::stat file_info;
-			ensure(::fstat(m_fd, &file_info) == 0); // "file::size"
-
-			return file_info.st_size;
-		}
-
-		native_handle get_handle() override
-		{
-			return m_fd;
-		}
-
-		file_id get_id() override
-		{
-			struct ::stat file_info;
-			ensure(::fstat(m_fd, &file_info) == 0); // "file::get_id"
-
-			file_id id{"unix_file"};
-			id.data.resize(sizeof(file_info.st_dev) + sizeof(file_info.st_ino));
-
-			std::memcpy(id.data.data(), &file_info.st_dev, sizeof(file_info.st_dev));
-			std::memcpy(id.data.data() + sizeof(file_info.st_dev), &file_info.st_ino, sizeof(file_info.st_ino));
-			return id;
-		}
-
-		u64 write_gather(const iovec_clone* buffers, u64 buf_count) override
-		{
-			static_assert(sizeof(iovec) == sizeof(iovec_clone), "Weird iovec size");
-			static_assert(offsetof(iovec, iov_len) == offsetof(iovec_clone, iov_len), "Weird iovec::iov_len offset");
-
-			u64 result = 0;
-
-			while (buf_count)
-			{
-				iovec arg[256];
-				const auto count = std::min<u64>(buf_count, 256);
-				std::memcpy(&arg, buffers, sizeof(iovec) * count);
-				const auto added = ::writev(m_fd, arg, count);
-				ensure(added != -1); // "file::write_gather"
-				result += added;
-				buf_count -= count;
-				buffers += count;
-			}
-
-			return result;
-		}
-	};
+		m_file = std::make_unique<unix_file>(fd, raw_device_size);
+		return;
+	}
 
 	m_file = std::make_unique<unix_file>(fd);
 
@@ -1674,6 +2116,21 @@ fs::file::file(const std::string& path, bs_t<open_mode> mode)
 		g_tls_error = error::isdir;
 	}
 #endif
+}
+
+
+
+fs::file fs::file::from_native_handle(native_handle handle)
+{
+	fs::file result;
+
+#ifdef _WIN32
+	result.m_file = std::make_unique<windows_file>(static_cast<HANDLE>(handle));
+#else
+	result.m_file = std::make_unique<unix_file>(handle);
+#endif
+
+	return result;
 }
 
 fs::file::file(const void* ptr, usz size)
@@ -1774,6 +2231,17 @@ fs::native_handle fs::file::get_handle() const
 	return INVALID_HANDLE_VALUE;
 #else
 	return -1;
+#endif
+}
+
+bool fs::set_sparse([[maybe_unused]] const fs::file& file)
+{
+#ifdef _WIN32
+	FILE_SET_SPARSE_BUFFER sparse{TRUE};
+	DWORD returned = 0;
+	return DeviceIoControl(file.get_handle(), FSCTL_SET_SPARSE, &sparse, sizeof(sparse), nullptr, 0, &returned, nullptr) != FALSE;
+#else
+	return true;
 #endif
 }
 
@@ -1957,6 +2425,9 @@ bool fs::file::strict_read_check(u64 offset, u64 _size, u64 type_size) const
 
 std::string fs::get_executable_path()
 {
+#ifdef ANDROID
+	return g_android_executable_dir + "/dummy-rpcs3.apk";
+#else
 	// Use magic static
 	static const std::string s_exe_path = []
 	{
@@ -2002,10 +2473,14 @@ std::string fs::get_executable_path()
 	}();
 
 	return s_exe_path;
+#endif
 }
 
 std::string fs::get_executable_dir()
 {
+#ifdef ANDROID
+	return g_android_executable_dir;
+#else
 	// Use magic static
 	static const std::string s_exe_dir = []
 	{
@@ -2019,10 +2494,14 @@ std::string fs::get_executable_dir()
 	}();
 
 	return s_exe_dir;
+#endif
 }
 
-const std::string& fs::get_config_dir()
+const std::string& fs::get_config_dir([[maybe_unused]] bool get_config_subdirectory)
 {
+#ifdef ANDROID
+	return g_android_config_dir;
+#else
 	// Use magic static
 	static const std::string s_dir = []
 	{
@@ -2103,11 +2582,23 @@ const std::string& fs::get_config_dir()
 		return dir;
 	}();
 
+#ifdef _WIN32
+	if (get_config_subdirectory)
+	{
+		static const std::string subdir = s_dir + "config/";
+		return subdir;
+	}
+#endif
+
 	return s_dir;
+#endif
 }
 
 const std::string& fs::get_cache_dir()
 {
+#ifdef ANDROID
+	return g_android_cache_dir;
+#else
 	static const std::string s_dir = []
 	{
 		std::string dir;
@@ -2142,6 +2633,17 @@ const std::string& fs::get_cache_dir()
 	}();
 
 	return s_dir;
+#endif
+}
+
+const std::string& fs::get_log_dir()
+{
+#ifdef _WIN32
+	static const std::string s_dir = fs::get_config_dir() + "log/";
+	return s_dir;
+#else
+	return fs::get_cache_dir();
+#endif
 }
 
 const std::string& fs::get_temp_dir()
@@ -2506,10 +3008,10 @@ bool fs::pending_file::commit(bool overwrite)
 	while (file_handle != INVALID_HANDLE_VALUE)
 	{
 		// Get file ID (used to check for hardlinks)
-		BY_HANDLE_FILE_INFORMATION file_info;
+		BY_HANDLE_FILE_INFORMATION file_info{};
 
 		if (!GetFileInformationByHandle(file_handle, &file_info) || file_info.nNumberOfLinks == 1)
-		{	
+		{
 			CloseHandle(file_handle);
 			break;
 		}
@@ -2704,6 +3206,7 @@ void fmt_class_string<fs::error>::format(std::string& out, u64 arg)
 		case fs::error::notempty: return "Not empty";
 		case fs::error::readonly: return "Read only";
 		case fs::error::isdir: return "Is a directory";
+		case fs::error::notdir: return "Not a directory";
 		case fs::error::toolong: return "Path too long";
 		case fs::error::nospace: return "Not enough space on the device";
 		case fs::error::xdev: return "Device mismatch";

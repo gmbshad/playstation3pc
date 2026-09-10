@@ -1,6 +1,8 @@
 #include "stdafx.h"
 #include "main_application.h"
 #include "display_sleep_control.h"
+#include "gamemode_control.h"
+#include "rpcs3qt/config_database.h"
 
 #include "util/types.hpp"
 #include "util/logs.hpp"
@@ -17,6 +19,7 @@
 #include "Emu/Io/Null/NullMouseHandler.h"
 #include "Emu/Io/KeyboardHandler.h"
 #include "Emu/Io/MouseHandler.h"
+#include "Emu/VFS.h"
 #include "Input/basic_keyboard_handler.h"
 #include "Input/basic_mouse_handler.h"
 #include "Input/raw_mouse_handler.h"
@@ -35,12 +38,15 @@
 #include "Emu/Audio/FAudio/faudio_enumerator.h"
 #endif
 
+#include <QDateTime>
+#include <QDir>
 #include <QFileInfo> // This shouldn't be outside rpcs3qt...
 #include <QImageReader> // This shouldn't be outside rpcs3qt...
 #include <QStandardPaths> // This shouldn't be outside rpcs3qt...
 #include <thread>
 
 LOG_CHANNEL(sys_log, "SYS");
+LOG_CHANNEL(cfg_log, "CFG");
 
 namespace audio
 {
@@ -56,10 +62,41 @@ namespace rsx::overlays
 
 extern void qt_events_aware_op(int repeat_duration_ms, std::function<bool()> wrapped_op);
 
+main_application::main_application()
+	: m_render_creator(std::make_shared<render_creator>())
+{
+	std::set<video_renderer> supported_renderers;
+	supported_renderers.insert(video_renderer::null);
+
+	if (m_render_creator->OpenGL.supported)
+	{
+		supported_renderers.insert(video_renderer::opengl);
+	}
+
+	// Make Vulkan default setting if it is supported
+	if (m_render_creator->Vulkan.supported && !m_render_creator->Vulkan.adapters.empty())
+	{
+		const std::string adapter = ::at32(m_render_creator->Vulkan.adapters, 0).toStdString();
+		cfg_log.notice("Setting the default renderer to Vulkan. Default GPU: '%s'", adapter);
+		Emu.SetDefaultRenderer(video_renderer::vulkan);
+		Emu.SetDefaultGraphicsAdapter(adapter);
+
+		supported_renderers.insert(video_renderer::vulkan);
+	}
+	else if (m_render_creator->OpenGL.supported)
+	{
+		cfg_log.notice("Setting the default renderer to OpenGl");
+		Emu.SetDefaultRenderer(video_renderer::opengl);
+	}
+
+	Emu.SetSupportedRenderers(supported_renderers);
+}
+
 /** Emu.Init() wrapper for user management */
-void main_application::InitializeEmulator(const std::string& user, bool show_gui)
+void main_application::InitializeEmulator(const std::string& user, bool show_gui, bool headless)
 {
 	Emu.SetHasGui(show_gui);
+	Emu.SetHeadless(headless);
 	Emu.SetUsr(user);
 	Emu.Init();
 
@@ -67,27 +104,22 @@ void main_application::InitializeEmulator(const std::string& user, bool show_gui
 	const std::string firmware_version = utils::get_firmware_version();
 	const std::string firmware_string  = firmware_version.empty() ? "Missing Firmware" : ("Firmware version: " + firmware_version);
 	sys_log.always()("%s", firmware_string);
+
+	rpcs3::utils::configure_logs(Emu.IsStopped());
 }
 
 void main_application::OnEmuSettingsChange()
 {
+	// Change logging
+	rpcs3::utils::configure_logs(Emu.IsStopped());
+
 	if (Emu.IsRunning())
 	{
-		if (g_cfg.misc.prevent_display_sleep)
-		{
-			disable_display_sleep();
-		}
-		else
-		{
-			enable_display_sleep();
-		}
+		enable_display_sleep(!g_cfg.misc.prevent_display_sleep);
 	}
 
 	if (!Emu.IsStopped())
 	{
-		// Change logging (only allowed during gameplay)
-		rpcs3::utils::configure_logs();
-
 		// Force audio provider
 		g_cfg.audio.provider.set(Emu.IsVsh() ? audio_provider::rsxaudio : audio_provider::cell_audio);
 	}
@@ -352,6 +384,34 @@ EmuCallbacks main_application::CreateCallbacks()
 		return QFileInfo(QString::fromUtf8(sv.data(), static_cast<int>(sv.size()))).canonicalFilePath().toStdString();
 	};
 
+	callbacks.resolve_path_may_not_exist = [](std::string_view sv)
+	{
+		const QString path = QString::fromUtf8(sv.data(), static_cast<int>(sv.size()));
+		QFileInfo fi(path);
+
+		QString tail;
+
+		while (!fi.exists())
+		{
+			tail = fi.fileName() + "/" + tail;
+			fi.setFile(fi.path());
+		}
+
+		QString result = QDir::cleanPath(QDir(fi.canonicalFilePath()).filePath(tail));
+
+#ifdef _WIN32
+		if (sv.starts_with("/") && !sv.starts_with("//"))
+		{
+			// Erase absolute path for non-existant path
+			if (result.size() >= 3 && result[1] == ':' && result[2] == '/')
+			{
+				result.remove(0, 2);
+			}
+		}
+#endif
+		return result.toStdString();
+	};
+
 	callbacks.get_font_dirs = []()
 	{
 		const QStringList locations = QStandardPaths::standardLocations(QStandardPaths::FontsLocation);
@@ -363,22 +423,81 @@ EmuCallbacks main_application::CreateCallbacks()
 			{
 				font_dir += '/';
 			}
-			font_dirs.push_back(font_dir);
+			font_dirs.push_back(std::move(font_dir));
 		}
 		return font_dirs;
 	};
 
-	callbacks.on_install_pkgs = [](const std::vector<std::string>& pkgs)
+	callbacks.on_install_pkgs = [](const std::vector<std::string>& pkgs, bool from_optical_drive)
 	{
 		for (const std::string& pkg : pkgs)
 		{
-			if (!rpcs3::utils::install_pkg(pkg))
+			if (!rpcs3::utils::install_pkg(pkg, from_optical_drive))
 			{
 				sys_log.error("Failed to install %s", pkg);
 				return false;
 			}
 		}
 		return true;
+	};
+
+	callbacks.enable_gamemode = [](bool enabled){ enable_gamemode(enabled); };
+
+	callbacks.get_photo_path = [](std::string_view title)
+	{
+		const QDateTime date_time = QDateTime::currentDateTime();
+		const QDate date = date_time.date();
+		const QTime time = date_time.time();
+
+		std::string_view extension = ".png";
+		if (const auto extension_start = title.find_last_of('.');
+			extension_start != umax)
+		{
+			extension = title.substr(extension_start);
+			title = title.substr(0, extension_start);
+		}
+
+		std::string suffix = std::string(extension);
+		const std::string path = vfs::get(fmt::format("/dev_hdd0/photo/%04d/%02d/%02d/%s %02d-%02d-%04d %02d-%02d-%02d",
+		                                              date.year(), date.month(), date.day(), vfs::escape(title, true),
+		                                              date.day(), date.month(), date.year(), time.hour(), time.minute(), time.second()));
+
+		u32 counter = 0;
+		while (!Emu.IsStopped() && fs::is_file(path + suffix))
+		{
+			suffix = fmt::format(" %d%s", ++counter, extension);
+		}
+
+		return path + suffix;
+	};
+
+	callbacks.get_database_config = [](const std::string& title_id)
+	{
+		sys_log.notice("Trying to retrieve database config for: '%s'", title_id);
+
+		if (title_id.empty())
+		{
+			sys_log.warning("Cannot retrieve database config for empty title_id");
+			return std::string();
+		}
+
+		config_database config_db(nullptr);
+		config_db.request_config_database(false);
+
+		if (!config_db.has_config(title_id))
+		{
+			sys_log.notice("Cannot find database config for: '%s'", title_id);
+			return std::string();
+		}
+
+		if (const auto config = config_db.get_config(title_id))
+		{
+			sys_log.notice("Found database config for: '%s'", title_id);
+			return config.value();
+		}
+
+		sys_log.error("Failed to retrieve database config for: '%s'", title_id);
+		return std::string();
 	};
 
 	return callbacks;

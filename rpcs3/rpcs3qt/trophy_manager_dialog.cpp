@@ -4,6 +4,7 @@
 #include "game_list_delegate.h"
 #include "qt_utils.h"
 #include "game_list.h"
+#include "gui_application.h"
 #include "gui_settings.h"
 #include "progress_dialog.h"
 #include "persistent_settings.h"
@@ -16,6 +17,8 @@
 #include "Emu/system_utils.hpp"
 #include "Emu/Cell/Modules/sceNpTrophy.h"
 #include "Emu/Cell/Modules/cellRtc.h"
+#include "Emu/NP/rpcn_client.h"
+#include "Emu/NP/rpcn_config.h"
 
 #include <QApplication>
 #include <QClipboard>
@@ -34,8 +37,18 @@
 #include <QGuiApplication>
 #include <QScreen>
 #include <QTimeZone>
+#include <QMessageBox>
+#include <QPushButton>
+#include <QTimer>
+#include <QElapsedTimer>
 
 LOG_CHANNEL(gui_log, "GUI");
+
+static constexpr qint64 RPCN_TROPHY_SYNC_ALL_COOLDOWN_MS = 300'000;
+static constexpr qint64 RPCN_TROPHY_SYNC_SINGLE_COOLDOWN_MS = 5'000;
+static QElapsedTimer s_rpcn_trophy_sync_all_cooldown;
+static QElapsedTimer s_rpcn_trophy_sync_single_cooldown;
+static bool s_rpcn_trophy_sync_in_progress = false;
 
 enum GameUserRole
 {
@@ -99,16 +112,17 @@ trophy_manager_dialog::trophy_manager_dialog(std::shared_ptr<gui_settings> gui_s
 	m_game_table->setAlternatingRowColors(true);
 	m_game_table->installEventFilter(this);
 
-	auto add_game_column = [this](gui::trophy_game_list_columns col, const QString& header_text, const QString& action_text)
+	const auto add_game_column = [this](gui::trophy_game_list_columns col)
 	{
-		m_game_table->setHorizontalHeaderItem(static_cast<int>(col), new QTableWidgetItem(header_text));
-		m_game_column_acts.append(new QAction(action_text, this));
+		const int column = static_cast<int>(col);
+		m_game_table->setHorizontalHeaderItem(column, new QTableWidgetItem(get_gamelist_header_text(column)));
+		m_game_column_acts[column] = new QAction(get_gamelist_action_text(column), this);
 	};
 
-	add_game_column(gui::trophy_game_list_columns::icon,     tr("Icon"),     tr("Show Icons"));
-	add_game_column(gui::trophy_game_list_columns::name,     tr("Game"),     tr("Show Games"));
-	add_game_column(gui::trophy_game_list_columns::progress, tr("Progress"), tr("Show Progress"));
-	add_game_column(gui::trophy_game_list_columns::trophies, tr("Trophies"), tr("Show Trophies"));
+	add_game_column(gui::trophy_game_list_columns::icon);
+	add_game_column(gui::trophy_game_list_columns::name);
+	add_game_column(gui::trophy_game_list_columns::progress);
+	add_game_column(gui::trophy_game_list_columns::trophies);
 
 	// Trophy Table
 	m_trophy_table = new game_list();
@@ -132,20 +146,21 @@ trophy_manager_dialog::trophy_manager_dialog(std::shared_ptr<gui_settings> gui_s
 	m_trophy_table->setAlternatingRowColors(true);
 	m_trophy_table->installEventFilter(this);
 
-	auto add_trophy_column = [this](gui::trophy_list_columns col, const QString& header_text, const QString& action_text)
+	const auto add_trophy_column = [this](gui::trophy_list_columns col)
 	{
-		m_trophy_table->setHorizontalHeaderItem(static_cast<int>(col), new QTableWidgetItem(header_text));
-		m_trophy_column_acts.append(new QAction(action_text, this));
+		const int column = static_cast<int>(col);
+		m_trophy_table->setHorizontalHeaderItem(column, new QTableWidgetItem(get_trophy_header_text(column)));
+		m_trophy_column_acts[column] = new QAction(get_trophy_action_text(column), this);
 	};
 
-	add_trophy_column(gui::trophy_list_columns::icon,          tr("Icon"),              tr("Show Icons"));
-	add_trophy_column(gui::trophy_list_columns::name,          tr("Name"),              tr("Show Names"));
-	add_trophy_column(gui::trophy_list_columns::description,   tr("Description"),       tr("Show Descriptions"));
-	add_trophy_column(gui::trophy_list_columns::type,          tr("Type"),              tr("Show Types"));
-	add_trophy_column(gui::trophy_list_columns::is_unlocked,   tr("Status"),            tr("Show Status"));
-	add_trophy_column(gui::trophy_list_columns::id,            tr("ID"),                tr("Show IDs"));
-	add_trophy_column(gui::trophy_list_columns::platinum_link, tr("Platinum Relevant"), tr("Show Platinum Relevant"));
-	add_trophy_column(gui::trophy_list_columns::time_unlocked, tr("Time Unlocked"),     tr("Show Time Unlocked"));
+	add_trophy_column(gui::trophy_list_columns::icon);
+	add_trophy_column(gui::trophy_list_columns::name);
+	add_trophy_column(gui::trophy_list_columns::description);
+	add_trophy_column(gui::trophy_list_columns::type);
+	add_trophy_column(gui::trophy_list_columns::is_unlocked);
+	add_trophy_column(gui::trophy_list_columns::id);
+	add_trophy_column(gui::trophy_list_columns::platinum_link);
+	add_trophy_column(gui::trophy_list_columns::time_unlocked);
 
 	m_splitter = new QSplitter();
 	m_splitter->addWidget(m_game_table);
@@ -226,11 +241,20 @@ trophy_manager_dialog::trophy_manager_dialog(std::shared_ptr<gui_settings> gui_s
 	slider_layout->addWidget(m_game_icon_slider);
 	icon_settings->setLayout(slider_layout);
 
+	QGroupBox* rpcn_settings = new QGroupBox(tr("RPCN"));
+	QVBoxLayout* rpcn_layout = new QVBoxLayout();
+	m_btn_sync_all_trophies = new QPushButton(tr("Sync All to RPCN"));
+	QPushButton* btn_delete_online_trophies = new QPushButton(tr("Delete Online Trophies"));
+	rpcn_layout->addWidget(m_btn_sync_all_trophies);
+	rpcn_layout->addWidget(btn_delete_online_trophies);
+	rpcn_settings->setLayout(rpcn_layout);
+
 	QVBoxLayout* options_layout = new QVBoxLayout();
 	options_layout->addWidget(choose_game);
 	options_layout->addWidget(trophy_info);
 	options_layout->addWidget(show_settings);
 	options_layout->addWidget(icon_settings);
+	options_layout->addWidget(rpcn_settings);
 	options_layout->addStretch();
 
 	QHBoxLayout* all_layout = new QHBoxLayout(this);
@@ -240,6 +264,10 @@ trophy_manager_dialog::trophy_manager_dialog(std::shared_ptr<gui_settings> gui_s
 	setLayout(all_layout);
 
 	// Make connects
+	connect(m_btn_sync_all_trophies, &QAbstractButton::clicked, this, &trophy_manager_dialog::SyncAllOnlineTrophies);
+	connect(btn_delete_online_trophies, &QAbstractButton::clicked, this, &trophy_manager_dialog::DeleteOnlineTrophies);
+	UpdateOnlineTrophySyncCooldown();
+
 	connect(m_icon_slider, &QSlider::valueChanged, this, [this, trophy_slider_label](int val)
 	{
 		m_icon_height = val;
@@ -389,7 +417,7 @@ trophy_manager_dialog::trophy_manager_dialog(std::shared_ptr<gui_settings> gui_s
 	m_trophy_table->create_header_actions(m_trophy_column_acts,
 		[this](int col) { return m_gui_settings->GetTrophylistColVisibility(static_cast<gui::trophy_list_columns>(col)); },
 		[this](int col, bool visible) { m_gui_settings->SetTrophylistColVisibility(static_cast<gui::trophy_list_columns>(col), visible); });
-	
+
 	m_game_table->create_header_actions(m_game_column_acts,
 		[this](int col) { return m_gui_settings->GetTrophyGamelistColVisibility(static_cast<gui::trophy_game_list_columns>(col)); },
 		[this](int col, bool visible) { m_gui_settings->SetTrophyGamelistColVisibility(static_cast<gui::trophy_game_list_columns>(col), visible); });
@@ -399,10 +427,460 @@ trophy_manager_dialog::trophy_manager_dialog(std::shared_ptr<gui_settings> gui_s
 	StartTrophyLoadThreads();
 }
 
+void trophy_manager_dialog::DeleteOnlineTrophies()
+{
+	DeleteOnlineTrophiesForCommunicationId({});
+}
+
+void trophy_manager_dialog::DeleteOnlineTrophiesForCommunicationId(std::string_view communication_id, const QString& game_name)
+{
+	g_cfg_rpcn.load();
+
+	if (g_cfg_rpcn.get_npid().empty() || g_cfg_rpcn.get_password().empty())
+	{
+		QMessageBox::warning(this, tr("Account Not Configured"), tr("Please configure your RPCN account before deleting online trophies."), QMessageBox::Ok);
+		return;
+	}
+
+	const bool delete_all = communication_id.empty();
+	const QString confirmation = delete_all
+		? tr("Are you sure you want to delete all trophies synchronized to RPCN for account \"%1\"?\n\n"
+		     "This only removes trophies stored on RPCN. Your local RPCS3 trophy data will not be deleted.\n\n"
+		     "If trophy synchronization runs again, your local trophies may be uploaded to RPCN again.")
+			.arg(QString::fromStdString(g_cfg_rpcn.get_npid()))
+		: tr("Are you sure you want to delete the trophies synchronized to RPCN for:\n%1\n\n"
+		     "Communication ID: %2\n\n"
+		     "This only removes trophies stored on RPCN. Your local RPCS3 trophy data will not be deleted.\n\n"
+		     "If trophy synchronization runs again, your local trophies may be uploaded to RPCN again.")
+			.arg(game_name, QString::fromUtf8(communication_id.data(), static_cast<qsizetype>(communication_id.size())));
+
+	if (QMessageBox::warning(this, tr("Delete Online Trophies"), confirmation, QMessageBox::Yes | QMessageBox::No, QMessageBox::No) != QMessageBox::Yes)
+		return;
+
+	const auto rpcn = rpcn::rpcn_client::get_instance(0);
+
+	if (auto result = rpcn->wait_for_connection(); result != rpcn::rpcn_state::failure_no_failure)
+	{
+		const QString error_message = tr("Failed to connect to RPCN server:\n%0").arg(QString::fromStdString(rpcn::rpcn_state_to_string(result)));
+		QMessageBox::critical(this, tr("Error Connecting to RPCN!"), error_message, QMessageBox::Ok);
+		return;
+	}
+
+	if (auto result = rpcn->wait_for_authentified(); result != rpcn::rpcn_state::failure_no_failure)
+	{
+		const QString error_message = tr("Failed to authentify to RPCN:\n%0").arg(QString::fromStdString(rpcn::rpcn_state_to_string(result)));
+		QMessageBox::warning(this, tr("Error authentifying to RPCN!"), error_message, QMessageBox::Ok);
+		return;
+	}
+
+	if (const auto error = rpcn->delete_trophies(communication_id); error != rpcn::ErrorType::NoError)
+	{
+		QString error_message;
+		switch (error)
+		{
+		case rpcn::ErrorType::InvalidInput: error_message = tr("The communication ID is invalid."); break;
+		case rpcn::ErrorType::DbFail: error_message = tr("A database related error happened on the server."); break;
+		default: error_message = tr("An unknown error occurred."); break;
+		}
+
+		QMessageBox::critical(this, tr("Trophy Deletion Failed"), tr("Failed to delete RPCN trophies:\n%1").arg(error_message), QMessageBox::Ok);
+		return;
+	}
+
+	const QString success_message = delete_all
+		? tr("All trophies synchronized to RPCN have been successfully deleted.\n\nYour local RPCS3 trophy data was not changed and can be synchronized again later.")
+		: tr("The RPCN trophies for %1 (%2) have been successfully deleted.\n\nYour local RPCS3 trophy data was not changed and can be synchronized again later.")
+			.arg(game_name, QString::fromUtf8(communication_id.data(), static_cast<qsizetype>(communication_id.size())));
+
+	QMessageBox::information(this, tr("RPCN Trophies Deleted"), success_message, QMessageBox::Ok);
+}
+
+bool trophy_manager_dialog::SyncOnlineTrophyGame(int db_ind, const std::shared_ptr<rpcn::rpcn_client>& rpcn, QString& error_message)
+{
+	if (db_ind < 0 || db_ind >= static_cast<int>(m_trophies_db.size()) || !m_trophies_db[db_ind] || !m_trophies_db[db_ind]->trop_usr)
+	{
+		error_message = tr("The selected trophy entry is no longer available.");
+		return false;
+	}
+
+	auto& db = m_trophies_db[db_ind];
+	const std::string& communication_id = db->communication_id;
+
+	if (communication_id.size() != COMMUNICATION_ID_SIZE ||
+		communication_id[COMMUNICATION_ID_COMID_COMPONENT_SIZE] != '_' ||
+		communication_id[COMMUNICATION_ID_COMID_COMPONENT_SIZE + 1] < '0' || communication_id[COMMUNICATION_ID_COMID_COMPONENT_SIZE + 1] > '9' ||
+		communication_id[COMMUNICATION_ID_COMID_COMPONENT_SIZE + 2] < '0' || communication_id[COMMUNICATION_ID_COMID_COMPONENT_SIZE + 2] > '9')
+	{
+		error_message = tr("Invalid communication ID: %1").arg(QString::fromStdString(communication_id));
+		return false;
+	}
+
+	SceNpCommunicationId comm_id{};
+	std::memcpy(comm_id.data, communication_id.data(), COMMUNICATION_ID_COMID_COMPONENT_SIZE);
+	comm_id.data[COMMUNICATION_ID_COMID_COMPONENT_SIZE] = '\0';
+	comm_id.num = static_cast<u8>((communication_id[COMMUNICATION_ID_COMID_COMPONENT_SIZE + 1] - '0') * 10 +
+		(communication_id[COMMUNICATION_ID_COMID_COMPONENT_SIZE + 2] - '0'));
+
+	const std::string trophy_path = vfs::retrieve(db->path);
+	if (trophy_path.empty())
+	{
+		error_message = tr("Failed to resolve the local trophy directory for %1.").arg(QString::fromStdString(db->game_name));
+		return false;
+	}
+
+	const std::string tropusr_path = trophy_path + "/TROPUSR.DAT";
+	const std::string tropconf_path = trophy_path + "/TROPCONF.SFM";
+
+	// Reload the file before synchronizing in case it changed while Trophy Manager was open.
+	if (!db->trop_usr->Load(tropusr_path, tropconf_path).success)
+	{
+		error_message = tr("Failed to reload the local trophy data for %1.").arg(QString::fromStdString(db->game_name));
+		return false;
+	}
+
+	const u32 trophy_count = db->trop_usr->GetTrophiesCount();
+	std::vector<std::pair<s32, s64>> local_unlocked;
+	local_unlocked.reserve(trophy_count);
+
+	for (u32 trophy_id = 0; trophy_id < trophy_count; ++trophy_id)
+	{
+		const s32 id = static_cast<s32>(trophy_id);
+		if (db->trop_usr->GetTrophyUnlockState(id))
+		{
+			local_unlocked.emplace_back(id, static_cast<s64>(db->trop_usr->GetTrophyTimestamp(id)));
+		}
+	}
+
+	const std::vector<std::pair<s32, s64>> server_trophies = rpcn->sync_trophies(comm_id, local_unlocked);
+
+	if (!rpcn->is_connected() || !rpcn->is_authentified())
+	{
+		error_message = tr("The RPCN connection was lost while synchronizing %1.").arg(QString::fromStdString(db->game_name));
+		return false;
+	}
+
+	bool changed = false;
+	for (const auto& [trophy_id, timestamp] : server_trophies)
+	{
+		if (trophy_id < 0 || trophy_id >= static_cast<s32>(trophy_count) || timestamp < 0 || db->trop_usr->GetTrophyUnlockState(trophy_id))
+		{
+			continue;
+		}
+
+		if (!db->trop_usr->UnlockTrophy(trophy_id, static_cast<u64>(timestamp), static_cast<u64>(timestamp)))
+		{
+			error_message = tr("Failed to apply trophy %1 received from RPCN for %2.")
+				.arg(trophy_id)
+				.arg(QString::fromStdString(db->game_name));
+			return false;
+		}
+		changed = true;
+	}
+
+	if (changed && !db->trop_usr->Save(tropusr_path))
+	{
+		error_message = tr("Failed to save the synchronized local trophy data for %1.").arg(QString::fromStdString(db->game_name));
+		return false;
+	}
+
+	return true;
+}
+
+qint64 trophy_manager_dialog::GetOnlineTrophySyncCooldownRemainingMs(bool sync_all) const
+{
+	const QElapsedTimer& cooldown = sync_all ? s_rpcn_trophy_sync_all_cooldown : s_rpcn_trophy_sync_single_cooldown;
+	if (!cooldown.isValid())
+	{
+		return 0;
+	}
+
+	const qint64 cooldown_ms = sync_all ? RPCN_TROPHY_SYNC_ALL_COOLDOWN_MS : RPCN_TROPHY_SYNC_SINGLE_COOLDOWN_MS;
+	const qint64 remaining_ms = cooldown_ms - cooldown.elapsed();
+	return remaining_ms > 0 ? remaining_ms : 0;
+}
+
+bool trophy_manager_dialog::CanStartOnlineTrophySync(bool sync_all)
+{
+	if (s_rpcn_trophy_sync_in_progress)
+	{
+		QMessageBox::information(this, tr("RPCN Trophy Synchronization"), tr("A trophy synchronization is already in progress."), QMessageBox::Ok);
+		return false;
+	}
+
+	const qint64 remaining_ms = GetOnlineTrophySyncCooldownRemainingMs(sync_all);
+	if (remaining_ms > 0)
+	{
+		const qint64 remaining_seconds = (remaining_ms + 999) / 1000;
+		QMessageBox::information(this, tr("RPCN Trophy Synchronization"),
+			tr("Please wait %1 second(s) before synchronizing trophies again.").arg(remaining_seconds), QMessageBox::Ok);
+		return false;
+	}
+
+	return true;
+}
+
+void trophy_manager_dialog::BeginOnlineTrophySync(bool sync_all)
+{
+	s_rpcn_trophy_sync_in_progress = true;
+	if (sync_all)
+	{
+		s_rpcn_trophy_sync_all_cooldown.restart();
+	}
+	else
+	{
+		s_rpcn_trophy_sync_single_cooldown.restart();
+	}
+	UpdateOnlineTrophySyncCooldown();
+}
+
+void trophy_manager_dialog::EndOnlineTrophySync()
+{
+	s_rpcn_trophy_sync_in_progress = false;
+	UpdateOnlineTrophySyncCooldown();
+}
+
+void trophy_manager_dialog::UpdateOnlineTrophySyncCooldown()
+{
+	if (!m_btn_sync_all_trophies)
+	{
+		return;
+	}
+
+	const qint64 remaining_ms = GetOnlineTrophySyncCooldownRemainingMs(true);
+	m_btn_sync_all_trophies->setEnabled(!s_rpcn_trophy_sync_in_progress && remaining_ms == 0);
+
+	if (s_rpcn_trophy_sync_in_progress)
+	{
+		m_btn_sync_all_trophies->setToolTip(tr("A trophy synchronization is currently in progress."));
+		QTimer::singleShot(1000, this, [this]()
+		{
+			UpdateOnlineTrophySyncCooldown();
+		});
+		return;
+	}
+
+	if (remaining_ms > 0)
+	{
+		const qint64 remaining_seconds = (remaining_ms + 999) / 1000;
+		m_btn_sync_all_trophies->setToolTip(tr("Trophy synchronization will be available again in %1 second(s).").arg(remaining_seconds));
+		QTimer::singleShot(static_cast<int>(remaining_ms), this, [this]()
+		{
+			UpdateOnlineTrophySyncCooldown();
+		});
+		return;
+	}
+
+	m_btn_sync_all_trophies->setToolTip(QString{});
+}
+
+void trophy_manager_dialog::SyncOnlineTrophiesForGame(int db_ind)
+{
+	if (!CanStartOnlineTrophySync(false))
+	{
+		return;
+	}
+
+	if (db_ind < 0 || db_ind >= static_cast<int>(m_trophies_db.size()) || !m_trophies_db[db_ind])
+	{
+		return;
+	}
+
+	g_cfg_rpcn.load();
+	if (g_cfg_rpcn.get_npid().empty() || g_cfg_rpcn.get_password().empty())
+	{
+		QMessageBox::warning(this, tr("Account Not Configured"), tr("Please configure your RPCN account before synchronizing trophies."), QMessageBox::Ok);
+		return;
+	}
+
+	const auto rpcn = rpcn::rpcn_client::get_instance(0);
+	if (auto result = rpcn->wait_for_connection(); result != rpcn::rpcn_state::failure_no_failure)
+	{
+		QMessageBox::critical(this, tr("Error Connecting to RPCN!"), tr("Failed to connect to RPCN server:\n%1").arg(QString::fromStdString(rpcn::rpcn_state_to_string(result))), QMessageBox::Ok);
+		return;
+	}
+
+	if (auto result = rpcn->wait_for_authentified(); result != rpcn::rpcn_state::failure_no_failure)
+	{
+		QMessageBox::warning(this, tr("Error Authenticating to RPCN!"), tr("Failed to authenticate with RPCN:\n%1").arg(QString::fromStdString(rpcn::rpcn_state_to_string(result))), QMessageBox::Ok);
+		return;
+	}
+
+	BeginOnlineTrophySync(false);
+
+	QString error_message;
+	const bool sync_success = SyncOnlineTrophyGame(db_ind, rpcn, error_message);
+	EndOnlineTrophySync();
+
+	if (!sync_success)
+	{
+		QMessageBox::critical(this, tr("Trophy Synchronization Failed"), error_message, QMessageBox::Ok);
+		return;
+	}
+
+	const QString game_name = QString::fromStdString(m_trophies_db[db_ind]->game_name);
+	RepaintUI(true);
+	QMessageBox::information(this, tr("RPCN Trophy Synchronization"), tr("Trophies for %1 have been successfully synchronized with RPCN.").arg(game_name), QMessageBox::Ok);
+}
+
+void trophy_manager_dialog::SyncAllOnlineTrophies()
+{
+	if (!CanStartOnlineTrophySync(true))
+	{
+		return;
+	}
+
+	if (m_trophies_db.empty())
+	{
+		QMessageBox::information(this, tr("RPCN Trophy Synchronization"), tr("There are no local trophy sets to synchronize."), QMessageBox::Ok);
+		return;
+	}
+
+	g_cfg_rpcn.load();
+	if (g_cfg_rpcn.get_npid().empty() || g_cfg_rpcn.get_password().empty())
+	{
+		QMessageBox::warning(this, tr("Account Not Configured"), tr("Please configure your RPCN account before synchronizing trophies."), QMessageBox::Ok);
+		return;
+	}
+
+	const auto rpcn = rpcn::rpcn_client::get_instance(0);
+	if (auto result = rpcn->wait_for_connection(); result != rpcn::rpcn_state::failure_no_failure)
+	{
+		QMessageBox::critical(this, tr("Error Connecting to RPCN!"), tr("Failed to connect to RPCN server:\n%1").arg(QString::fromStdString(rpcn::rpcn_state_to_string(result))), QMessageBox::Ok);
+		return;
+	}
+
+	if (auto result = rpcn->wait_for_authentified(); result != rpcn::rpcn_state::failure_no_failure)
+	{
+		QMessageBox::warning(this, tr("Error Authenticating to RPCN!"), tr("Failed to authenticate with RPCN:\n%1").arg(QString::fromStdString(rpcn::rpcn_state_to_string(result))), QMessageBox::Ok);
+		return;
+	}
+
+	BeginOnlineTrophySync(true);
+
+	const int game_count = static_cast<int>(m_trophies_db.size());
+	progress_dialog progress_dlg(tr("Synchronizing trophies"), tr("Synchronizing trophy data with RPCN..."), tr("Cancel"), 0, game_count, false, this, Qt::Dialog | Qt::WindowTitleHint | Qt::CustomizeWindowHint);
+	progress_dlg.setWindowModality(Qt::WindowModal);
+	progress_dlg.setMinimumDuration(0);
+	progress_dlg.setValue(0);
+	progress_dlg.show();
+
+	int synced_count = 0;
+	QStringList failures;
+	bool canceled = false;
+
+	for (int db_ind = 0; db_ind < game_count; ++db_ind)
+	{
+		if (progress_dlg.wasCanceled())
+		{
+			canceled = true;
+			break;
+		}
+
+		const QString game_name = QString::fromStdString(m_trophies_db[db_ind]->game_name);
+		progress_dlg.setLabelText(tr("Synchronizing %1 (%2/%3)...").arg(game_name).arg(db_ind + 1).arg(game_count));
+		QApplication::processEvents();
+
+		QString error_message;
+		if (SyncOnlineTrophyGame(db_ind, rpcn, error_message))
+		{
+			++synced_count;
+		}
+		else
+		{
+			failures.append(tr("%1: %2").arg(game_name, error_message));
+		}
+
+		progress_dlg.setValue(db_ind + 1);
+		QApplication::processEvents();
+	}
+
+	progress_dlg.close();
+	EndOnlineTrophySync();
+	RepaintUI(true);
+
+	QString summary = canceled
+		? tr("Synchronization was canceled after %1 of %2 games were synchronized.").arg(synced_count).arg(game_count)
+		: tr("Successfully synchronized %1 of %2 games with RPCN.").arg(synced_count).arg(game_count);
+
+	if (!failures.isEmpty())
+	{
+		summary += tr("\n\nFailed games:\n%1").arg(failures.join('\n'));
+	}
+
+	if (failures.isEmpty())
+	{
+		QMessageBox::information(this, tr("RPCN Trophy Synchronization"), summary, QMessageBox::Ok);
+	}
+	else
+	{
+		QMessageBox::warning(this, tr("RPCN Trophy Synchronization"), summary, QMessageBox::Ok);
+	}
+}
+
 trophy_manager_dialog::~trophy_manager_dialog()
 {
 	WaitAndAbortGameRepaintThreads();
 	WaitAndAbortTrophyRepaintThreads();
+}
+
+QString trophy_manager_dialog::get_trophy_header_text(int col) const
+{
+	switch (static_cast<gui::trophy_list_columns>(col))
+	{
+	case gui::trophy_list_columns::icon:          return tr("Icon");
+	case gui::trophy_list_columns::name:          return tr("Name");
+	case gui::trophy_list_columns::description:   return tr("Description");
+	case gui::trophy_list_columns::type:          return tr("Type");
+	case gui::trophy_list_columns::is_unlocked:   return tr("Status");
+	case gui::trophy_list_columns::id:            return tr("ID");
+	case gui::trophy_list_columns::platinum_link: return tr("Platinum Relevant");
+	case gui::trophy_list_columns::time_unlocked: return tr("Time Unlocked");
+	case gui::trophy_list_columns::count:         break;
+	}
+	return {};
+}
+
+QString trophy_manager_dialog::get_trophy_action_text(int col) const
+{
+	switch (static_cast<gui::trophy_list_columns>(col))
+	{
+	case gui::trophy_list_columns::icon:          return tr("Show Icons");
+	case gui::trophy_list_columns::name:          return tr("Show Names");
+	case gui::trophy_list_columns::description:   return tr("Show Descriptions");
+	case gui::trophy_list_columns::type:          return tr("Show Types");
+	case gui::trophy_list_columns::is_unlocked:   return tr("Show Status");
+	case gui::trophy_list_columns::id:            return tr("Show IDs");
+	case gui::trophy_list_columns::platinum_link: return tr("Show Platinum Relevant");
+	case gui::trophy_list_columns::time_unlocked: return tr("Show Time Unlocked");
+	case gui::trophy_list_columns::count:         break;
+	}
+	return {};
+}
+
+QString trophy_manager_dialog::get_gamelist_header_text(int col) const
+{
+	switch (static_cast<gui::trophy_game_list_columns>(col))
+	{
+	case gui::trophy_game_list_columns::icon:       return tr("Icon");
+	case gui::trophy_game_list_columns::name:       return tr("Game");
+	case gui::trophy_game_list_columns::progress:   return tr("Progress");
+	case gui::trophy_game_list_columns::trophies:   return tr("Trophies");
+	case gui::trophy_game_list_columns::count:      break;
+	}
+	return {};
+}
+
+QString trophy_manager_dialog::get_gamelist_action_text(int col) const
+{
+	switch (static_cast<gui::trophy_game_list_columns>(col))
+	{
+	case gui::trophy_game_list_columns::icon:       return tr("Show Icons");
+	case gui::trophy_game_list_columns::name:       return tr("Show Games");
+	case gui::trophy_game_list_columns::progress:   return tr("Show Progress");
+	case gui::trophy_game_list_columns::trophies:   return tr("Show Trophies");
+	case gui::trophy_game_list_columns::count:      break;
+	}
+	return {};
 }
 
 bool trophy_manager_dialog::LoadTrophyFolderToDB(const std::string& trop_name)
@@ -420,6 +898,7 @@ bool trophy_manager_dialog::LoadTrophyFolderToDB(const std::string& trop_name)
 	std::unique_ptr<GameTrophiesData> game_trophy_data = std::make_unique<GameTrophiesData>();
 
 	game_trophy_data->path = vfs_path;
+	game_trophy_data->communication_id = trop_name;
 	game_trophy_data->trop_usr = std::make_unique<TROPUSRLoader>();
 	const std::string tropusr_path = trophy_path + "/TROPUSR.DAT";
 	const std::string tropconf_path = trophy_path + "/TROPCONF.SFM";
@@ -511,7 +990,6 @@ void trophy_manager_dialog::RepaintUI(bool restore_layout)
 	if (restore_layout && !m_game_table->horizontalHeader()->restoreState(game_table_state) && m_game_table->rowCount())
 	{
 		// If no settings exist, resize to contents. (disabled)
-		//m_game_table->verticalHeader()->resizeSections(QHeaderView::ResizeMode::ResizeToContents);
 		//m_game_table->horizontalHeader()->resizeSections(QHeaderView::ResizeMode::ResizeToContents);
 	}
 
@@ -519,7 +997,6 @@ void trophy_manager_dialog::RepaintUI(bool restore_layout)
 	if (restore_layout && !m_trophy_table->horizontalHeader()->restoreState(trophy_table_state) && m_trophy_table->rowCount())
 	{
 		// If no settings exist, resize to contents. (disabled)
-		//m_trophy_table->verticalHeader()->resizeSections(QHeaderView::ResizeMode::ResizeToContents);
 		//m_trophy_table->horizontalHeader()->resizeSections(QHeaderView::ResizeMode::ResizeToContents);
 	}
 
@@ -579,15 +1056,18 @@ void trophy_manager_dialog::ResizeGameIcons()
 
 	ReadjustGameTable();
 
+	const s32 language_index = gui_application::get_language_id();
+	const QString localized_icon = QString::fromStdString(fmt::format("ICON0_%02d.PNG", language_index));
+
 	for (int i = 0; i < m_game_table->rowCount(); ++i)
 	{
 		if (movie_item* item = static_cast<movie_item*>(m_game_table->item(i, static_cast<int>(gui::trophy_game_list_columns::icon))))
 		{
 			const qreal dpr = devicePixelRatioF();
 			const int trophy_index = item->data(GameUserRole::GameIndex).toInt();
-			const std::string icon_path = m_trophies_db[trophy_index]->path + "ICON0.PNG";
+			QString trophy_icon_path = QString::fromStdString(m_trophies_db[trophy_index]->path);
 
-			item->set_icon_load_func([this, icon_path, trophy_index, cancel = item->icon_loading_aborted(), dpr](int index)
+			item->set_icon_load_func([this, icon_path = std::move(trophy_icon_path), localized_icon, cancel = item->icon_loading_aborted(), dpr](int index)
 			{
 				if (cancel && cancel->load())
 				{
@@ -601,8 +1081,8 @@ void trophy_manager_dialog::ResizeGameIcons()
 					if (!item->data(GameUserRole::GamePixmapLoaded).toBool())
 					{
 						// Load game icon
-						const std::string icon_path = m_trophies_db[trophy_index]->path + "ICON0.PNG";
-						if (!icon.load(QString::fromStdString(icon_path)))
+						if (!icon.load(icon_path + localized_icon) &&
+							!icon.load(icon_path + "ICON0.PNG"))
 						{
 							gui_log.warning("Could not load trophy game icon from path %s", icon_path);
 						}
@@ -833,7 +1313,7 @@ void trophy_manager_dialog::ShowTrophyTableContextMenu(const QPoint& pos)
 		if (!name.isEmpty() && !desc.isEmpty())
 		{
 			QAction* copy_both = new QAction(tr("&Copy Name + Description"), copy_menu);
-			connect(copy_both, &QAction::triggered, this, [this, name, desc]()
+			connect(copy_both, &QAction::triggered, this, [name, desc]()
 			{
 				QApplication::clipboard()->setText(name % QStringLiteral("\n\n") % desc);
 			});
@@ -843,7 +1323,7 @@ void trophy_manager_dialog::ShowTrophyTableContextMenu(const QPoint& pos)
 		if (!name.isEmpty())
 		{
 			QAction* copy_name = new QAction(tr("&Copy Name"), copy_menu);
-			connect(copy_name, &QAction::triggered, this, [this, name]()
+			connect(copy_name, &QAction::triggered, this, [name]()
 			{
 				QApplication::clipboard()->setText(name);
 			});
@@ -853,7 +1333,7 @@ void trophy_manager_dialog::ShowTrophyTableContextMenu(const QPoint& pos)
 		if (!desc.isEmpty())
 		{
 			QAction* copy_desc = new QAction(tr("&Copy Description"), copy_menu);
-			connect(copy_desc, &QAction::triggered, this, [this, desc]()
+			connect(copy_desc, &QAction::triggered, this, [desc]()
 			{
 				QApplication::clipboard()->setText(desc);
 			});
@@ -923,7 +1403,7 @@ void trophy_manager_dialog::ShowTrophyTableContextMenu(const QPoint& pos)
 			}
 			if (QTableWidgetItem* date_item = m_trophy_table->item(row, static_cast<int>(gui::trophy_list_columns::time_unlocked)))
 			{
-				date_item->setText(tick ? QLocale().toString(TickToDateTime(tick), gui::persistent::last_played_date_with_time_of_day_format) : tr("Unknown"));
+				date_item->setText(tick ? gui::utils::format_datetime(TickToDateTime(tick), gui::persistent::last_played_date_with_time_of_day_format) : tr("Unknown"));
 				date_item->setData(Qt::UserRole, QVariant::fromValue<qulonglong>(tick));
 			}
 		});
@@ -936,9 +1416,15 @@ void trophy_manager_dialog::ShowTrophyTableContextMenu(const QPoint& pos)
 
 void trophy_manager_dialog::ShowGameTableContextMenu(const QPoint& pos)
 {
-	const int row = m_game_table->currentRow();
+	const QModelIndex index = m_game_table->indexAt(pos);
+	if (!index.isValid())
+	{
+		return;
+	}
 
-	if (!m_game_table->item(row, static_cast<int>(gui::trophy_game_list_columns::icon)))
+	const int row = index.row();
+	const QTableWidgetItem* icon_item = m_game_table->item(row, static_cast<int>(gui::trophy_game_list_columns::icon));
+	if (!icon_item)
 	{
 		return;
 	}
@@ -946,11 +1432,28 @@ void trophy_manager_dialog::ShowGameTableContextMenu(const QPoint& pos)
 	QMenu* menu = new QMenu();
 	QAction* remove_trophy_dir = new QAction(tr("&Remove"), this);
 	QAction* show_trophy_dir = new QAction(tr("&Open Trophy Directory"), menu);
+	QAction* sync_rpcn_trophies = new QAction(tr("&Sync This Game to RPCN"), menu);
+	QAction* delete_rpcn_trophies = new QAction(tr("Delete &RPCN Trophies for This Game"), menu);
 
-	const int db_ind = m_game_combo->currentData().toInt();
+	const qint64 sync_cooldown_remaining_ms = GetOnlineTrophySyncCooldownRemainingMs(false);
+	if (s_rpcn_trophy_sync_in_progress)
+	{
+		sync_rpcn_trophies->setEnabled(false);
+		sync_rpcn_trophies->setToolTip(tr("A trophy synchronization is currently in progress."));
+	}
+	else if (sync_cooldown_remaining_ms > 0)
+	{
+		const qint64 remaining_seconds = (sync_cooldown_remaining_ms + 999) / 1000;
+		sync_rpcn_trophies->setEnabled(false);
+		sync_rpcn_trophies->setText(tr("&Sync This Game to RPCN (%1s)").arg(remaining_seconds));
+		sync_rpcn_trophies->setToolTip(tr("Trophy synchronization will be available again in %1 second(s).").arg(remaining_seconds));
+	}
+
+	const int db_ind = icon_item->data(GameUserRole::GameIndex).toInt();
 
 	const QTableWidgetItem* name_item = m_game_table->item(row, static_cast<int>(gui::trophy_game_list_columns::name));
 	const QString name = name_item ? name_item->text() : "";
+	const std::string communication_id = m_trophies_db[db_ind]->communication_id;
 
 	connect(remove_trophy_dir, &QAction::triggered, this, [this, name, db_ind]()
 	{
@@ -967,14 +1470,25 @@ void trophy_manager_dialog::ShowGameTableContextMenu(const QPoint& pos)
 		const QString path = QString::fromStdString(m_trophies_db[db_ind]->path);
 		gui::utils::open_dir(path);
 	});
+	connect(sync_rpcn_trophies, &QAction::triggered, this, [this, db_ind]()
+	{
+		SyncOnlineTrophiesForGame(db_ind);
+	});
+	connect(delete_rpcn_trophies, &QAction::triggered, this, [this, communication_id, name]()
+	{
+		DeleteOnlineTrophiesForCommunicationId(communication_id, name);
+	});
 
 	menu->addAction(remove_trophy_dir);
 	menu->addAction(show_trophy_dir);
+	menu->addSeparator();
+	menu->addAction(sync_rpcn_trophies);
+	menu->addAction(delete_rpcn_trophies);
 
 	if (!name.isEmpty())
 	{
 		QAction* copy_name = new QAction(tr("&Copy Name"), menu);
-		connect(copy_name, &QAction::triggered, this, [this, name]()
+		connect(copy_name, &QAction::triggered, this, [name]()
 		{
 			QApplication::clipboard()->setText(name);
 		});
@@ -1015,21 +1529,21 @@ void trophy_manager_dialog::StartTrophyLoadThreads()
 	for (int i = 0; i < count; ++i)
 		indices.append(i);
 
-	QFutureWatcher<void> futureWatcher;
+	QFutureWatcher<void> future_watcher;
 
-	progress_dialog progressDialog(tr("Loading trophies"), tr("Loading trophy data, please wait..."), tr("Cancel"), 0, 1, false, this, Qt::Dialog | Qt::WindowTitleHint | Qt::CustomizeWindowHint);
+	progress_dialog progress_dlg(tr("Loading trophies"), tr("Loading trophy data, please wait..."), tr("Cancel"), 0, 1, false, this, Qt::Dialog | Qt::WindowTitleHint | Qt::CustomizeWindowHint);
 
-	connect(&futureWatcher, &QFutureWatcher<void>::progressRangeChanged, &progressDialog, &QProgressDialog::setRange);
-	connect(&futureWatcher, &QFutureWatcher<void>::progressValueChanged, &progressDialog, &QProgressDialog::setValue);
-	connect(&futureWatcher, &QFutureWatcher<void>::finished, this, [this]() { RepaintUI(true); });
-	connect(&progressDialog, &QProgressDialog::canceled, this, [this, &futureWatcher]()
+	connect(&future_watcher, &QFutureWatcher<void>::progressRangeChanged, &progress_dlg, &QProgressDialog::setRange);
+	connect(&future_watcher, &QFutureWatcher<void>::progressValueChanged, &progress_dlg, &QProgressDialog::setValue);
+	connect(&future_watcher, &QFutureWatcher<void>::finished, this, [this]() { RepaintUI(true); });
+	connect(&progress_dlg, &QProgressDialog::canceled, this, [this, &future_watcher]()
 	{
-		futureWatcher.cancel();
+		future_watcher.cancel();
 		close(); // It's pointless to show an empty window
 	});
 
 	atomic_t<usz> error_count{};
-	futureWatcher.setFuture(QtConcurrent::map(indices, [this, &error_count, &folder_list](const int& i)
+	future_watcher.setFuture(QtConcurrent::map(indices, [this, &error_count, &folder_list](const int& i)
 	{
 		const std::string dir_name = folder_list.value(i).toStdString();
 		gui_log.trace("Loading trophy dir: %s", dir_name);
@@ -1042,9 +1556,9 @@ void trophy_manager_dialog::StartTrophyLoadThreads()
 		}
 	}));
 
-	progressDialog.exec();
+	progress_dlg.exec();
 
-	futureWatcher.waitForFinished();
+	future_watcher.waitForFinished();
 
 	if (error_count != 0)
 	{
@@ -1059,6 +1573,21 @@ void trophy_manager_dialog::PopulateGameTable()
 	m_game_table->setSortingEnabled(false); // Disable sorting before using setItem calls
 	m_game_table->clearContents();
 	m_game_table->setRowCount(static_cast<int>(m_trophies_db.size()));
+
+	// Update headers
+	for (int col = 0; col < m_game_table->horizontalHeader()->count(); col++)
+	{
+		if (auto item = m_game_table->horizontalHeaderItem(col))
+		{
+			item->setText(get_gamelist_header_text(col));
+		}
+	}
+
+	// Update actions
+	for (auto& [col, action] : m_game_column_acts)
+	{
+		action->setText(get_gamelist_action_text(col));
+	}
 
 	m_game_combo->clear();
 	m_game_combo->blockSignals(true);
@@ -1110,6 +1639,8 @@ void trophy_manager_dialog::PopulateTrophyTable()
 		return;
 
 	auto& data = m_trophies_db[m_game_combo->currentData().toInt()];
+	ensure(!!data);
+
 	gui_log.trace("Populating Trophy Manager UI with %s %s", data->game_name, data->path);
 
 	const int all_trophies = data->trop_usr->GetTrophiesCount();
@@ -1122,10 +1653,23 @@ void trophy_manager_dialog::PopulateTrophyTable()
 	m_trophy_table->setRowCount(all_trophies);
 	m_trophy_table->setSortingEnabled(false); // Disable sorting before using setItem calls
 
+	// Update headers
+	for (int col = 0; col < m_trophy_table->horizontalHeader()->count(); col++)
+	{
+		if (auto item = m_trophy_table->horizontalHeaderItem(col))
+		{
+			item->setText(get_trophy_header_text(col));
+		}
+	}
+
+	// Update actions
+	for (auto& [col, action] : m_trophy_column_acts)
+	{
+		action->setText(get_trophy_action_text(col));
+	}
+
 	QPixmap placeholder(m_icon_height, m_icon_height);
 	placeholder.fill(Qt::transparent);
-
-	const QLocale locale{};
 
 	std::shared_ptr<rXmlNode> trophy_base = data->trop_config.GetRoot();
 	if (!trophy_base)
@@ -1185,7 +1729,7 @@ void trophy_manager_dialog::PopulateTrophyTable()
 
 		// Get timestamp
 		const u64 tick = data->trop_usr->GetTrophyTimestamp(trophy_id);
-		const QString datetime = tick ? locale.toString(TickToDateTime(tick), gui::persistent::last_played_date_with_time_of_day_format) : tr("Unknown");
+		const QString datetime = tick ? gui::utils::format_datetime(TickToDateTime(tick), gui::persistent::last_played_date_with_time_of_day_format) : tr("Unknown");
 
 		const QString unlockstate = data->trop_usr->GetTrophyUnlockState(trophy_id) ? tr("Earned") : tr("Not Earned");
 
@@ -1216,9 +1760,9 @@ void trophy_manager_dialog::PopulateTrophyTable()
 void trophy_manager_dialog::ReadjustGameTable() const
 {
 	// Fixate vertical header and row height
+	m_game_table->verticalHeader()->setDefaultSectionSize(m_game_icon_size.height());
 	m_game_table->verticalHeader()->setMinimumSectionSize(m_game_icon_size.height());
 	m_game_table->verticalHeader()->setMaximumSectionSize(m_game_icon_size.height());
-	m_game_table->resizeRowsToContents();
 
 	// Resize and fixate icon column
 	m_game_table->resizeColumnToContents(static_cast<int>(gui::trophy_game_list_columns::icon));
@@ -1231,9 +1775,9 @@ void trophy_manager_dialog::ReadjustGameTable() const
 void trophy_manager_dialog::ReadjustTrophyTable() const
 {
 	// Fixate vertical header and row height
+	m_trophy_table->verticalHeader()->setDefaultSectionSize(m_icon_height);
 	m_trophy_table->verticalHeader()->setMinimumSectionSize(m_icon_height);
 	m_trophy_table->verticalHeader()->setMaximumSectionSize(m_icon_height);
-	m_trophy_table->resizeRowsToContents();
 
 	// Resize and fixate icon column
 	m_trophy_table->resizeColumnToContents(static_cast<int>(gui::trophy_list_columns::icon));

@@ -1,15 +1,13 @@
 #include "gui_settings.h"
 
 #include "qt_utils.h"
-#include "localized.h"
+#include "category.h"
 
 #include "Emu/System.h"
 
 #include <QCheckBox>
 #include <QCoreApplication>
 #include <QMessageBox>
-
-#include <thread>
 
 LOG_CHANNEL(cfg_log, "CFG");
 
@@ -19,43 +17,55 @@ namespace gui
 {
 	QString stylesheet;
 	bool custom_stylesheet_active = false;
+	f32 volume = 1.0f;
+
+	QString get_savestate_list_column_name(savestate_list_columns col)
+	{
+		switch (col)
+		{
+		case gui::savestate_list_columns::name: return "savestate_column_name";
+		case gui::savestate_list_columns::compatible: return "savestate_column_compatible";
+		case gui::savestate_list_columns::date: return "savestate_column_date";
+		case gui::savestate_list_columns::path: return "savestate_column_path";
+		case gui::savestate_list_columns::count: return "";
+		}
+
+		fmt::throw_exception("get_savestate_list_column_name: Invalid column");
+	}
+
+	QString get_savestate_game_list_column_name(savestate_game_list_columns col)
+	{
+		switch (col)
+		{
+		case gui::savestate_game_list_columns::icon: return "savestate_game_column_icon";
+		case gui::savestate_game_list_columns::name: return "savestate_game_column_name";
+		case gui::savestate_game_list_columns::savestates: return "savestate_game_column_savestates";
+		case gui::savestate_game_list_columns::count: return "";
+		}
+
+		fmt::throw_exception("get_savestate_game_list_column_name: Invalid column");
+	}
 
 	QString get_game_list_column_name(game_list_columns col)
 	{
 		switch (col)
 		{
-		case game_list_columns::icon:
-			return "column_icon";
-		case game_list_columns::name:
-			return "column_name";
-		case game_list_columns::serial:
-			return "column_serial";
-		case game_list_columns::firmware:
-			return "column_firmware";
-		case game_list_columns::version:
-			return "column_version";
-		case game_list_columns::category:
-			return "column_category";
-		case game_list_columns::path:
-			return "column_path";
-		case game_list_columns::move:
-			return "column_move";
-		case game_list_columns::resolution:
-			return "column_resolution";
-		case game_list_columns::sound:
-			return "column_sound";
-		case game_list_columns::parental:
-			return "column_parental";
-		case game_list_columns::last_play:
-			return "column_last_play";
-		case game_list_columns::playtime:
-			return "column_playtime";
-		case game_list_columns::compat:
-			return "column_compat";
-		case game_list_columns::dir_size:
-			return "column_dir_size";
-		case game_list_columns::count:
-			return "";
+		case game_list_columns::icon: return "column_icon";
+		case game_list_columns::name: return "column_name";
+		case game_list_columns::serial: return "column_serial";
+		case game_list_columns::firmware: return "column_firmware";
+		case game_list_columns::version: return "column_version";
+		case game_list_columns::category: return "column_category";
+		case game_list_columns::path: return "column_path";
+		case game_list_columns::move: return "column_move";
+		case game_list_columns::resolution: return "column_resolution";
+		case game_list_columns::sound: return "column_sound";
+		case game_list_columns::parental: return "column_parental";
+		case game_list_columns::last_play: return "column_last_play";
+		case game_list_columns::playtime: return "column_playtime";
+		case game_list_columns::compat: return "column_compat";
+		case game_list_columns::dir_size: return "column_dir_size";
+		case game_list_columns::count: return "";
 		}
 	
 		fmt::throw_exception("get_game_list_column_name: Invalid column");
@@ -65,24 +75,15 @@ namespace gui
 	{
 		switch (col)
 		{
-		case trophy_list_columns::icon:
-			return "trophy_column_icon";
-		case trophy_list_columns::name:
-			return "trophy_column_name";
-		case trophy_list_columns::description:
-			return "trophy_column_description";
-		case trophy_list_columns::type:
-			return "trophy_column_type";
-		case trophy_list_columns::is_unlocked:
-			return "trophy_column_is_unlocked";
-		case trophy_list_columns::id:
-			return "trophy_column_id";
-		case trophy_list_columns::platinum_link:
-			return "trophy_column_platinum_link";
-		case trophy_list_columns::time_unlocked:
-			return "trophy_column_time_unlocked";
-		case trophy_list_columns::count:
-			return "";
+		case trophy_list_columns::icon: return "trophy_column_icon";
+		case trophy_list_columns::name: return "trophy_column_name";
+		case trophy_list_columns::description: return "trophy_column_description";
+		case trophy_list_columns::type: return "trophy_column_type";
+		case trophy_list_columns::is_unlocked: return "trophy_column_is_unlocked";
+		case trophy_list_columns::id: return "trophy_column_id";
+		case trophy_list_columns::platinum_link: return "trophy_column_platinum_link";
+		case trophy_list_columns::time_unlocked: return "trophy_column_time_unlocked";
+		case trophy_list_columns::count: return "";
 		}
 	
 		fmt::throw_exception("get_trophy_list_column_name: Invalid column");
@@ -92,44 +93,344 @@ namespace gui
 	{
 		switch (col)
 		{
-		case trophy_game_list_columns::icon:
-			return "trophy_game_column_icon";
-		case trophy_game_list_columns::name:
-			return "trophy_game_column_name";
-		case trophy_game_list_columns::progress:
-			return "trophy_game_column_progress";
-		case trophy_game_list_columns::trophies:
-			return "trophy_game_column_trophies";
-		case trophy_game_list_columns::count:
-			return "";
+		case trophy_game_list_columns::icon: return "trophy_game_column_icon";
+		case trophy_game_list_columns::name: return "trophy_game_column_name";
+		case trophy_game_list_columns::progress: return "trophy_game_column_progress";
+		case trophy_game_list_columns::trophies: return "trophy_game_column_trophies";
+		case trophy_game_list_columns::count: return "";
 		}
 	
 		fmt::throw_exception("get_trophy_game_list_column_name: Invalid column");
+	}
+
+	QString window_states_to_string(Qt::WindowStates states)
+	{
+		if (states & Qt::WindowFullScreen) return "FullScreen";
+		if (states & Qt::WindowMaximized) return "Maximized";
+		if (states & Qt::WindowMinimized) return "Minimized";
+		return "Windowed";
+	}
+
+	Qt::WindowState string_to_window_states(const QString& state)
+	{
+		const QString lower = state.toLower(); // Allow for better user experience
+		if (lower == "fullscreen") return Qt::WindowFullScreen;
+		if (lower == "maximized") return Qt::WindowMaximized;
+		if (lower == "minimized") return Qt::WindowMinimized;
+		return Qt::WindowNoState;
+	}
+
+	QString visibility_to_string(QWindow::Visibility visibility)
+	{
+		switch (visibility)
+		{
+		case QWindow::Visibility::Windowed: return "Windowed";
+		case QWindow::Visibility::Minimized: return "Minimized";
+		case QWindow::Visibility::Maximized: return "Maximized";
+		case QWindow::Visibility::FullScreen: return "FullScreen";
+		default: return "AutomaticVisibility";
+		}
+	}
+
+	QWindow::Visibility string_to_visibility(const QString& visibility)
+	{
+		const QString lower = visibility.toLower(); // Allow for better user experience
+		if (lower == "windowed") return QWindow::Visibility::Windowed;
+		if (lower == "minimized") return QWindow::Visibility::Minimized;
+		if (lower == "maximized") return QWindow::Visibility::Maximized;
+		if (lower == "fullscreen") return QWindow::Visibility::FullScreen;
+		return QWindow::Visibility::AutomaticVisibility;
 	}
 }
 
 gui_settings::gui_settings(QObject* parent) : settings(parent)
 {
-	m_settings = std::make_unique<QSettings>(ComputeSettingsDir() + gui::Settings + ".ini", QSettings::Format::IniFormat, parent);
+	m_settings = std::make_unique<QSettings>(GetSettingsDir() + gui::Settings + ".ini", QSettings::Format::IniFormat, parent);
 }
 
 QStringList gui_settings::GetGameListCategoryFilters(bool is_list_mode) const
 {
-	QStringList filterList;
+	QStringList filters;
 
-	if (GetCategoryVisibility(Category::HDD_Game, is_list_mode)) filterList.append(cat::cat_hdd_game);
-	if (GetCategoryVisibility(Category::Disc_Game, is_list_mode)) filterList.append(cat::cat_disc_game);
-	if (GetCategoryVisibility(Category::PS1_Game, is_list_mode)) filterList.append(cat::cat_ps1_game);
-	if (GetCategoryVisibility(Category::PS2_Game, is_list_mode)) filterList.append(cat::ps2_games);
-	if (GetCategoryVisibility(Category::PSP_Game, is_list_mode)) filterList.append(cat::psp_games);
-	if (GetCategoryVisibility(Category::Home, is_list_mode)) filterList.append(cat::cat_home);
-	if (GetCategoryVisibility(Category::Media, is_list_mode)) filterList.append(cat::media);
-	if (GetCategoryVisibility(Category::Data, is_list_mode)) filterList.append(cat::data);
-	if (GetCategoryVisibility(Category::OS, is_list_mode)) filterList.append(cat::os);
-	if (GetCategoryVisibility(Category::Unknown_Cat, is_list_mode)) filterList.append(cat::cat_unknown);
-	if (GetCategoryVisibility(Category::Others, is_list_mode)) filterList.append(cat::others);
+	if (GetCategoryVisibility(Category::HDD_Game, is_list_mode)) filters.append(cat::cat_hdd_game);
+	if (GetCategoryVisibility(Category::Disc_Game, is_list_mode)) filters.append(cat::cat_disc_game);
+	if (GetCategoryVisibility(Category::PS1_Game, is_list_mode)) filters.append(cat::cat_ps1_game);
+	if (GetCategoryVisibility(Category::PS2_Game, is_list_mode)) filters.append(cat::ps2_games);
+	if (GetCategoryVisibility(Category::PSP_Game, is_list_mode)) filters.append(cat::psp_games);
+	if (GetCategoryVisibility(Category::Home, is_list_mode)) filters.append(cat::cat_home);
+	if (GetCategoryVisibility(Category::Media, is_list_mode)) filters.append(cat::media);
+	if (GetCategoryVisibility(Category::Data, is_list_mode)) filters.append(cat::data);
+	if (GetCategoryVisibility(Category::OS, is_list_mode)) filters.append(cat::os);
+	if (GetCategoryVisibility(Category::Unknown_Cat, is_list_mode)) filters.append(cat::cat_unknown);
+	if (GetCategoryVisibility(Category::Others, is_list_mode)) filters.append(cat::others);
 
-	return filterList;
+	return filters;
+}
+
+namespace
+{
+	constexpr QLatin1String gc_games_prefix("games_");
+
+	// '/' is the group separator of QSettings and would split the ini key in two.
+	// ',' separates the entries of the stored collection list. The rest is ini syntax.
+	constexpr QStringView gc_forbidden_chars = u"/\\[]=;,";
+	constexpr int gc_max_name_length = 64;
+}
+
+QStringList gui_settings::GetGameCollections() const
+{
+	return GetValue(gui::gc_collections).toStringList();
+}
+
+bool gui_settings::AddGameCollection(const QString& name) const
+{
+	if (!IsValidGameCollectionName(name) || IsReservedGameCollectionName(name))
+	{
+		return false;
+	}
+
+	QStringList collections = GetGameCollections();
+
+	// Two names that differ only in case would land on the same games_ key and share one member list.
+	// QSettings folds those keys the way toLower does, not the way Qt::CaseInsensitive compares: the two
+	// disagree on the Greek sigmas, which QSettings keeps apart.
+	const QString key = name.toLower();
+
+	if (std::any_of(collections.cbegin(), collections.cend(), [&key](const QString& c) { return c.toLower() == key; }))
+	{
+		return false;
+	}
+
+	collections.append(name);
+
+	SetValue(gui::gc_collections, collections);
+	return true;
+}
+
+bool gui_settings::RenameGameCollection(const QString& from, const QString& to) const
+{
+	if (!IsValidGameCollectionName(to) || IsReservedGameCollectionName(to))
+	{
+		return false;
+	}
+
+	QStringList collections = GetGameCollections();
+	const qsizetype at = collections.indexOf(from);
+
+	if (at < 0 || collections[at] == to)
+	{
+		return false;
+	}
+
+	// The collection may take the key it already owns, which is what a change of case alone does, but not
+	// one another collection owns
+	const QString key = to.toLower();
+
+	for (qsizetype i = 0; i < collections.size(); i++)
+	{
+		if (i != at && collections[i].toLower() == key)
+		{
+			return false;
+		}
+	}
+
+	// Read the members before the key they live under goes away
+	const QSet<QString> games = GetGamesInCollection(from);
+
+	collections[at] = to;
+	SetValue(gui::gc_collections, collections, false);
+
+	RemoveValue(gui::game_collection, gc_games_prefix + from, false);
+	SetGamesInCollection(to, games);
+
+	if (GetValue(gui::gc_current).toString() == from)
+	{
+		SetCurrentGameCollection(to, false);
+	}
+
+	sync();
+	return true;
+}
+
+bool gui_settings::RemoveGameCollection(const QString& name) const
+{
+	QStringList collections = GetGameCollections();
+
+	if (!collections.removeOne(name))
+	{
+		return false;
+	}
+
+	const bool reset_current = GetValue(gui::gc_current).toString() == name;
+
+	if (collections.isEmpty())
+	{
+		RemoveValue(gui::gc_collections, false);
+	}
+	else
+	{
+		SetValue(gui::gc_collections, collections, false);
+	}
+
+	RemoveValue(gui::game_collection, gc_games_prefix + name, false);
+
+	if (reset_current)
+	{
+		SetCurrentGameCollection({}, false);
+	}
+
+	sync();
+	return true;
+}
+
+QString gui_settings::GetCurrentGameCollection() const
+{
+	return GetValue(gui::gc_current).toString();
+}
+
+void gui_settings::SetCurrentGameCollection(const QString& name, bool sync) const
+{
+	// Removing the entry lets the whole [GameCollection] section disappear with the last collection, and
+	// matches SetGamesInCollection, where dropping the key is mandatory rather than tidy.
+	if (name.isEmpty())
+	{
+		RemoveValue(gui::gc_current, sync);
+		return;
+	}
+
+	SetValue(gui::gc_current, name, sync);
+}
+
+QSet<QString> gui_settings::GetGamesInCollection(const QString& name) const
+{
+	return gui::utils::list_to_set(GetValue(gui::game_collection, gc_games_prefix + name, QStringList()).toStringList());
+}
+
+bool gui_settings::CleanupCollections(const QSet<QString>& serials) const
+{
+	const QStringList& collections = GetGameCollections();
+
+	if (collections.isEmpty())
+	{
+		return false;
+	}
+
+	bool changed = false;
+
+	for (const QString& collection : collections)
+	{
+		const QSet<QString> old_games = GetGamesInCollection(collection);
+		QSet<QString> games = old_games;
+
+		games.intersect(serials);
+
+		if (games != old_games)
+		{
+			SetGamesInCollection(collection, games);
+			changed = true;
+		}
+	}
+
+	if (changed)
+	{
+		sync();
+	}
+
+	return changed;
+}
+
+bool gui_settings::SetGameCollectionMembership(const QSet<QString>& serials, const QString& name, bool add) const
+{
+	if (serials.isEmpty() || !GetGameCollections().contains(name))
+	{
+		return false;
+	}
+
+	QSet<QString> games = GetGamesInCollection(name);
+	const qsizetype old_size = games.size();
+
+	if (add)
+	{
+		games.unite(serials);
+	}
+	else
+	{
+		games.subtract(serials);
+	}
+
+	// unite only adds and subtract only removes, so a size that did not move is a set that did not either
+	if (games.size() == old_size)
+	{
+		return false;
+	}
+
+	SetGamesInCollection(name, games);
+	sync();
+	return true;
+}
+
+QString gui_settings::GetAllGamesCollectionLabel()
+{
+	return tr("All Games");
+}
+
+bool gui_settings::IsValidGameCollectionName(const QString& name)
+{
+	if (name.isEmpty() || name.size() > gc_max_name_length || name != name.trimmed())
+	{
+		return false;
+	}
+
+	for (const QChar c : name)
+	{
+		// Control characters would break the line structure of the ini file
+		if (!c.isPrint() || gc_forbidden_chars.contains(c))
+		{
+			return false;
+		}
+	}
+
+	return true;
+}
+
+QString gui_settings::GetGameCollectionNameHint()
+{
+	QStringList chars;
+
+	for (const QChar c : gc_forbidden_chars)
+	{
+		chars << c;
+	}
+
+	return tr("A collection name may be at most %0 characters long, "
+		"may only contain printable characters, and must not contain any of these: %1")
+		.arg(QString::number(gc_max_name_length), chars.join(QLatin1Char(' ')));
+}
+
+bool gui_settings::IsReservedGameCollectionName(const QString& name)
+{
+	// Always reject the English string, plus whatever "All Games" reads as in the current language. A name
+	// created under a different language can still end up matching the label, which merely looks odd: the
+	// default entry is identified by an empty collection name, never by its text.
+	return name.compare(GetAllGamesCollectionLabel(), Qt::CaseInsensitive) == 0 ||
+	       name.compare(QStringLiteral("All Games"), Qt::CaseInsensitive) == 0;
+}
+
+void gui_settings::SetGamesInCollection(const QString& name, const QSet<QString>& serials) const
+{
+	if (!IsValidGameCollectionName(name))
+	{
+		return;
+	}
+
+	// QSettings writes an empty list as "@Invalid()", so drop the key instead of leaving that in the ini
+	if (serials.isEmpty())
+	{
+		RemoveValue(gui::game_collection, gc_games_prefix + name, false);
+		return;
+	}
+
+	SetValue(gui::game_collection, gc_games_prefix + name, QStringList(serials.values()), false);
 }
 
 bool gui_settings::GetCategoryVisibility(int cat, bool is_list_mode) const
@@ -243,6 +544,16 @@ bool gui_settings::GetBootConfirmation(QWidget* parent, const gui_save& gui_save
 	return true;
 }
 
+void gui_settings::SetSavestateGamelistColVisibility(gui::savestate_game_list_columns col, bool val) const
+{
+	SetValue(GetGuiSaveForSavestateGameColumn(col), val);
+}
+
+void gui_settings::SetSavestateListColVisibility(gui::savestate_list_columns col, bool val) const
+{
+	SetValue(GetGuiSaveForSavestateColumn(col), val);
+}
+
 void gui_settings::SetTrophyGamelistColVisibility(gui::trophy_game_list_columns col, bool val) const
 {
 	SetValue(GetGuiSaveForTrophyGameColumn(col), val);
@@ -268,6 +579,16 @@ logs::level gui_settings::GetLogLevel() const
 	return logs::level(GetValue(gui::l_level).toUInt());
 }
 
+bool gui_settings::GetSavestateGamelistColVisibility(gui::savestate_game_list_columns col) const
+{
+	return GetValue(GetGuiSaveForSavestateGameColumn(col)).toBool();
+}
+
+bool gui_settings::GetSavestateListColVisibility(gui::savestate_list_columns col) const
+{
+	return GetValue(GetGuiSaveForSavestateColumn(col)).toBool();
+}
+
 bool gui_settings::GetTrophyGamelistColVisibility(gui::trophy_game_list_columns col) const
 {
 	return GetValue(GetGuiSaveForTrophyGameColumn(col)).toBool();
@@ -291,7 +612,7 @@ QColor gui_settings::GetCustomColor(int col) const
 QStringList gui_settings::GetStylesheetEntries() const
 {
 	const QStringList name_filter = QStringList("*.qss");
-	QStringList res = gui::utils::get_dir_entries(m_settings_dir, name_filter);
+	QStringList res = gui::utils::get_dir_entries(QDir(GetSettingsDir()), name_filter);
 #if !defined(_WIN32)
 	// Makes stylesheets load if using AppImage (App Bundle) or installed to /usr/bin
 #ifdef __APPLE__
@@ -314,6 +635,16 @@ QStringList gui_settings::GetStylesheetEntries() const
 QSize gui_settings::SizeFromSlider(int pos)
 {
 	return gui::gl_icon_size_min + (gui::gl_icon_size_max - gui::gl_icon_size_min) * (1.f * pos / gui::gl_max_slider_pos);
+}
+
+gui_save gui_settings::GetGuiSaveForSavestateGameColumn(gui::savestate_game_list_columns col)
+{
+	return gui_save{ gui::savestate, "visibility_" + gui::get_savestate_game_list_column_name(col), true };
+}
+
+gui_save gui_settings::GetGuiSaveForSavestateColumn(gui::savestate_list_columns col)
+{
+	return gui_save{ gui::savestate, "visibility_" + gui::get_savestate_list_column_name(col), true };
 }
 
 gui_save gui_settings::GetGuiSaveForTrophyGameColumn(gui::trophy_game_list_columns col)

@@ -8,7 +8,6 @@ progress_dialog::progress_dialog(const QString& windowTitle, const QString& labe
 {
 	setWindowTitle(windowTitle);
 	setMinimumSize(QLabel("This is the very length of the progressdialog due to hidpi reasons.").sizeHint().width(), sizeHint().height());
-	setValue(0);
 	setWindowModality(Qt::WindowModal);
 
 	if (delete_on_close)
@@ -50,35 +49,4 @@ void progress_dialog::SignalFailure() const
 	m_progress_indicator->signal_failure();
 
 	QApplication::beep();
-}
-
-void progress_dialog::show_progress_indicator()
-{
-	// Try to find a window handle first
-	QWindow* handle = windowHandle();
-
-	for (QWidget* ancestor = this; !handle && ancestor;)
-	{
-		ancestor = static_cast<QWidget*>(ancestor->parent());
-		if (ancestor) handle = ancestor->windowHandle();
-	}
-
-	m_progress_indicator->show(handle);
-}
-
-void progress_dialog::setVisible(bool visible)
-{
-	if (visible)
-	{
-		if (!isVisible())
-		{
-			show_progress_indicator();
-		}
-	}
-	else if (isVisible())
-	{
-		m_progress_indicator->hide();
-	}
-
-	QProgressDialog::setVisible(visible);
 }

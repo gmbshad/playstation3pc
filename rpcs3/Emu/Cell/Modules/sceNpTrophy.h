@@ -1,10 +1,10 @@
 #pragma once
 
 #include "util/types.hpp"
-#include "util/endian.hpp"
 #include "Emu/Memory/vm_ptr.h"
 #include "Emu/Cell/ErrorCodes.h"
 #include <vector>
+#include <mutex>
 
 // Error codes
 enum SceNpTrophyError : u32
@@ -134,7 +134,7 @@ struct SceNpTrophyFlagArray
 	be_t<u32> flag_bits[SCE_NP_TROPHY_FLAG_SETSIZE >> SCE_NP_TROPHY_FLAG_BITS_SHIFT];
 };
 
-enum
+enum SceNpTrophyStatus : u32
 {
 	SCE_NP_TROPHY_STATUS_UNKNOWN             = 0,
 	SCE_NP_TROPHY_STATUS_NOT_INSTALLED       = 1,

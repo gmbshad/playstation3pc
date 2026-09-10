@@ -2,8 +2,6 @@
 #include "Skylander.h"
 #include "Emu/Cell/lv2/sys_usbd.h"
 
-#include "util/asm.hpp"
-
 LOG_CHANNEL(skylander_log, "skylander");
 
 sky_portal g_skyportal;
@@ -93,7 +91,7 @@ void sky_portal::get_status(u8* reply_buf)
 
 	std::memset(reply_buf, 0, 0x20);
 	reply_buf[0] = 0x53;
-	write_to_ptr<le_t<u16>>(reply_buf, 1, status);
+	write_to_ptr_unsafe<le_t<u16>>(reply_buf, 1, status);
 	reply_buf[5] = interrupt_counter++;
 	reply_buf[6] = 0x01;
 }
@@ -155,11 +153,11 @@ bool sky_portal::remove_skylander(u8 sky_num)
 	return false;
 }
 
-u8 sky_portal::load_skylander(u8* buf, fs::file in_file)
+u8 sky_portal::load_skylander(const std::array<u8, 0x40 * 0x10>& data, fs::file in_file)
 {
 	std::lock_guard lock(sky_mutex);
 
-	const u32 sky_serial = read_from_ptr<le_t<u32>>(buf);
+	const u32 sky_serial = read_from_ptr<le_t<u32>>(data);
 	u8 found_slot  = 0xFF;
 
 	// mimics spot retaining on the portal
@@ -183,7 +181,7 @@ u8 sky_portal::load_skylander(u8* buf, fs::file in_file)
 	ensure(found_slot != 0xFF);
 
 	skylander& thesky = skylanders[found_slot];
-	memcpy(thesky.data.data(), buf, thesky.data.size());
+	memcpy(thesky.data.data(), data.data(), thesky.data.size());
 	thesky.sky_file = std::move(in_file);
 	thesky.status   = 3;
 	thesky.queued_status.push(3);
@@ -206,6 +204,16 @@ usb_device_skylander::usb_device_skylander(const std::array<u8, 7>& location)
 
 usb_device_skylander::~usb_device_skylander()
 {
+}
+
+std::shared_ptr<usb_device> usb_device_skylander::make_instance(u32, const std::array<u8, 7>& location)
+{
+	return std::make_shared<usb_device_skylander>(location);
+}
+
+u16 usb_device_skylander::get_num_emu_devices()
+{
+	return 1;
 }
 
 void usb_device_skylander::control_transfer(u8 bmRequestType, u8 bRequest, u16 wValue, u16 wIndex, u16 wLength, u32 buf_size, u8* buf, UsbTransfer* transfer)
@@ -342,7 +350,7 @@ void usb_device_skylander::interrupt_transfer(u32 buf_size, u8* buf, u32 endpoin
 	transfer->fake            = true;
 	transfer->expected_count  = buf_size;
 	transfer->expected_result = HC_CC_NOERR;
-	
+
 	if (endpoint == 0x02)
 	{
 		// Audio transfers are fairly quick(~1ms)

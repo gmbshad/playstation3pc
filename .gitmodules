@@ -21,16 +21,12 @@
 	ignore = dirty
 [submodule "3rdparty/hidapi"]
 	path = 3rdparty/hidapi/hidapi
-	url = ../../RPCS3/hidapi.git
+	url = ../../libusb/hidapi.git
 	branch = master
 	ignore = dirty
 [submodule "3rdparty/pugixml"]
 	path = 3rdparty/pugixml
 	url = ../../zeux/pugixml.git
-	ignore = dirty
-[submodule "3rdparty/xxHash"]
-	path = 3rdparty/xxHash
-	url = ../../Cyan4973/xxHash.git
 	ignore = dirty
 [submodule "3rdparty/yaml-cpp"]
 	path = 3rdparty/yaml-cpp/yaml-cpp
@@ -55,10 +51,6 @@
 [submodule "3rdparty/wolfssl"]
 	path = 3rdparty/wolfssl/wolfssl
 	url = ../../wolfSSL/wolfssl.git
-	ignore = dirty
-[submodule "3rdparty/flatbuffers"]
-	path = 3rdparty/flatbuffers
-	url = ../../google/flatbuffers.git
 	ignore = dirty
 [submodule "3rdparty/cubeb/cubeb"]
 	path = 3rdparty/cubeb/cubeb
@@ -103,4 +95,20 @@
 [submodule "3rdparty/fusion/fusion"]
 	path = 3rdparty/fusion/fusion
 	url = ../../xioTechnologies/Fusion.git
+	ignore = dirty
+[submodule "3rdparty/discord-rpc/discord-rpc"]
+	path = 3rdparty/discord-rpc/discord-rpc
+	url = ../../Vestrel/discord-rpc
+	ignore = dirty
+[submodule "3rdparty/GPUOpen/VulkanMemoryAllocator"]
+	path = 3rdparty/GPUOpen/VulkanMemoryAllocator
+	url = ../../GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator.git
+	ignore = dirty
+[submodule "3rdparty/feralinteractive/feralinteractive"]
+	path = 3rdparty/feralinteractive/feralinteractive
+	url = ../../FeralInteractive/gamemode.git
+	ignore = dirty
+[submodule "3rdparty/protobuf/protobuf"]
+	path = 3rdparty/protobuf/protobuf
+	url = ../../protocolbuffers/protobuf.git
 	ignore = dirty

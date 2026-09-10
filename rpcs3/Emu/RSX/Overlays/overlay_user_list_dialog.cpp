@@ -4,14 +4,12 @@
 #include "Emu/vfs_config.h"
 #include "Emu/system_utils.hpp"
 #include "Emu/System.h"
-#include "Utilities/StrUtil.h"
-#include "Utilities/Thread.h"
 
 namespace rsx
 {
 	namespace overlays
 	{
-		user_list_dialog::user_list_entry::user_list_entry(const std::string& username, const std::string& user_id, const std::string& avatar_path)
+		user_list_dialog::user_list_entry::user_list_entry(std::string_view username, std::string_view user_id, const std::string& avatar_path)
 		{
 			std::unique_ptr<overlay_element> image = std::make_unique<image_view>();
 			image->set_size(160, 110);
@@ -19,7 +17,7 @@ namespace rsx
 
 			if (fs::exists(avatar_path))
 			{
-				icon_data = std::make_unique<image_info>(avatar_path.c_str());
+				icon_data = std::make_unique<image_info>(avatar_path);
 				static_cast<image_view*>(image.get())->set_raw_image(icon_data.get());
 			}
 			else
@@ -115,11 +113,11 @@ namespace rsx
 				{
 					return_code = selection_code::error;
 				}
-				Emu.GetCallbacks().play_sound(fs::get_config_dir() + "sounds/snd_decide.wav");
+				play_sound(sound_effect::accept);
 				close_dialog = true;
 				break;
 			case pad_button::circle:
-				Emu.GetCallbacks().play_sound(fs::get_config_dir() + "sounds/snd_cancel.wav");
+				play_sound(sound_effect::cancel);
 				close_dialog = true;
 				break;
 			case pad_button::dpad_up:
@@ -155,7 +153,7 @@ namespace rsx
 			// Play a sound unless this is a fast auto repeat which would induce a nasty noise
 			else if (!is_auto_repeat || m_auto_repeat_ms_interval >= m_auto_repeat_ms_interval_default)
 			{
-				Emu.GetCallbacks().play_sound(fs::get_config_dir() + "sounds/snd_cursor.wav");
+				play_sound(sound_effect::cursor);
 			}
 		}
 
@@ -176,7 +174,7 @@ namespace rsx
 			return result;
 		}
 
-		error_code user_list_dialog::show(const std::string& title, u32 focused, const std::vector<u32>& user_ids, bool enable_overlay, std::function<void(s32 status)> on_close)
+		error_code user_list_dialog::show(std::string_view title, u32 focused, const std::vector<u32>& user_ids, bool enable_overlay, std::function<void(s32 status)> on_close)
 		{
 			visible = false;
 

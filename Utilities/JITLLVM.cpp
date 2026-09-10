@@ -1,5 +1,6 @@
 #include "util/types.hpp"
 #include "util/sysinfo.hpp"
+#include "Utilities/Thread.h"
 #include "JIT.h"
 #include "StrFmt.h"
 #include "File.h"
@@ -10,6 +11,10 @@
 #include "Crypto/unzip.h"
 
 #include <charconv>
+
+#if defined(__APPLE__)
+#include <pthread.h>
+#endif
 
 LOG_CHANNEL(jit_log, "JIT");
 
@@ -45,6 +50,48 @@ LOG_CHANNEL(jit_log, "JIT");
 #pragma GCC diagnostic pop
 #endif
 
+#ifdef ARCH_ARM64
+#include "Emu/CPU/Backends/AArch64/AArch64Common.h"
+#endif
+
+namespace
+{
+	thread_local std::string* g_llvm_fatal_message = nullptr;
+
+	template <typename F>
+	bool run_recoverable_llvm(F&& func, std::string& error)
+	{
+		error.clear();
+
+		// Run LLVM codegen in a disposable thread. If LLVM invokes the fatal
+		// handler, only this helper thread exits.
+		named_thread worker("LLVM JIT", [&]()
+		{
+#if defined(__APPLE__)
+			pthread_jit_write_protect_np(false);
+#endif
+			g_llvm_fatal_message = &error;
+
+			std::forward<F>(func)();
+
+			g_llvm_fatal_message = nullptr;
+#if defined(__APPLE__)
+			pthread_jit_write_protect_np(true);
+#endif
+		});
+
+		worker();
+		const bool result = static_cast<thread_state>(worker) == thread_state::finished;
+
+		if (!result && error.empty())
+		{
+			error = "LLVM crash recovery invoked";
+		}
+
+		return result;
+	}
+}
+
 const bool jit_initialize = []() -> bool
 {
 	llvm::InitializeNativeTarget();
@@ -77,8 +124,7 @@ static u64 make_null_function(const std::string& name)
 
 		if (res.ec == std::errc() && res.ptr == name.c_str() + name.size() && addr < 0x8000'0000)
 		{
-			// Point the garbage to reserved, non-executable memory
-			return reinterpret_cast<u64>(vm::g_sudo_addr + addr);
+			fmt::throw_exception("Unhandled symbols cementing! (name='%s'", name);
 		}
 	}
 
@@ -174,18 +220,34 @@ struct JITAnnouncer : llvm::JITEventListener
 struct MemoryManager1 : llvm::RTDyldMemoryManager
 {
 	// 256 MiB for code or data
-	static constexpr u64 c_max_size = 0x20000000 / 2;
+	static constexpr u64 c_max_size = 0x1000'0000;
 
 	// Allocation unit (2M)
 	static constexpr u64 c_page_size = 2 * 1024 * 1024;
 
-	// Reserve 512 MiB
-	u8* const ptr = static_cast<u8*>(utils::memory_reserve(c_max_size * 2));
+	// Reserve 256 MiB blocks
+	void* m_code_mems = nullptr;
+	void* m_data_ro_mems = nullptr;
+	void* m_data_rw_mems = nullptr;
 
 	u64 code_ptr = 0;
-	u64 data_ptr = c_max_size;
+	u64 data_ro_ptr = 0;
+	u64 data_rw_ptr = 0;
 
-	MemoryManager1() = default;
+	// First fallback for non-existing symbols
+	// May be a memory container internally
+	std::function<u64(const std::string&)> m_symbols_cement;
+
+	MemoryManager1(std::function<u64(const std::string&)> symbols_cement = {}) noexcept
+		: m_symbols_cement(std::move(symbols_cement))
+	{
+		auto ptr = reinterpret_cast<u8*>(utils::memory_reserve(c_max_size * 3, true));
+		m_code_mems = ptr;
+		// ptr += c_max_size;
+		// m_data_ro_mems = ptr;
+		 ptr += c_max_size;
+		m_data_rw_mems = ptr;
+	}
 
 	MemoryManager1(const MemoryManager1&) = delete;
 
@@ -194,12 +256,21 @@ struct MemoryManager1 : llvm::RTDyldMemoryManager
 	~MemoryManager1() override
 	{
 		// Hack: don't release to prevent reuse of address space, see jit_announce
-		utils::memory_decommit(ptr, c_max_size * 2);
+		// constexpr auto how_much = [](u64 pos) { return utils::align(pos, pos < c_page_size ? c_page_size / 4 : c_page_size); };
+		// utils::memory_decommit(m_code_mems, how_much(code_ptr));
+		// utils::memory_decommit(m_data_ro_mems, how_much(data_ro_ptr));
+		// utils::memory_decommit(m_data_rw_mems, how_much(data_rw_ptr));
+		utils::memory_decommit(m_code_mems, c_max_size * 3, true);
 	}
 
 	llvm::JITSymbol findSymbol(const std::string& name) override
 	{
 		u64 addr = RTDyldMemoryManager::getSymbolAddress(name);
+
+		if (!addr && m_symbols_cement)
+		{
+			addr = m_symbols_cement(name);
+		}
 
 		if (!addr)
 		{
@@ -214,45 +285,79 @@ struct MemoryManager1 : llvm::RTDyldMemoryManager
 		return {addr, llvm::JITSymbolFlags::Exported};
 	}
 
-	u8* allocate(u64& oldp, uptr size, uint align, utils::protection prot)
+	u8* allocate(u64& alloc_pos, void* block, uptr size, u64 align, utils::protection prot)
 	{
-		if (align > c_page_size)
+		align = align ? align : 16;
+ 
+		const u64 sizea = utils::align(size, align);
+
+		if (!size || align > c_page_size || sizea > c_max_size || sizea < size)
 		{
-			jit_log.fatal("Unsupported alignment (size=0x%x, align=0x%x)", size, align);
+			jit_log.fatal("Unsupported size/alignment (size=0x%x, align=0x%x)", size, align);
 			return nullptr;
 		}
 
-		const u64 olda = utils::align(oldp, align);
-		const u64 newp = utils::align(olda + size, align);
+		u64 oldp = alloc_pos;
 
-		if ((newp - 1) / c_max_size != oldp / c_max_size)
+		u64 olda = utils::align(oldp, align);
+
+		ensure(olda >= oldp);
+		ensure(olda < ~sizea);
+
+		u64 newp = olda + sizea;
+
+		if ((newp - 1) / c_max_size != (oldp - 1) / c_max_size)
 		{
-			jit_log.fatal("Out of memory (size=0x%x, align=0x%x)", size, align);
-			return nullptr;
+			constexpr usz num_of_allocations = 1;
+
+			if ((newp - 1) / c_max_size > num_of_allocations)
+			{
+				// Allocating more than one region does not work for relocations, needs more robust solution
+				fmt::throw_exception("Out of memory (size=0x%x, align=0x%x)", size, align);
+			}
 		}
 
-		if ((oldp - 1) / c_page_size != (newp - 1) / c_page_size)
+		// Update allocation counter
+		alloc_pos = newp;
+
+		constexpr usz page_quarter = c_page_size / 4;
+
+		// Optimization: split the first allocation to 512 KiB for single-module compilers
+		if (oldp < c_page_size && align < page_quarter && (std::min(newp, c_page_size) - 1) / page_quarter != (oldp - 1) / page_quarter)
+		{
+			const u64 pagea = utils::align(oldp, page_quarter);
+			const u64 psize = utils::align(std::min(newp, c_page_size) - pagea, page_quarter);
+			utils::memory_commit(reinterpret_cast<u8*>(block) + (pagea % c_max_size), psize, prot);
+
+			// Advance
+			oldp = pagea + psize;
+		}
+
+		if ((newp - 1) / c_page_size != (oldp - 1) / c_page_size)
 		{
 			// Allocate pages on demand
 			const u64 pagea = utils::align(oldp, c_page_size);
 			const u64 psize = utils::align(newp - pagea, c_page_size);
-			utils::memory_commit(this->ptr + pagea, psize, prot);
+			utils::memory_commit(reinterpret_cast<u8*>(block) + (pagea % c_max_size), psize, prot);
 		}
 
-		// Update allocation counter
-		oldp = newp;
-
-		return this->ptr + olda;
+		return reinterpret_cast<u8*>(block) + (olda % c_max_size);
 	}
 
 	u8* allocateCodeSection(uptr size, uint align, uint /*sec_id*/, llvm::StringRef /*sec_name*/) override
 	{
-		return allocate(code_ptr, size, align, utils::protection::wx);
+		return allocate(code_ptr, m_code_mems, size, align, utils::protection::wx);
 	}
 
-	u8* allocateDataSection(uptr size, uint align, uint /*sec_id*/, llvm::StringRef /*sec_name*/, bool /*is_ro*/) override
+	u8* allocateDataSection(uptr size, uint align, uint /*sec_id*/, llvm::StringRef /*sec_name*/, bool is_ro) override
 	{
-		return allocate(data_ptr, size, align, utils::protection::rw);
+		if (is_ro)
+		{
+			// Disabled
+			//return allocate(data_ro_ptr, m_data_ro_mems, size, align, utils::protection::rw);
+		}
+
+		return allocate(data_rw_ptr, m_data_rw_mems, size, align, utils::protection::rw);
 	}
 
 	bool finalizeMemory(std::string* = nullptr) override
@@ -272,7 +377,14 @@ struct MemoryManager1 : llvm::RTDyldMemoryManager
 // Simple memory manager
 struct MemoryManager2 : llvm::RTDyldMemoryManager
 {
-	MemoryManager2() = default;
+	// First fallback for non-existing symbols
+	// May be a memory container internally
+	std::function<u64(const std::string&)> m_symbols_cement;
+
+	MemoryManager2(std::function<u64(const std::string&)> symbols_cement = {}) noexcept
+		: m_symbols_cement(std::move(symbols_cement))
+	{
+	}
 
 	~MemoryManager2() override
 	{
@@ -281,6 +393,11 @@ struct MemoryManager2 : llvm::RTDyldMemoryManager
 	llvm::JITSymbol findSymbol(const std::string& name) override
 	{
 		u64 addr = RTDyldMemoryManager::getSymbolAddress(name);
+
+		if (!addr && m_symbols_cement)
+		{
+			addr = m_symbols_cement(name);
+		}
 
 		if (!addr)
 		{
@@ -338,7 +455,7 @@ public:
 	{
 		std::string name = m_path;
 
-		name.append(_module->getName().data());
+		name.append(_module->getName());
 		//fs::file(name, fs::rewrite).write(obj.getBufferStart(), obj.getBufferSize());
 		name.append(".gz");
 
@@ -350,9 +467,9 @@ public:
 
 		ensure(m_compiler);
 
-		fs::file module_file(name, fs::rewrite);
+		fs::pending_file module_file;
 
-		if (!module_file)
+		if (!module_file.open((name)))
 		{
 			jit_log.error("LLVM: Failed to create module file: %s (%s)", name, fs::g_tls_error);
 			return;
@@ -367,18 +484,17 @@ public:
 			return;
 		}
 
-		if (!zip(obj.getBufferStart(), obj.getBufferSize(), module_file))
+		if (!zip(obj.getBufferStart(), obj.getBufferSize(), module_file.file))
 		{
-			jit_log.error("LLVM: Failed to compress module: %s", _module->getName().data());
-			module_file.close();
-			fs::remove_file(name);
+			jit_log.error("LLVM: Failed to compress module: %s", std::string(_module->getName()));
 			return;
 		}
 
-		jit_log.trace("LLVM: Created module: %s", _module->getName().data());
+		jit_log.trace("LLVM: Created module: %s", std::string(_module->getName()));
 
 		// Restore space that was overestimated
-		ensure(m_compiler->add_sub_disk_space(max_size - module_file.size()));
+		ensure(m_compiler->add_sub_disk_space(max_size - module_file.file.size()));
+		module_file.commit();
 	}
 
 	static std::unique_ptr<llvm::MemoryBuffer> load(const std::string& path)
@@ -435,9 +551,9 @@ public:
 	}
 };
 
-std::string jit_compiler::cpu(const std::string& _cpu)
+std::string jit_compiler::cpu(std::string_view _cpu)
 {
-	std::string m_cpu = _cpu;
+	std::string m_cpu = std::string(_cpu);
 
 	if (m_cpu.empty())
 	{
@@ -519,8 +635,10 @@ std::string jit_compiler::triple1()
 	return llvm::Triple::normalize(llvm::sys::getProcessTriple());
 #elif defined(__APPLE__) && defined(ARCH_X64)
 	return llvm::Triple::normalize("x86_64-unknown-linux-gnu");
-#elif defined(__APPLE__) && defined(ARCH_ARM64)
+#elif (defined(__ANDROID__) || defined(__APPLE__)) && defined(ARCH_ARM64)
 	return llvm::Triple::normalize("aarch64-unknown-linux-android"); // Set environment to android to reserve x18
+#elif defined(__ANDROID__) && defined(ARCH_X64)
+	return llvm::Triple::normalize("x86_64-unknown-linux-android");
 #else
 	return llvm::Triple::normalize(llvm::sys::getProcessTriple());
 #endif
@@ -534,8 +652,10 @@ std::string jit_compiler::triple2()
 	return llvm::Triple::normalize("aarch64-unknown-linux-gnu");
 #elif defined(__APPLE__) && defined(ARCH_X64)
 	return llvm::Triple::normalize("x86_64-unknown-linux-gnu");
-#elif defined(__APPLE__) && defined(ARCH_ARM64)
+#elif (defined(__ANDROID__) || defined(__APPLE__)) && defined(ARCH_ARM64)
 	return llvm::Triple::normalize("aarch64-unknown-linux-android"); // Set environment to android to reserve x18
+#elif defined(__ANDROID__) && defined(ARCH_X64)
+	return llvm::Triple::normalize("x86_64-unknown-linux-android"); // Set environment to android to reserve x18
 #else
 	return llvm::Triple::normalize(llvm::sys::getProcessTriple());
 #endif
@@ -561,14 +681,33 @@ bool jit_compiler::add_sub_disk_space(ssz space)
 	}).second;
 }
 
-jit_compiler::jit_compiler(const std::unordered_map<std::string, u64>& _link, const std::string& _cpu, u32 flags)
+jit_compiler::jit_compiler(const std::unordered_map<std::string, u64>& _link, std::string_view _cpu, u32 flags, std::function<u64(const std::string&)> symbols_cement) noexcept
 	: m_context(new llvm::LLVMContext)
 	, m_cpu(cpu(_cpu))
 {
+	[[maybe_unused]] static const bool s_install_llvm_error_handler = []()
+	{
+		llvm::remove_fatal_error_handler();
+		llvm::install_fatal_error_handler([](void*, const char* msg, bool)
+		{
+			const std::string_view out = msg ? msg : "";
+
+			if (g_llvm_fatal_message)
+			{
+				*g_llvm_fatal_message = out;
+				thread_ctrl::silent_exit();
+			}
+
+			fmt::throw_exception("LLVM Emergency Exit Invoked: '%s'", out);
+		}, nullptr);
+
+		return true;
+	}();
+
 	std::string result;
 
 	auto null_mod = std::make_unique<llvm::Module> ("null_", *m_context);
-	null_mod->setTargetTriple(jit_compiler::triple1());
+	null_mod->setTargetTriple(llvm::Triple(jit_compiler::triple1()));
 
 	std::unique_ptr<llvm::RTDyldMemoryManager> mem;
 
@@ -577,34 +716,64 @@ jit_compiler::jit_compiler(const std::unordered_map<std::string, u64>& _link, co
 		// Auxiliary JIT (does not use custom memory manager, only writes the objects)
 		if (flags & 0x1)
 		{
-			mem = std::make_unique<MemoryManager1>();
+			mem = std::make_unique<MemoryManager1>(std::move(symbols_cement));
 		}
 		else
 		{
-			mem = std::make_unique<MemoryManager2>();
-			null_mod->setTargetTriple(jit_compiler::triple2());
+			mem = std::make_unique<MemoryManager2>(std::move(symbols_cement));
+			null_mod->setTargetTriple(llvm::Triple(jit_compiler::triple2()));
 		}
 	}
 	else
 	{
-		mem = std::make_unique<MemoryManager1>();
+		mem = std::make_unique<MemoryManager1>(std::move(symbols_cement));
 	}
+
+	std::vector<std::string> attributes;
+
+#if defined(ARCH_ARM64)
+	if (utils::has_sha3())
+		attributes.push_back("+sha3");
+	else
+		attributes.push_back("-sha3");
+
+	if (utils::has_dotprod())
+		attributes.push_back("+dotprod");
+	else
+		attributes.push_back("-dotprod");
+
+	// The recompilers emit i8mm intrinsics (e.g. ummla) gated on utils::has_i8mm().
+	// The JIT target features must advertise i8mm too, otherwise the backend fails
+	// with "Cannot select: intrinsic %llvm.aarch64.neon.ummla" whenever the resolved
+	// -mcpu does not already imply it (e.g. the cortex-a78 fallback on Apple silicon).
+	if (utils::has_i8mm())
+		attributes.push_back("+i8mm");
+	else
+		attributes.push_back("-i8mm");
+
+	if (utils::has_sve())
+		attributes.push_back("+sve");
+	else
+		attributes.push_back("-sve");
+
+	if (utils::has_sve2())
+		attributes.push_back("+sve2");
+	else
+		attributes.push_back("-sve2");
+#endif
 
 	{
 		m_engine.reset(llvm::EngineBuilder(std::move(null_mod))
 			.setErrorStr(&result)
 			.setEngineKind(llvm::EngineKind::JIT)
 			.setMCJITMemoryManager(std::move(mem))
-#if LLVM_VERSION_MAJOR < 18
-			.setOptLevel(llvm::CodeGenOpt::Aggressive)
-#else
 			.setOptLevel(llvm::CodeGenOptLevel::Aggressive)
-#endif
 			.setCodeModel(flags & 0x2 ? llvm::CodeModel::Large : llvm::CodeModel::Small)
 #ifdef __APPLE__
 			//.setCodeModel(llvm::CodeModel::Large)
 #endif
 			.setRelocationModel(llvm::Reloc::Model::PIC_)
+			.setMAttrs(attributes)
 			.setMCPU(m_cpu)
 			.create());
 	}
@@ -636,7 +805,19 @@ jit_compiler::jit_compiler(const std::unordered_map<std::string, u64>& _link, co
 	}
 }
 
-jit_compiler::~jit_compiler()
+jit_compiler& jit_compiler::operator=(thread_state s) noexcept
+{
+	if (s == thread_state::destroying_context)
+	{
+		// Release resources explicitly
+		m_engine.reset();
+		m_context.reset();
+	}
+
+	return *this;
+}
+
+jit_compiler::~jit_compiler() noexcept
 {
 }
 
@@ -657,6 +838,33 @@ void jit_compiler::add(std::unique_ptr<llvm::Module> _module, const std::string&
 	}
 }
 
+bool jit_compiler::try_add(std::unique_ptr<llvm::Module> _module, const std::string& path, std::string& error)
+{
+	ObjectCache cache{path, this};
+	m_engine->setObjectCache(&cache);
+
+	const auto ptr = _module.get();
+	m_engine->addModule(std::move(_module));
+
+	if (!run_recoverable_llvm([&]()
+	{
+		m_engine->generateCodeForModule(ptr);
+	}, error))
+	{
+		return false;
+	}
+
+	m_engine->setObjectCache(nullptr);
+
+	for (auto& func : ptr->functions())
+	{
+		// Delete IR to lower memory consumption
+		func.deleteBody();
+	}
+
+	return true;
+}
+
 void jit_compiler::add(std::unique_ptr<llvm::Module> _module)
 {
 	const auto ptr = _module.get();
@@ -670,6 +878,28 @@ void jit_compiler::add(std::unique_ptr<llvm::Module> _module)
 	}
 }
 
+bool jit_compiler::try_add(std::unique_ptr<llvm::Module> _module, std::string& error)
+{
+	const auto ptr = _module.get();
+	m_engine->addModule(std::move(_module));
+
+	if (!run_recoverable_llvm([&]()
+	{
+		m_engine->generateCodeForModule(ptr);
+	}, error))
+	{
+		return false;
+	}
+
+	for (auto& func : ptr->functions())
+	{
+		// Delete IR to lower memory consumption
+		func.deleteBody();
+	}
+
+	return true;
+}
+
 bool jit_compiler::add(const std::string& path)
 {
 	auto cache = ObjectCache::load(path);
@@ -677,7 +907,7 @@ bool jit_compiler::add(const std::string& path)
 	if (!cache)
 	{
 		jit_log.error("ObjectCache: Failed to read file. (path='%s', error=%s)", path, fs::g_tls_error);
-		return false;		
+		return false;
 	}
 
 	if (auto object_file = llvm::object::ObjectFile::createObjectFile(*cache))
@@ -721,14 +951,22 @@ void jit_compiler::fin()
 	m_engine->finalizeObject();
 }
 
+bool jit_compiler::try_fin(std::string& error)
+{
+	return run_recoverable_llvm([&]()
+	{
+		m_engine->finalizeObject();
+	}, error);
+}
+
 u64 jit_compiler::get(const std::string& name)
 {
 	return m_engine->getGlobalValueAddress(name);
 }
 
-llvm::StringRef fallback_cpu_detection()
+const char * fallback_cpu_detection()
 {
-#if defined (ARCH_X64)
+#if defined(ARCH_X64)
 	// If we got here we either have a very old and outdated CPU or a new CPU that has not been seen by LLVM yet.
 	const std::string brand = utils::get_cpu_brand();
 	const auto family = utils::get_cpu_family();
@@ -758,11 +996,11 @@ llvm::StringRef fallback_cpu_detection()
 			// Return zen4 as a workaround until the next LLVM upgrade.
 			return "znver4";
 		default:
-		 	// Safest guesses
+			// Safest guesses
 			return utils::has_avx512() ? "znver4" :
-				utils::has_avx2() ? "znver1" :
-				utils::has_avx() ? "bdver1" :
-				"nehalem";
+			       utils::has_avx2()   ? "znver1" :
+			       utils::has_avx()    ? "bdver1" :
+			                             "nehalem";
 		}
 	}
 	else if (brand.find("Intel") != std::string::npos)
@@ -792,10 +1030,26 @@ llvm::StringRef fallback_cpu_detection()
 	}
 
 #elif defined(ARCH_ARM64)
+#ifdef ANDROID
+	static std::string s_result = []() -> std::string
+	{
+		std::string result = aarch64::get_cpu_name();
+		if (result.empty())
+		{
+			return "cortex-a78";
+		}
+
+		std::transform(result.begin(), result.end(), result.begin(), ::tolower);
+		return result;
+	}();
+
+	return s_result.c_str();
+#else
 	// TODO: Read the data from /proc/cpuinfo. ARM CPU registers are not accessible from usermode.
 	// This will be a pain when supporting snapdragon on windows but we'll cross that bridge when we get there.
 	// Require at least armv8-2a. Older chips are going to be useless anyway.
 	return "cortex-a78";
+#endif
 #endif
 
 	// Failed to guess, use generic fallback

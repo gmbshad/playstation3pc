@@ -2,11 +2,6 @@
 #include "Dimensions.h"
 
 #include <bit>
-#include <thread>
-
-#include "Crypto/aes.h"
-#include "Crypto/sha1.h"
-#include "util/asm.hpp"
 
 #include "Emu/Cell/lv2/sys_usbd.h"
 
@@ -101,8 +96,8 @@ u32 dimensions_toypad::get_next()
 std::array<u8, 8> dimensions_toypad::decrypt(const u8* buf, std::optional<std::array<u8, 16>> key)
 {
 	// Value to decrypt is separated in to two little endian 32 bit unsigned integers
-	u32 data_one = read_from_ptr<le_t<u32>>(buf);
-	u32 data_two = read_from_ptr<le_t<u32>>(buf, 4);
+	u32 data_one = read_from_ptr_unsafe<le_t<u32>>(buf);
+	u32 data_two = read_from_ptr_unsafe<le_t<u32>>(buf, 4);
 
 	// Use the key as 4 32 bit little endian unsigned integers
 	u32 key_one;
@@ -148,8 +143,8 @@ std::array<u8, 8> dimensions_toypad::encrypt(const u8* buf, std::optional<std::a
 {
 	// Value to encrypt is separated in to two little endian 32 bit unsigned integers
 
-	u32 data_one = read_from_ptr<le_t<u32>>(buf);
-	u32 data_two = read_from_ptr<le_t<u32>>(buf, 4);
+	u32 data_one = read_from_ptr_unsafe<le_t<u32>>(buf);
+	u32 data_two = read_from_ptr_unsafe<le_t<u32>>(buf, 4);
 
 	// Use the key as 4 32 bit little endian unsigned integers
 	u32 key_one;
@@ -219,10 +214,10 @@ u32 dimensions_toypad::scramble(const std::array<u8, 7>& uid, u8 count)
 	}
 	::at32(to_scramble, count * 4 - 1) = 0xaa;
 
-	return read_from_ptr<be_t<u32>>(dimensions_randomize(to_scramble, count).data());
+	return read_from_ptr<be_t<u32>>(dimensions_randomize(to_scramble, count));
 }
 
-std::array<u8, 4> dimensions_toypad::dimensions_randomize(const std::vector<u8> key, u8 count)
+std::array<u8, 4> dimensions_toypad::dimensions_randomize(const std::vector<u8>& key, u8 count)
 {
 	u32 scrambled = 0;
 	for (u8 i = 0; i < count; i++)
@@ -333,7 +328,7 @@ void dimensions_toypad::write_block(u8 index, u8 page, const u8* to_write_buf, s
 			// Id is written to page 36
 			if (page == 36)
 			{
-				figure.id = read_from_ptr<le_t<u32>>(to_write_buf);
+				figure.id = read_from_ptr_unsafe<le_t<u32>>(to_write_buf);
 			}
 			std::memcpy(figure.data.data() + (page * 4), to_write_buf, 4);
 			figure.save();
@@ -527,7 +522,7 @@ bool dimensions_toypad::create_blank_character(std::array<u8, 0x2D * 0x04>& buf,
 	else
 	{
 		// Page 38 is used as verification for blank tags
-		write_to_ptr<be_t<u16>>(buf.data(), 38 * 4, 1);
+		write_to_ptr<be_t<u16>>(buf, 38 * 4, 1);
 	}
 
 	return true;
@@ -535,11 +530,10 @@ bool dimensions_toypad::create_blank_character(std::array<u8, 0x2D * 0x04>& buf,
 
 std::array<u8, 4> dimensions_toypad::pwd_generate(const std::array<u8, 7>& uid)
 {
-	std::vector<u8> pwd_calc = {PWD_CONSTANT.begin(), PWD_CONSTANT.end() - 1};
-	for (u8 i = 0; i < uid.size(); i++)
-	{
-		pwd_calc.insert(pwd_calc.begin() + i, uid[i]);
-	}
+	std::vector<u8> pwd_calc;
+	pwd_calc.reserve(uid.size() + PWD_CONSTANT.size());
+	pwd_calc.insert(pwd_calc.end(), uid.begin(), uid.end());
+	pwd_calc.insert(pwd_calc.end(), PWD_CONSTANT.begin(), PWD_CONSTANT.end());
 
 	return dimensions_randomize(pwd_calc, 8);
 }
@@ -549,9 +543,7 @@ std::optional<std::array<u8, 32>> dimensions_toypad::pop_added_removed_response(
 	std::lock_guard lock(m_dimensions_mutex);
 
 	if (m_figure_added_removed_responses.empty())
-	{
 		return std::nullopt;
-	}
 
 	std::array<u8, 32> response = m_figure_added_removed_responses.front();
 	m_figure_added_removed_responses.pop();
@@ -573,6 +565,16 @@ usb_device_dimensions::~usb_device_dimensions()
 {
 }
 
+std::shared_ptr<usb_device> usb_device_dimensions::make_instance(u32, const std::array<u8, 7>& location)
+{
+	return std::make_shared<usb_device_dimensions>(location);
+}
+
+u16 usb_device_dimensions::get_num_emu_devices()
+{
+	return 1;
+}
+
 void usb_device_dimensions::control_transfer(u8 bmRequestType, u8 bRequest, u16 wValue, u16 wIndex, u16 wLength, u32 buf_size, u8* buf, UsbTransfer* transfer)
 {
 	usb_device_emulated::control_transfer(bmRequestType, bRequest, wValue, wIndex, wLength, buf_size, buf, transfer);
@@ -592,7 +594,6 @@ void usb_device_dimensions::interrupt_transfer(u32 buf_size, u8* buf, u32 endpoi
 	{
 		// Read Endpoint, if a request has not been sent via the write endpoint, set expected result as
 		// EHCI_CC_HALTED so the game doesn't report the Toypad as being disconnected.
-		std::lock_guard lock(m_query_mutex);
 		std::optional<std::array<u8, 32>> response = g_dimensionstoypad.pop_added_removed_response();
 		if (response)
 		{
@@ -691,16 +692,10 @@ void usb_device_dimensions::interrupt_transfer(u32 buf_size, u8* buf, u32 endpoi
 			break;
 		}
 		}
-		std::lock_guard lock(m_query_mutex);
 		m_queries.push(q_result);
 		break;
 	}
 	default:
 		break;
 	}
-}
-
-void usb_device_dimensions::isochronous_transfer(UsbTransfer* transfer)
-{
-	usb_device_emulated::isochronous_transfer(transfer);
 }

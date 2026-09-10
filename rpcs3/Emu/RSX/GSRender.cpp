@@ -1,5 +1,6 @@
 #include "stdafx.h"
 
+#include "Emu/System.h"
 #include "GSRender.h"
 
 GSRender::GSRender(utils::serial* ar) noexcept : rsx::thread(ar)
@@ -12,6 +13,8 @@ GSRender::GSRender(utils::serial* ar) noexcept : rsx::thread(ar)
 	{
 		m_frame = nullptr;
 	}
+
+	m_vsync_mode = g_cfg.video.vsync;
 }
 
 GSRender::~GSRender()

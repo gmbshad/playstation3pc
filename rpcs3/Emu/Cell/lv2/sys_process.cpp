@@ -255,8 +255,10 @@ CellError process_is_spu_lock_line_reservation_address(u32 addr, u64 flags)
 	return {};
 }
 
-error_code sys_process_is_spu_lock_line_reservation_address(u32 addr, u64 flags)
+error_code sys_process_is_spu_lock_line_reservation_address(ppu_thread& ppu, u32 addr, u64 flags)
 {
+	ppu.state += cpu_flag::wait;
+
 	sys_process.warning("sys_process_is_spu_lock_line_reservation_address(addr=0x%x, flags=0x%llx)", addr, flags);
 
 	if (auto err = process_is_spu_lock_line_reservation_address(addr, flags))
@@ -271,7 +273,7 @@ error_code _sys_process_get_paramsfo(vm::ptr<char> buffer)
 {
 	sys_process.warning("_sys_process_get_paramsfo(buffer=0x%x)", buffer);
 
-	if (!Emu.GetTitleID().length())
+	if (Emu.GetTitleID().empty())
 	{
 		return CELL_ENOENT;
 	}
@@ -473,7 +475,7 @@ void lv2_exitspawn(ppu_thread& ppu, std::vector<std::string>& argv, std::vector<
 		};
 
 		Emu.after_kill_callback = [func = std::move(func), argv = std::move(argv), envp = std::move(envp), data = std::move(data),
-			disc = std::move(disc), path = std::move(path), hdd1 = std::move(hdd1), old_config = Emu.GetUsedConfig(), klic]() mutable
+			disc = std::move(disc), path = std::move(path), hdd1 = std::move(hdd1), old_config = Emu.GetUsedConfig(), old_db_config = Emu.GetUsedDatabaseConfig(), klic]() mutable
 		{
 			Emu.argv = std::move(argv);
 			Emu.envp = std::move(envp);
@@ -489,7 +491,7 @@ void lv2_exitspawn(ppu_thread& ppu, std::vector<std::string>& argv, std::vector<
 
 			Emu.SetForceBoot(true);
 
-			auto res = Emu.BootGame(path, "", true, cfg_mode::continuous, old_config);
+			auto res = Emu.BootGame(path, "", true, cfg_mode::continuous, old_config, old_db_config);
 
 			if (res != game_boot_result::no_errors)
 			{

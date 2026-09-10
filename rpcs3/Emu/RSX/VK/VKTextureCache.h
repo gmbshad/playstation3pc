@@ -1,6 +1,5 @@
 #pragma once
 
-#include "VKAsyncScheduler.h"
 #include "VKDMA.h"
 #include "VKRenderTargets.h"
 #include "VKResourceManager.h"
@@ -9,8 +8,7 @@
 
 #include "../Common/texture_cache.h"
 #include "../Common/tiled_dma_copy.hpp"
-
-#include "Emu/Cell/timers.hpp"
+#include "../Utils/image_utils.hpp"
 
 #include <memory>
 #include <vector>
@@ -40,7 +38,7 @@ namespace vk
 
 		std::unique_ptr<vk::viewable_image> managed_texture = nullptr;
 
-		//DMA relevant data
+		// DMA relevant data
 		std::unique_ptr<vk::event> dma_fence;
 		vk::render_device* m_device = nullptr;
 		vk::viewable_image* vram_texture = nullptr;
@@ -50,7 +48,10 @@ namespace vk
 
 		void create(u16 w, u16 h, u16 depth, u16 mipmaps, vk::image* image, u32 rsx_pitch, bool managed, u32 gcm_format, bool pack_swap_bytes = false)
 		{
-			if (vram_texture && !managed_texture && get_protection() == utils::protection::no)
+			auto new_texture = static_cast<vk::viewable_image*>(image);
+			ensure(!exists() || !is_managed() || vram_texture == new_texture);
+
+			if (vram_texture != new_texture && !managed_texture && get_protection() == utils::protection::no)
 			{
 				// In-place image swap, still locked. Likely a color buffer that got rebound as depth buffer or vice-versa.
 				vk::as_rtt(vram_texture)->on_swap_out();
@@ -62,8 +63,6 @@ namespace vk
 				}
 			}
 
-			auto new_texture = static_cast<vk::viewable_image*>(image);
-			ensure(!exists() || !is_managed() || vram_texture == new_texture);
 			vram_texture = new_texture;
 
 			ensure(rsx_pitch);
@@ -99,6 +98,26 @@ namespace vk
 
 			// Notify baseclass
 			baseclass::on_section_resources_created();
+		}
+
+		void create(u16 w, u16 h, u16 depth, u16 mipmaps, vk::image* image, u32 rsx_pitch, bool managed, const vk::render_target* surface)
+		{
+			u32 gcm_format;
+			bool swap_bytes;
+
+			if (surface->is_depth_surface())
+			{
+				gcm_format = (surface->get_surface_depth_format() != rsx::surface_depth_format::z16) ? CELL_GCM_TEXTURE_DEPTH16 : CELL_GCM_TEXTURE_DEPTH24_D8;
+				swap_bytes = true;
+			}
+			else
+			{
+				auto info = get_compatible_gcm_format(surface->get_surface_color_format());
+				gcm_format = info.first;
+				swap_bytes = info.second;
+			}
+
+			create(w, h, depth, mipmaps, image, rsx_pitch, managed, gcm_format, swap_bytes);
 		}
 
 		void release_dma_resources()
@@ -188,7 +207,7 @@ namespace vk
 			return flushed;
 		}
 
-		void dma_transfer(vk::command_buffer& cmd, vk::image* src, const areai& src_area, const utils::address_range& valid_range, u32 pitch);
+		void dma_transfer(vk::command_buffer& cmd, vk::image* src, const areai& src_area, const utils::address_range32& valid_range, u32 pitch);
 
 		void copy_texture(vk::command_buffer& cmd, bool miss)
 		{
@@ -234,9 +253,9 @@ namespace vk
 				const auto filter = (target->aspect() == VK_IMAGE_ASPECT_COLOR_BIT) ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
 
 				vk::copy_scaled_image(cmd, locked_resource, target,
-					{ 0, 0, static_cast<s32>(locked_resource->width()), static_cast<s32>(locked_resource->height()) },
-					{ 0, 0, static_cast<s32>(transfer_width), static_cast<s32>(transfer_height) },
-					1, true, filter);
+					areai{ 0, 0, static_cast<s32>(locked_resource->width()), static_cast<s32>(locked_resource->height()) },
+					areai{ 0, 0, static_cast<s32>(transfer_width), static_cast<s32>(transfer_height) },
+					{}, true, filter);
 
 				target->change_layout(cmd, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
 			}
@@ -303,7 +322,7 @@ namespace vk
 			if (const auto tiled_region = rsx::get_current_renderer()->get_tiled_memory_region(range))
 			{
 				auto real_data = vm::get_super_ptr<u8>(range.start);
-				auto out_data = std::vector<u8>(tiled_region.tile->size);
+				auto out_data = rsx::simple_array<u8>(tiled_region.tile->size);
 				rsx::tile_texel_data<u32>(
 					out_data.data(),
 					real_data,
@@ -327,7 +346,7 @@ namespace vk
 
 				// Read-modify-write to avoid corrupting already resident memory outside texture region
 				void* data = get_ptr(range.start);
-				std::vector<u8> tmp_data(rsx_pitch * height);
+				rsx::simple_array<u8> tmp_data(rsx_pitch * height);
 				std::memcpy(tmp_data.data(), data, tmp_data.size());
 
 				switch (gcm_format)
@@ -368,7 +387,7 @@ namespace vk
 			rsx_pitch = pitch;
 		}
 
-		void sync_surface_memory(const std::vector<cached_texture_section*>& surfaces)
+		void sync_surface_memory(const rsx::simple_array<cached_texture_section*>& surfaces)
 		{
 			auto rtt = vk::as_rtt(vram_texture);
 			rtt->sync_tag();
@@ -420,7 +439,8 @@ namespace vk
 		{
 			initialize_image_contents = 1,
 			do_not_reuse = 2,
-			shareable = 4
+			shareable = 4,
+			mutable_format = 8
 		};
 
 		void on_section_destroyed(cached_texture_section& tex) override;
@@ -447,45 +467,41 @@ namespace vk
 
 		VkComponentMapping apply_component_mapping_flags(u32 gcm_format, rsx::component_order flags, const rsx::texture_channel_remap_t& remap_vector) const;
 
-		void copy_transfer_regions_impl(vk::command_buffer& cmd, vk::image* dst, const std::vector<copy_region_descriptor>& sections_to_transfer) const;
+		void copy_transfer_regions_impl(vk::command_buffer& cmd, vk::image* dst, const rsx::simple_array<copy_region_descriptor>& sections_to_transfer) const;
 
-		vk::image* get_template_from_collection_impl(const std::vector<copy_region_descriptor>& sections_to_transfer) const;
+		vk::image* get_template_from_collection_impl(const rsx::simple_array<copy_region_descriptor>& sections_to_transfer) const;
 
 		std::unique_ptr<vk::viewable_image> find_cached_image(VkFormat format, u16 w, u16 h, u16 d, u16 mipmaps, VkImageType type, VkImageCreateFlags create_flags, VkImageUsageFlags usage, VkSharingMode sharing);
 
 	protected:
-		vk::image_view* create_temporary_subresource_view_impl(vk::command_buffer& cmd, vk::image* source, VkImageType image_type, VkImageViewType view_type,
-			u32 gcm_format, u16 x, u16 y, u16 w, u16 h, u16 d, u8 mips, const rsx::texture_channel_remap_t& remap_vector, bool copy);
+		vk::image_view* create_temporary_subresource_view_impl(
+			vk::command_buffer& cmd, vk::image* source, VkImageType image_type, VkImageViewType view_type,
+			u32 gcm_format, u16 w, u16 h, u16 d, u8 mips, const rsx::texture_channel_remap_t& remap_vector,
+			const copy_region_descriptor* copy = nullptr);
 
-		vk::image_view* create_temporary_subresource_view(vk::command_buffer& cmd, vk::image* source, u32 gcm_format,
-			u16 x, u16 y, u16 w, u16 h, const rsx::texture_channel_remap_t& remap_vector) override;
+		vk::image_view* create_temporary_subresource_view(vk::command_buffer& cmd, const deferred_subresource& desc) override;
 
-		vk::image_view* create_temporary_subresource_view(vk::command_buffer& cmd, vk::image** source, u32 gcm_format,
-			u16 x, u16 y, u16 w, u16 h, const rsx::texture_channel_remap_t& remap_vector) override;
+		vk::image_view* generate_cubemap_from_images(vk::command_buffer& cmd, const deferred_subresource& desc) override;
 
-		vk::image_view* generate_cubemap_from_images(vk::command_buffer& cmd, u32 gcm_format, u16 size,
-			const std::vector<copy_region_descriptor>& sections_to_copy, const rsx::texture_channel_remap_t& remap_vector) override;
+		vk::image_view* generate_3d_from_2d_images(vk::command_buffer& cmd, const deferred_subresource& desc) override;
 
-		vk::image_view* generate_3d_from_2d_images(vk::command_buffer& cmd, u32 gcm_format, u16 width, u16 height, u16 depth,
-			const std::vector<copy_region_descriptor>& sections_to_copy, const rsx::texture_channel_remap_t& remap_vector) override;
+		vk::image_view* generate_atlas_from_images(vk::command_buffer& cmd, const deferred_subresource& desc) override;
 
-		vk::image_view* generate_atlas_from_images(vk::command_buffer& cmd, u32 gcm_format, u16 width, u16 height,
-			const std::vector<copy_region_descriptor>& sections_to_copy, const rsx::texture_channel_remap_t& remap_vector) override;
-
-		vk::image_view* generate_2d_mipmaps_from_images(vk::command_buffer& cmd, u32 gcm_format, u16 width, u16 height,
-			const std::vector<copy_region_descriptor>& sections_to_copy, const rsx::texture_channel_remap_t& remap_vector) override;
+		vk::image_view* generate_2d_mipmaps_from_images(vk::command_buffer& cmd, const deferred_subresource& desc) override;
 
 		void release_temporary_subresource(vk::image_view* view) override;
 
-		void update_image_contents(vk::command_buffer& cmd, vk::image_view* dst_view, vk::image* src, u16 width, u16 height) override;
+		void initialize_subresource_from_memory(vk::command_buffer& cmd, vk::image* dst, const deferred_subresource& desc, rsx::texture_dimension_extended type) const;
 
-		cached_texture_section* create_new_texture(vk::command_buffer& cmd, const utils::address_range& rsx_range, u16 width, u16 height, u16 depth, u16 mipmaps, u32 pitch,
+		void update_image_contents(vk::command_buffer& cmd, vk::image_view* dst_view, const deferred_subresource& desc) override;
+
+		cached_texture_section* create_new_texture(vk::command_buffer& cmd, const utils::address_range32& rsx_range, u16 width, u16 height, u16 depth, u16 mipmaps, u32 pitch,
 			u32 gcm_format, rsx::texture_upload_context context, rsx::texture_dimension_extended type, bool swizzled, rsx::component_order swizzle_flags, rsx::flags32_t flags) override;
 
-		cached_texture_section* create_nul_section(vk::command_buffer& cmd, const utils::address_range& rsx_range, const rsx::image_section_attributes_t& attrs,
+		cached_texture_section* create_nul_section(vk::command_buffer& cmd, const utils::address_range32& rsx_range, const rsx::image_section_attributes_t& attrs,
 			const rsx::GCM_tile_reference& tile, bool memory_load) override;
 
-		cached_texture_section* upload_image_from_cpu(vk::command_buffer& cmd, const utils::address_range& rsx_range, u16 width, u16 height, u16 depth, u16 mipmaps, u32 pitch, u32 gcm_format,
+		cached_texture_section* upload_image_from_cpu(vk::command_buffer& cmd, const utils::address_range32& rsx_range, u16 width, u16 height, u16 depth, u16 mipmaps, u32 pitch, u32 gcm_format,
 			rsx::texture_upload_context context, const std::vector<rsx::subresource_layout>& subresource_layout, rsx::texture_dimension_extended type, bool swizzled) override;
 
 		void set_component_order(cached_texture_section& section, u32 gcm_format, rsx::component_order expected_flags) override;

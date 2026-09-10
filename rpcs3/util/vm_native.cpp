@@ -1,5 +1,4 @@
 #include "stdafx.h"
-#include "util/logs.hpp"
 #include "util/vm.hpp"
 #include "util/asm.hpp"
 #ifdef _WIN32
@@ -223,7 +222,7 @@ namespace utils
 		return _prot;
 	}
 
-	void* memory_reserve(usz size, void* use_addr, [[maybe_unused]] bool is_memory_mapping)
+	void* memory_reserve(usz size, void* use_addr, [[maybe_unused]] bool is_memory_mapping, [[maybe_unused]] bool can_be_jit)
 	{
 #ifdef _WIN32
 		if (is_memory_mapping && has_win10_memory_mapping_api())
@@ -252,11 +251,15 @@ namespace utils
 			size += 0x10000;
 		}
 
+		// Memory mapping regions will be replaced by file-backed MAP_FIXED mappings
+		// (via shm::map), which is incompatible with MAP_JIT. Only use MAP_JIT for
+		// non-mapping regions that need JIT executable support.
 #ifdef __APPLE__
+		const int jit_flag = is_memory_mapping || !can_be_jit ? 0 : MAP_JIT;
 #ifdef ARCH_ARM64
-		auto ptr = ::mmap(use_addr, size, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE | MAP_JIT | c_map_noreserve, -1, 0);
+		auto ptr = ::mmap(use_addr, size, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE | jit_flag | c_map_noreserve, -1, 0);
 #else
-		auto ptr = ::mmap(use_addr, size, PROT_NONE, MAP_ANON | MAP_PRIVATE | MAP_JIT | c_map_noreserve, -1, 0);
+		auto ptr = ::mmap(use_addr, size, PROT_NONE, MAP_ANON | MAP_PRIVATE | jit_flag | c_map_noreserve, -1, 0);
 #endif
 #else
 		auto ptr = ::mmap(use_addr, size, PROT_NONE, MAP_ANON | MAP_PRIVATE | c_map_noreserve, -1, 0);
@@ -310,25 +313,35 @@ namespace utils
 
 	void memory_commit(void* pointer, usz size, protection prot)
 	{
+		if (!size)
+		{
+			return;
+		}
+
 #ifdef _WIN32
 		ensure(::VirtualAlloc(pointer, size, MEM_COMMIT, +prot));
 #else
 		const u64 ptr64 = reinterpret_cast<u64>(pointer);
-		ensure(::mprotect(reinterpret_cast<void*>(ptr64 & -c_page_size), size + (ptr64 & (c_page_size - 1)), +prot) != -1);
+		ensure(::mprotect(reinterpret_cast<void*>(ptr64 & -get_page_size()), size + (ptr64 & (get_page_size() - 1)), +prot) != -1);
 
 		if constexpr (c_madv_dump != 0)
 		{
-			ensure(::madvise(reinterpret_cast<void*>(ptr64 & -c_page_size), size + (ptr64 & (c_page_size - 1)), c_madv_dump) != -1);
+			ensure(::madvise(reinterpret_cast<void*>(ptr64 & -get_page_size()), size + (ptr64 & (get_page_size() - 1)), c_madv_dump) != -1);
 		}
 		else
 		{
-			ensure(::madvise(reinterpret_cast<void*>(ptr64 & -c_page_size), size + (ptr64 & (c_page_size - 1)), MADV_WILLNEED) != -1);
+			ensure(::madvise(reinterpret_cast<void*>(ptr64 & -get_page_size()), size + (ptr64 & (get_page_size() - 1)), MADV_WILLNEED) != -1);
 		}
 #endif
 	}
 
-	void memory_decommit(void* pointer, usz size)
+	void memory_decommit(void* pointer, usz size, [[maybe_unused]] bool can_be_jit)
 	{
+		if (!size)
+		{
+			return;
+		}
+
 #ifdef _WIN32
 		ensure(::VirtualFree(pointer, size, MEM_DECOMMIT));
 #else
@@ -339,24 +352,29 @@ namespace utils
 		// The Xcode manpage says the pointer is a hint and the OS will try to map at the hint location
 		// so this isn't completely undefined behavior.
 		ensure(::munmap(pointer, size) != -1);
-		ensure(::mmap(pointer, size, PROT_NONE,  MAP_ANON | MAP_PRIVATE | MAP_JIT, -1, 0) == pointer);
+		ensure(::mmap(pointer, size, PROT_NONE,  MAP_ANON | MAP_PRIVATE | (can_be_jit ? MAP_JIT : 0), -1, 0) == pointer);
 #else
 		ensure(::mmap(pointer, size, PROT_NONE, MAP_FIXED | MAP_ANON | MAP_PRIVATE | c_map_noreserve, -1, 0) != reinterpret_cast<void*>(uptr{umax}));
 #endif
 
 		if constexpr (c_madv_no_dump != 0)
 		{
-			ensure(::madvise(reinterpret_cast<void*>(ptr64 & -c_page_size), size + (ptr64 & (c_page_size - 1)), c_madv_no_dump) != -1);
+			ensure(::madvise(reinterpret_cast<void*>(ptr64 & -get_page_size()), size + (ptr64 & (get_page_size() - 1)), c_madv_no_dump) != -1);
 		}
 		else
 		{
-			ensure(::madvise(reinterpret_cast<void*>(ptr64 & -c_page_size), size + (ptr64 & (c_page_size - 1)), c_madv_free) != -1);
+			ensure(::madvise(reinterpret_cast<void*>(ptr64 & -get_page_size()), size + (ptr64 & (get_page_size() - 1)), c_madv_free) != -1);
 		}
 #endif
 	}
 
-	void memory_reset(void* pointer, usz size, protection prot)
+	void memory_reset(void* pointer, usz size, protection prot, [[maybe_unused]] bool can_be_jit)
 	{
+		if (!size)
+		{
+			return;
+		}
+
 #ifdef _WIN32
 		memory_decommit(pointer, size);
 		memory_commit(pointer, size, prot);
@@ -364,7 +382,7 @@ namespace utils
 		const u64 ptr64 = reinterpret_cast<u64>(pointer);
 #if defined(__APPLE__) && defined(ARCH_ARM64)
 		ensure(::munmap(pointer, size) != -1);
-		ensure(::mmap(pointer, size, +prot,  MAP_ANON | MAP_PRIVATE | MAP_JIT, -1, 0) == pointer);
+		ensure(::mmap(pointer, size, +prot,  MAP_ANON | MAP_PRIVATE | (can_be_jit ? MAP_JIT : 0), -1, 0) == pointer);
 #else
 		ensure(::mmap(pointer, size, +prot, MAP_FIXED | MAP_ANON | MAP_PRIVATE, -1, 0) != reinterpret_cast<void*>(uptr{umax}));
 #endif
@@ -373,23 +391,28 @@ namespace utils
 		{
 			if (size % 0x200000 == 0)
 			{
-				::madvise(reinterpret_cast<void*>(ptr64 & -c_page_size), size + (ptr64 & (c_page_size - 1)), c_madv_hugepage);
+				::madvise(reinterpret_cast<void*>(ptr64 & -get_page_size()), size + (ptr64 & (get_page_size() - 1)), c_madv_hugepage);
 			}
 		}
 
 		if constexpr (c_madv_dump != 0)
 		{
-			ensure(::madvise(reinterpret_cast<void*>(ptr64 & -c_page_size), size + (ptr64 & (c_page_size - 1)), c_madv_dump) != -1);
+			ensure(::madvise(reinterpret_cast<void*>(ptr64 & -get_page_size()), size + (ptr64 & (get_page_size() - 1)), c_madv_dump) != -1);
 		}
 		else
 		{
-			ensure(::madvise(reinterpret_cast<void*>(ptr64 & -c_page_size), size + (ptr64 & (c_page_size - 1)), MADV_WILLNEED) != -1);
+			ensure(::madvise(reinterpret_cast<void*>(ptr64 & -get_page_size()), size + (ptr64 & (get_page_size() - 1)), MADV_WILLNEED) != -1);
 		}
 #endif
 	}
 
 	void memory_release(void* pointer, usz size)
 	{
+		if (!size)
+		{
+			return;
+		}
+
 #ifdef _WIN32
 		unmap_mappping_memory(reinterpret_cast<u64>(pointer), size);
 		ensure(::VirtualFree(pointer, 0, MEM_RELEASE));
@@ -400,6 +423,11 @@ namespace utils
 
 	void memory_protect(void* pointer, usz size, protection prot)
 	{
+		if (!size)
+		{
+			return;
+		}
+
 #ifdef _WIN32
 
 		DWORD old;
@@ -423,12 +451,17 @@ namespace utils
 		}
 #else
 		const u64 ptr64 = reinterpret_cast<u64>(pointer);
-		ensure(::mprotect(reinterpret_cast<void*>(ptr64 & -c_page_size), size + (ptr64 & (c_page_size - 1)), +prot) != -1);
+		ensure(::mprotect(reinterpret_cast<void*>(ptr64 & -get_page_size()), size + (ptr64 & (get_page_size() - 1)), +prot) != -1);
 #endif
 	}
 
 	bool memory_lock(void* pointer, usz size)
 	{
+		if (!size)
+		{
+			return true;
+		}
+
 #ifdef _WIN32
 		return ::VirtualLock(pointer, size);
 #else
@@ -507,21 +540,33 @@ namespace utils
 		{
 			f.close();
 
-			for (u32 try_count = 3, i = 0; !f && i < try_count; i++)
+			for (u32 i = 1; i <= 3; i++)
+			{
+				// Cleanup
+				fs::remove_file(fmt::format("%s.%d.tmp", path, i));
+			}
+
+			for (u32 try_count = 3, i = 0; !f && i < try_count; i++, ::Sleep(100))
 			{
 				// Bug workaround: removing old file may be safer than rewriting it
 				if (!fs::remove_file(path) && fs::g_tls_error != fs::error::noent)
 				{
-					return false;
+					// Try MoveFile
+					fs::rename(path, fmt::format("%s.%d.tmp", path, i + 1), true);
 				}
 
-				if (!f.open(path, fs::read + fs::write + fs::create + fs::excl) && fs::g_tls_error != fs::error::exist)
+				if (f.open(path, fs::read + fs::write + fs::create + fs::excl))
+				{
+					return true;
+				}
+
+				if (fs::g_tls_error != fs::error::exist && fs::g_tls_error != fs::error::acces)
 				{
 					return false;
 				}
 			}
 
-			return f.operator bool();
+			return false;
 		};
 
 		std::string storage1 = fs::get_temp_dir();
@@ -657,7 +702,11 @@ namespace utils
 #else
 
 #ifdef __linux__
+#ifdef ANDROID
+		if constexpr (constexpr char c = '?')
+#else
 		if (const char c = fs::file("/proc/sys/vm/overcommit_memory").read<char>(); c == '0' || c == '1')
+#endif
 		{
 			// Simply use memfd for overcommit memory
 			m_file = ensure(::memfd_create_("", 0), FN(x >= 0));
@@ -860,9 +909,14 @@ namespace utils
 
 #ifdef _WIN32
 		::MEMORY_BASIC_INFORMATION mem{};
-		if (!::VirtualQuery(target, &mem, sizeof(mem)) || mem.State != MEM_RESERVE)
+		if (!::VirtualQuery(target, &mem, sizeof(mem)))
 		{
-			return {nullptr, fmt::format("VirtualQuery() Unexpceted memory info: state=0x%x, %s", mem.State, std::as_bytes(std::span(&mem, 1)))};
+			return {nullptr, fmt::format("VirtualQuery() Failed with %s", fmt::win_error{GetLastError(), nullptr})};
+		}
+
+		if (mem.State != MEM_RESERVE)
+		{
+			return {nullptr, fmt::format("VirtualQuery() reported unexpected memory info: state=0x%x, %s", mem.State, std::as_bytes(std::span(&mem, 1)))};
 		}
 
 		const auto base = static_cast<u8*>(mem.AllocationBase);
@@ -928,27 +982,37 @@ namespace utils
 			return {nullptr, "VirtualAlloc() failed to reserve allocation end"};
 		}
 #endif
+		const auto mapped_addr = this->map(target, prot, cow);
 
-		return {this->map(target, prot, cow), "Failed to map"};
+		if (!mapped_addr)
+		{
+			return {nullptr, "Failed to map"};
+		}
+
+		return {mapped_addr, {}};
 	}
 
 	u8* shm::map_self(protection prot)
 	{
 		void* ptr = m_ptr;
 
-		while (!ptr)
+		for (void* mapped = nullptr; !ptr;)
 		{
-			const auto mapped = this->map(nullptr, prot);
+			if (!mapped)
+			{
+				mapped = this->map(nullptr, prot);
+			}
 
 			// Install mapped memory
-			if (!m_ptr.compare_exchange(ptr, mapped))
-			{
-				// Mapped already, nothing to do.
-				this->unmap(mapped);
-			}
-			else
+			if (m_ptr.compare_exchange(ptr, mapped))
 			{
 				ptr = mapped;
+			}
+			else if (ptr)
+			{
+				// Mapped already, nothing to do.
+				ensure(ptr != mapped);
+				this->unmap(mapped);
 			}
 		}
 
@@ -1026,4 +1090,4 @@ namespace utils
 			this->unmap(ptr);
 		}
 	}
-}
+} // namespace utils

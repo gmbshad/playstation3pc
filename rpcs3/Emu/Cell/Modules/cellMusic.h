@@ -90,6 +90,8 @@ enum
 	CELL_MUSIC_PB_CMD_PREV        = 4,
 	CELL_MUSIC_PB_CMD_FASTFORWARD = 5,
 	CELL_MUSIC_PB_CMD_FASTREVERSE = 6,
+
+	CELL_MUSIC_PB_CMD_NEXT_TRACK  = 7, // RPCS3 helper for auto-play of the next track in the current playlist
 };
 
 enum
@@ -166,6 +168,7 @@ struct music_selection_context
 	void set_playlist(const std::string& path);
 	void create_playlist(const std::string& new_hash);
 	bool load_playlist();
+	void set_track(std::string_view track);
 	u32 step_track(bool next);
 
 	operator bool() const

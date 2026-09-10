@@ -2,6 +2,7 @@
 #include "Emu/Cell/Modules/cellMusic.h"
 #include "Emu/System.h"
 #include "util/logs.hpp"
+#include "Utilities/File.h"
 
 #include <QAudioOutput>
 #include <QUrl>
@@ -65,14 +66,24 @@ void fmt_class_string<QMediaPlayer::PlaybackState>::format(std::string& out, u64
 
 qt_music_handler::qt_music_handler()
 {
-	music_log.notice("Constructing Qt music handler...");
+	// Construct the QMediaPlayer on the GUI thread, the same thread on which it is destroyed
+	// (see ~qt_music_handler). cellMusic creates this handler from an emulated thread, but Qt's
+	// Windows multimedia backend balances its COM init/teardown per calling thread: constructing
+	// off the GUI thread and destroying on it left an unmatched CoUninitialize on the GUI thread,
+	// draining the OLE reference that Qt's startup OleInitialize set up until file drag&drop on
+	// the main window silently broke. Keeping both on the GUI thread keeps them balanced.
+	Emu.BlockingCallFromMainThread([this]()
+	{
+		music_log.notice("Constructing Qt music handler...");
 
-	m_media_player = std::make_shared<QMediaPlayer>();
-	m_media_player->setAudioOutput(new QAudioOutput());
+		m_media_player = std::make_unique<QMediaPlayer>();
+		m_media_player->setAudioOutput(new QAudioOutput(m_media_player.get()));
 
-	connect(m_media_player.get(), &QMediaPlayer::mediaStatusChanged, this, &qt_music_handler::handle_media_status);
-	connect(m_media_player.get(), &QMediaPlayer::playbackStateChanged, this, &qt_music_handler::handle_music_state);
-	connect(m_media_player.get(), &QMediaPlayer::errorOccurred, this, &qt_music_handler::handle_music_error);
+		connect(m_media_player.get(), &QMediaPlayer::mediaStatusChanged, this, &qt_music_handler::handle_media_status);
+		connect(m_media_player.get(), &QMediaPlayer::playbackStateChanged, this, &qt_music_handler::handle_music_state);
+		connect(m_media_player.get(), &QMediaPlayer::errorOccurred, this, &qt_music_handler::handle_music_error);
+		connect(m_media_player->audioOutput(), &QAudioOutput::volumeChanged, this, &qt_music_handler::handle_volume_change);
+	});
 }
 
 qt_music_handler::~qt_music_handler()
@@ -95,7 +106,7 @@ void qt_music_handler::stop()
 		m_media_player->stop();
 	});
 
-	m_state = CELL_MUSIC_PB_STATUS_STOP;
+	set_state(CELL_MUSIC_PB_STATUS_STOP);
 }
 
 void qt_music_handler::pause()
@@ -108,27 +119,32 @@ void qt_music_handler::pause()
 		m_media_player->pause();
 	});
 
-	m_state = CELL_MUSIC_PB_STATUS_PAUSE;
+	set_state(CELL_MUSIC_PB_STATUS_PAUSE);
 }
 
-void qt_music_handler::play(const std::string& path)
+void qt_music_handler::play(const std::string& path, bool automatic)
 {
 	std::lock_guard lock(m_mutex);
 
 	Emu.BlockingCallFromMainThread([&path, this]()
 	{
+		if (!fs::is_file(path))
+		{
+			music_log.error("play: File does not exist: '%s'", path);
+		}
+
 		if (m_path != path)
 		{
 			m_path = path;
 			m_media_player->setSource(QUrl::fromLocalFile(QString::fromStdString(path)));
 		}
 
-		music_log.notice("Playing music: %s", path);
+		music_log.notice("Playing music: '%s'", path);
 		m_media_player->setPlaybackRate(1.0);
 		m_media_player->play();
 	});
 
-	m_state = CELL_MUSIC_PB_STATUS_PLAY;
+	set_state(CELL_MUSIC_PB_STATUS_PLAY, automatic);
 }
 
 void qt_music_handler::fast_forward(const std::string& path)
@@ -137,18 +153,23 @@ void qt_music_handler::fast_forward(const std::string& path)
 
 	Emu.BlockingCallFromMainThread([&path, this]()
 	{
+		if (!fs::is_file(path))
+		{
+			music_log.error("fast_forward: File does not exist: '%s'", path);
+		}
+
 		if (m_path != path)
 		{
 			m_path = path;
 			m_media_player->setSource(QUrl::fromLocalFile(QString::fromStdString(path)));
 		}
 
-		music_log.notice("Fast-forwarding music...");
+		music_log.notice("Fast-forwarding music: '%s'", path);
 		m_media_player->setPlaybackRate(2.0);
 		m_media_player->play();
 	});
 
-	m_state = CELL_MUSIC_PB_STATUS_FASTFORWARD;
+	set_state(CELL_MUSIC_PB_STATUS_FASTFORWARD);
 }
 
 void qt_music_handler::fast_reverse(const std::string& path)
@@ -157,18 +178,23 @@ void qt_music_handler::fast_reverse(const std::string& path)
 
 	Emu.BlockingCallFromMainThread([&path, this]()
 	{
+		if (!fs::is_file(path))
+		{
+			music_log.error("fast_reverse: File does not exist: '%s'", path);
+		}
+
 		if (m_path != path)
 		{
 			m_path = path;
 			m_media_player->setSource(QUrl::fromLocalFile(QString::fromStdString(path)));
 		}
 
-		music_log.notice("Fast-reversing music...");
-		m_media_player->setPlaybackRate(-2.0);
+		music_log.notice("Fast-reversing music: '%s'", path);
+		m_media_player->setPlaybackRate(-2.0); // NOTE: This doesn't work on the current Qt version
 		m_media_player->play();
 	});
 
-	m_state = CELL_MUSIC_PB_STATUS_FASTREVERSE;
+	set_state(CELL_MUSIC_PB_STATUS_FASTREVERSE);
 }
 
 void qt_music_handler::set_volume(f32 volume)
@@ -177,8 +203,8 @@ void qt_music_handler::set_volume(f32 volume)
 
 	Emu.BlockingCallFromMainThread([&volume, this]()
 	{
-		const int new_volume = std::max<int>(0, std::min<int>(volume * 100, 100));
-		music_log.notice("Setting volume to %d%%", new_volume);
+		const f32 new_volume = std::clamp(volume, 0.0f, 1.0f);
+		music_log.notice("Setting volume to %f", new_volume);
 		m_media_player->audioOutput()->setVolume(new_volume);
 	});
 }
@@ -190,8 +216,8 @@ f32 qt_music_handler::get_volume() const
 
 	Emu.BlockingCallFromMainThread([&volume, this]()
 	{
-		volume = std::max(0.f, std::min(m_media_player->audioOutput()->volume(), 1.f));
-		music_log.notice("Getting volume: %d%%", volume);
+		volume = std::clamp(m_media_player->audioOutput()->volume(), 0.0f, 1.0f);
+		music_log.notice("Getting volume: %f", volume);
 	});
 
 	return volume;
@@ -201,7 +227,7 @@ void qt_music_handler::handle_media_status(QMediaPlayer::MediaStatus status)
 {
 	music_log.notice("New media status: %s (status=%d)", status, static_cast<int>(status));
 
-	if (!m_status_callback)
+	if (!m_playback_status_callback)
 	{
 		return;
 	}
@@ -217,7 +243,7 @@ void qt_music_handler::handle_media_status(QMediaPlayer::MediaStatus status)
 	case QMediaPlayer::MediaStatus::InvalidMedia:
 		break;
 	case QMediaPlayer::MediaStatus::EndOfMedia:
-		m_status_callback(player_status::end_of_media);
+		m_playback_status_callback(player_status::end_of_media);
 		break;
 	default:
 		music_log.error("Ignoring unknown status %d", static_cast<int>(status));
@@ -233,4 +259,9 @@ void qt_music_handler::handle_music_state(QMediaPlayer::PlaybackState state)
 void qt_music_handler::handle_music_error(QMediaPlayer::Error error, const QString& errorString)
 {
 	music_log.error("Error event: \"%s\" (error=%s)", errorString, error);
+}
+
+void qt_music_handler::handle_volume_change(float volume) const
+{
+	music_log.notice("Volume changed: %f", volume);
 }

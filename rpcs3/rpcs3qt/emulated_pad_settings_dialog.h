@@ -1,9 +1,8 @@
 #pragma once
 
-#include "Emu/Io/pad_types.h"
-
 #include <QComboBox>
 #include <QDialog>
+#include <QGroupBox>
 #include <QTabWidget>
 
 #include <vector>
@@ -21,6 +20,7 @@ public:
 		usio,
 		gem,
 		ds3gem,
+		mousegem,
 		guncon3,
 		topshotelite,
 		topshotfearmaster,
@@ -38,5 +38,5 @@ private:
 
 	pad_type m_type;
 
-	std::vector<std::vector<QComboBox*>> m_combos;
+	std::vector<std::vector<std::pair<QComboBox*, QGroupBox*>>> m_combos;
 };

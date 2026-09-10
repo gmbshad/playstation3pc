@@ -4,6 +4,7 @@
 #include "GHLtar.h"
 #include "Emu/Cell/lv2/sys_usbd.h"
 #include "Emu/Io/ghltar_config.h"
+#include "Emu/system_config.h"
 #include "Input/pad_thread.h"
 
 LOG_CHANNEL(ghltar_log, "GHLTAR");
@@ -50,6 +51,16 @@ usb_device_ghltar::usb_device_ghltar(u32 controller_index, const std::array<u8, 
 
 usb_device_ghltar::~usb_device_ghltar()
 {
+}
+
+std::shared_ptr<usb_device> usb_device_ghltar::make_instance(u32 controller_index, const std::array<u8, 7>& location)
+{
+	return std::make_shared<usb_device_ghltar>(controller_index, location);
+}
+
+u16 usb_device_ghltar::get_num_emu_devices()
+{
+	return static_cast<u16>(g_cfg.io.ghltar.get());
 }
 
 void usb_device_ghltar::control_transfer(u8 bmRequestType, u8 bRequest, u16 wValue, u16 wIndex, u16 wLength, u32 buf_size, u8* buf, UsbTransfer* transfer)
@@ -138,21 +149,21 @@ void usb_device_ghltar::interrupt_transfer(u32 buf_size, u8* buf, u32 /*endpoint
 	}
 
 	std::lock_guard lock(pad::g_pad_mutex);
-	const auto handler = pad::get_current_handler();
+	const auto handler = pad::get_pad_thread();
 	const auto& pad    = ::at32(handler->GetPads(), m_controller_index);
 
-	if (!(pad->m_port_status & CELL_PAD_STATUS_CONNECTED))
+	if (!pad->is_connected() || pad->is_copilot())
 	{
 		return;
 	}
 
 	const auto& cfg = ::at32(g_cfg_ghltar.players, m_controller_index);
-	cfg->handle_input(pad, true, [&buf](ghltar_btn btn, u16 value, bool pressed)
+	cfg->handle_input(pad, true, [&buf](const auto& value, bool& /*abort*/)
 		{
-			if (!pressed)
+			if (!value.pressed)
 				return;
 
-			switch (btn)
+			switch (value.btn)
 			{
 			case ghltar_btn::w1:
 				buf[0] += 0x01; // W1
@@ -194,17 +205,18 @@ void usb_device_ghltar::interrupt_transfer(u32 buf_size, u8* buf, u32 /*endpoint
 				buf[1] += 0x04; // GHTV Button
 				break;
 			case ghltar_btn::whammy:
-				buf[6] = ~(value) + 0x01; // Whammy
+				buf[6] = ~(value.to_8bit()) + 0x01; // Whammy
 				break;
 			case ghltar_btn::tilt:
-				buf[19] = static_cast<u8>(value); // Tilt
-				if (buf[19] >= 0xF0)
-					buf[5] = 0xFF;
-				else if (buf[19] <= 0x10)
-					buf[5] = 0x00;
+				buf[19] = value.to_8bit(); // Tilt
 				break;
 			case ghltar_btn::count:
 				break;
 			}
 		});
+
+	if (buf[19] >= 0xF0)
+		buf[5] = 0xFF;
+	else if (buf[19] <= 0x10)
+		buf[5] = 0x00;
 }

@@ -2,7 +2,6 @@
 #include "sys_rwlock.h"
 
 #include "Emu/IdManager.h"
-#include "Emu/IPC.h"
 
 #include "Emu/Cell/ErrorCodes.h"
 #include "Emu/Cell/PPUThread.h"
@@ -62,7 +61,7 @@ error_code sys_rwlock_create(ppu_thread& ppu, vm::ptr<u32> rw_lock_id, vm::ptr<s
 	}
 
 	ppu.check_state();
-	*rw_lock_id = idm::last_id();
+	*rw_lock_id = idm::last_id<lv2_rwlock>();
 	return CELL_OK;
 }
 
@@ -441,6 +440,8 @@ error_code sys_rwlock_wlock(ppu_thread& ppu, u32 rw_lock_id, u64 timeout)
 				{
 					continue;
 				}
+
+				ppu.state += cpu_flag::wait;
 
 				std::lock_guard lock(rwlock->mutex);
 

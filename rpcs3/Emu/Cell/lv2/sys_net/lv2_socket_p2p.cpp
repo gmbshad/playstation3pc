@@ -92,8 +92,7 @@ s32 lv2_socket_p2p::connect_followup()
 
 std::pair<s32, sys_net_sockaddr> lv2_socket_p2p::getpeername()
 {
-	sys_net.fatal("[P2P] getpeername() called on a P2P socket");
-	return {};
+	return {-SYS_NET_ENOTCONN, {}};
 }
 
 s32 lv2_socket_p2p::listen([[maybe_unused]] s32 backlog)
@@ -141,7 +140,8 @@ s32 lv2_socket_p2p::bind(const sys_net_sockaddr& addr)
 					p2p_vport++;
 				}
 			}
-			else if (pport.bound_p2p_vports.contains(p2p_vport))
+			
+			if (pport.bound_p2p_vports.contains(p2p_vport))
 			{
 				// Check that all other sockets are SO_REUSEADDR or SO_REUSEPORT
 				auto& bound_sockets = ::at32(pport.bound_p2p_vports, p2p_vport);
@@ -164,7 +164,7 @@ s32 lv2_socket_p2p::bind(const sys_net_sockaddr& addr)
 		std::lock_guard lock(mutex);
 		port       = p2p_port;
 		vport      = p2p_vport;
-		socket     = real_socket;
+		native_socket = real_socket;
 		bound_addr = psa_in_p2p->sin_addr;
 	}
 
@@ -176,7 +176,7 @@ std::pair<s32, sys_net_sockaddr> lv2_socket_p2p::getsockname()
 	std::lock_guard lock(mutex);
 
 	// Unbound socket
-	if (!socket)
+	if (!native_socket)
 	{
 		return {CELL_OK, {}};
 	}
@@ -273,7 +273,7 @@ std::optional<s32> lv2_socket_p2p::sendto(s32 flags, const std::vector<u8>& buf,
 	}
 
 	ensure(opt_sn_addr);
-	ensure(socket);                              // ensures it has been bound
+	ensure(native_socket); // ensures it has been bound
 	ensure(buf.size() <= static_cast<usz>(65535 - VPORT_P2P_HEADER_SIZE)); // catch games using full payload for future fragmentation implementation if necessary
 	const u16 p2p_port  = reinterpret_cast<const sys_net_sockaddr_in*>(&*opt_sn_addr)->sin_port;
 	const u16 p2p_vport = reinterpret_cast<const sys_net_sockaddr_in_p2p*>(&*opt_sn_addr)->sin_vport;
@@ -299,7 +299,7 @@ std::optional<s32> lv2_socket_p2p::sendto(s32 flags, const std::vector<u8>& buf,
 		native_flags |= MSG_WAITALL;
 	}
 
-	auto native_result = ::sendto(socket, reinterpret_cast<const char*>(p2p_data.data()), ::size32(p2p_data), native_flags, reinterpret_cast<struct sockaddr*>(&native_addr), sizeof(native_addr));
+	auto native_result = np::sendto_possibly_ipv6(native_socket, reinterpret_cast<const char*>(p2p_data.data()), ::size32(p2p_data), &native_addr, native_flags);
 
 	if (native_result >= 0)
 	{
@@ -363,45 +363,52 @@ s32 lv2_socket_p2p::shutdown([[maybe_unused]] s32 how)
 	return CELL_OK;
 }
 
-s32 lv2_socket_p2p::poll(sys_net_pollfd& sn_pfd, [[maybe_unused]] pollfd& native_pfd)
+void lv2_socket_p2p::get_sockinfo(sys_net_sockinfo_t& info)
 {
 	std::lock_guard lock(mutex);
-	ensure(vport);
+	info.state = vport ? SYS_NET_STATE_OPENED : SYS_NET_STATE_CREATED;
+}
 
-	// Check if it's a bound P2P socket
-	if ((sn_pfd.events & SYS_NET_POLLIN) && !data.empty())
+bs_t<lv2_socket::poll_t> lv2_socket_p2p::get_pending_events() const
+{
+	bs_t<lv2_socket::poll_t> pending{};
+
+	if (vport && !data.empty())
 	{
 		sys_net.trace("[P2P] p2p_data for vport %d contains %d elements", vport, data.size());
+		pending += lv2_socket::poll_t::read;
+	}
+
+	pending += lv2_socket::poll_t::write;
+
+	return pending;
+}
+
+void lv2_socket_p2p::poll(sys_net_pollfd& sn_pfd, [[maybe_unused]] pollfd& native_pfd)
+{
+	std::lock_guard lock(mutex);
+
+	const bs_t<lv2_socket::poll_t> pending = get_pending_events();
+
+	if ((sn_pfd.events & SYS_NET_POLLIN) && (pending & lv2_socket::poll_t::read))
+	{
 		sn_pfd.revents |= SYS_NET_POLLIN;
 	}
 
-	// Data can always be written on a dgram socket
-	if (sn_pfd.events & SYS_NET_POLLOUT)
+	if ((sn_pfd.events & SYS_NET_POLLOUT) && (pending & lv2_socket::poll_t::write))
 	{
 		sn_pfd.revents |= SYS_NET_POLLOUT;
 	}
-
-	return sn_pfd.revents ? 1 : 0;
 }
 
 std::tuple<bool, bool, bool> lv2_socket_p2p::select(bs_t<lv2_socket::poll_t> selected, [[maybe_unused]] pollfd& native_pfd)
 {
 	std::lock_guard lock(mutex);
 
-	bool read_set  = false;
-	bool write_set = false;
+	const bs_t<lv2_socket::poll_t> pending = get_pending_events() & selected;
 
-	// Check if it's a bound P2P socket
-	if ((selected & lv2_socket::poll_t::read) && vport && !data.empty())
-	{
-		sys_net.trace("[P2P] p2p_data for vport %d contains %d elements", vport, data.size());
-		read_set = true;
-	}
-
-	if (selected & lv2_socket::poll_t::write)
-	{
-		write_set = true;
-	}
+	const bool read_set = !!(pending & lv2_socket::poll_t::read);
+	const bool write_set = !!(pending & lv2_socket::poll_t::write);
 
 	return {read_set, write_set, false};
 }

@@ -2,6 +2,16 @@
 
 #ifdef LLVM_AVAILABLE
 
+#include "util/types.hpp"
+#include "util/sysinfo.hpp"
+#include "Utilities/StrFmt.h"
+#include "Utilities/JIT.h"
+#include "util/v128.hpp"
+
+#ifdef ARCH_X64
+#include <immintrin.h>
+#endif
+
 #ifdef _MSC_VER
 #pragma warning(push, 0)
 #else
@@ -21,11 +31,14 @@
 #include "llvm/IR/Module.h"
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/Support/KnownBits.h"
-#include "llvm/Support/ModRef.h"
+#include "llvm/Support/KnownFPClass.h"
+#include "llvm/Analysis/SimplifyQuery.h"
 #include "llvm/Analysis/ConstantFolding.h"
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/IntrinsicsX86.h"
+#ifdef ARCH_ARM64
 #include "llvm/IR/IntrinsicsAArch64.h"
+#endif
 #include "llvm/IR/InlineAsm.h"
 
 #ifdef _MSC_VER
@@ -34,15 +47,16 @@
 #pragma GCC diagnostic pop
 #endif
 
-#include "util/types.hpp"
-#include "util/sysinfo.hpp"
-#include "Utilities/StrFmt.h"
-#include "Utilities/BitField.h"
-#include "Utilities/JIT.h"
+// MSVC can use intrinsics without compiling for its target feature
+#if defined(_MSC_VER) || !defined(ARCH_X64)
+#define GNUC_X64_TARGET(x)
+#else
+#define GNUC_X64_TARGET(x) [[gnu::target(x)]]
+#endif
 
-#include "util/v128.hpp"
 #include <functional>
 #include <unordered_map>
+#include <source_location>
 
 // Helper function
 llvm::Value* peek_through_bitcasts(llvm::Value*);
@@ -62,9 +76,8 @@ template <typename T>
 concept LLVMValue = (std::is_pointer_v<T>) && (std::is_base_of_v<llvm::Value, std::remove_pointer_t<T>>);
 
 template <typename T>
-concept DSLValue = requires (T& v)
-{
-	{ v.eval(std::declval<llvm::IRBuilder<>*>()) } -> LLVMValue;
+concept DSLValue = requires(T& v, llvm::IRBuilder<>* ir) {
+	{ v.eval(ir) } -> LLVMValue;
 };
 
 template <usz N>
@@ -435,7 +448,7 @@ struct llvm_value_t<T*> : llvm_value_t<T>
 
 	static llvm::Type* get_type(llvm::LLVMContext& context)
 	{
-		return llvm_value_t<T>::get_type(context)->getPointerTo();
+		return llvm::PointerType::getUnqual(context);
 	}
 };
 
@@ -478,31 +491,33 @@ struct llvm_value_t<T[N]> : llvm_value_t<std::conditional_t<(std::extent_v<T> > 
 template <typename T>
 using llvm_expr_t = std::decay_t<T>;
 
-template <typename T, typename = void>
+template <typename T>
 struct is_llvm_expr
 {
 };
 
-template <typename T>
-struct is_llvm_expr<T, std::void_t<decltype(std::declval<T>().eval(std::declval<llvm::IRBuilder<>*>()))>>
+template <DSLValue T>
+struct is_llvm_expr<T>
 {
 	using type = typename std::decay_t<T>::type;
 };
 
-template <typename T, typename Of, typename = void>
+template <typename T, typename Of>
 struct is_llvm_expr_of
 {
 	static constexpr bool ok = false;
 };
 
 template <typename T, typename Of>
-struct is_llvm_expr_of<T, Of, std::void_t<typename is_llvm_expr<T>::type, typename is_llvm_expr<Of>::type>>
+	requires(requires { typename is_llvm_expr<T>::type; } && requires { typename is_llvm_expr<Of>::type; })
+struct is_llvm_expr_of<T, Of>
 {
 	static constexpr bool ok = std::is_same_v<typename is_llvm_expr<T>::type, typename is_llvm_expr<Of>::type>;
 };
 
 template <typename T, typename... Types>
-using llvm_common_t = std::enable_if_t<(is_llvm_expr_of<T, Types>::ok && ...), typename is_llvm_expr<T>::type>;
+	requires(is_llvm_expr_of<T, Types>::ok && ...)
+using llvm_common_t = typename is_llvm_expr<T>::type;
 
 template <typename... Args>
 using llvm_match_tuple = decltype(std::tuple_cat(std::declval<llvm_expr_t<Args>&>().match(std::declval<llvm::Value*&>(), nullptr)...));
@@ -559,6 +574,32 @@ struct llvm_placeholder_t
 		if (value && value->getType() == llvm_value_t<T>::get_type(value->getContext()))
 		{
 			return {{value}};
+		}
+
+		value = nullptr;
+		return {};
+	}
+};
+
+template <typename T, typename U = llvm_common_t<llvm_value_t<T>>>
+struct llvm_place_stealer_t
+{
+	// TODO: placeholder extracting actual constant values (u64, f64, vector, etc)
+
+	using type = T;
+
+	static constexpr bool is_ok = true;
+
+	llvm::Value* eval(llvm::IRBuilder<>*) const
+	{
+		return nullptr;
+	}
+
+	std::tuple<> match(llvm::Value*& value, llvm::Module*) const
+	{
+		if (value && value->getType() == llvm_value_t<T>::get_type(value->getContext()))
+		{
+			return {};
 		}
 
 		value = nullptr;
@@ -1148,7 +1189,7 @@ struct llvm_fshl
 	static llvm::Function* get_fshl(llvm::IRBuilder<>* ir)
 	{
 		const auto _module = ir->GetInsertBlock()->getParent()->getParent();
-		return llvm::Intrinsic::getDeclaration(_module, llvm::Intrinsic::fshl, {llvm_value_t<T>::get_type(ir->getContext())});
+		return llvm::Intrinsic::getOrInsertDeclaration(_module, llvm::Intrinsic::fshl, {llvm_value_t<T>::get_type(ir->getContext())});
 	}
 
 	static llvm::Value* fold(llvm::IRBuilder<>* ir, llvm::Value* v1, llvm::Value* v2, llvm::Value* v3)
@@ -1220,7 +1261,7 @@ struct llvm_fshr
 	static llvm::Function* get_fshr(llvm::IRBuilder<>* ir)
 	{
 		const auto _module = ir->GetInsertBlock()->getParent()->getParent();
-		return llvm::Intrinsic::getDeclaration(_module, llvm::Intrinsic::fshr, {llvm_value_t<T>::get_type(ir->getContext())});
+		return llvm::Intrinsic::getOrInsertDeclaration(_module, llvm::Intrinsic::fshr, {llvm_value_t<T>::get_type(ir->getContext())});
 	}
 
 	static llvm::Value* fold(llvm::IRBuilder<>* ir, llvm::Value* v1, llvm::Value* v2, llvm::Value* v3)
@@ -1283,10 +1324,95 @@ struct llvm_rol
 
 	llvm_expr_t<A1> a1;
 	llvm_expr_t<A2> a2;
+	bool use_sve_xar = false;
 
 	static_assert(llvm_value_t<T>::is_sint || llvm_value_t<T>::is_uint, "llvm_rol<>: invalid type");
 
 	static constexpr bool is_ok = llvm_value_t<T>::is_sint || llvm_value_t<T>::is_uint;
+
+#ifdef ARCH_ARM64
+	static bool get_constant_splat(llvm::Value* value, u64& result)
+	{
+		if (const auto constant = llvm::dyn_cast<llvm::ConstantInt>(value))
+		{
+			result = constant->getZExtValue();
+			return true;
+		}
+
+		if (llvm::isa<llvm::ConstantAggregateZero>(value))
+		{
+			result = 0;
+			return true;
+		}
+
+		const auto vector_type = llvm::dyn_cast<llvm::FixedVectorType>(value->getType());
+
+		if (!vector_type)
+		{
+			return false;
+		}
+
+		const auto element_count = vector_type->getNumElements();
+		const auto get_element = [&](u32 index) -> llvm::Constant*
+		{
+			if (const auto data = llvm::dyn_cast<llvm::ConstantDataVector>(value))
+			{
+				return data->getElementAsConstant(index);
+			}
+
+			if (const auto vector = llvm::dyn_cast<llvm::ConstantVector>(value))
+			{
+				return vector->getAggregateElement(index);
+			}
+
+			return nullptr;
+		};
+
+		const auto first_element = llvm::dyn_cast_or_null<llvm::ConstantInt>(get_element(0));
+
+		if (!first_element)
+		{
+			return false;
+		}
+
+		result = first_element->getZExtValue();
+
+		for (u32 i = 1; i < element_count; i++)
+		{
+			const auto element = llvm::dyn_cast_or_null<llvm::ConstantInt>(get_element(i));
+
+			if (!element || element->getZExtValue() != result)
+			{
+				return false;
+			}
+		}
+
+		return true;
+	}
+
+	static llvm::Value* to_sve_vector(llvm::IRBuilder<>* ir, llvm::Value* value)
+	{
+		if (llvm::isa<llvm::ScalableVectorType>(value->getType()))
+		{
+			return value;
+		}
+
+		const auto fixed_type = llvm::cast<llvm::FixedVectorType>(value->getType());
+		const auto scalable_type = llvm::ScalableVectorType::get(fixed_type->getElementType(), fixed_type->getNumElements());
+
+		return ir->CreateInsertVector(scalable_type, llvm::UndefValue::get(scalable_type), value, ir->getInt64(0));
+	}
+
+	static llvm::Value* from_sve_vector(llvm::IRBuilder<>* ir, llvm::Value* value, llvm::FixedVectorType* fixed_type)
+	{
+		if (value->getType() == fixed_type)
+		{
+			return value;
+		}
+
+		return ir->CreateExtractVector(fixed_type, value, ir->getInt64(0));
+	}
+#endif
 
 	llvm::Value* eval(llvm::IRBuilder<>* ir) const
 	{
@@ -1297,6 +1423,28 @@ struct llvm_rol
 		{
 			return llvm_fshl<A1, A1, A2>::fold(ir, v1, v1, v2);
 		}
+
+#ifdef ARCH_ARM64
+		u64 rotate = 0;
+
+		if (use_sve_xar && llvm::isa<llvm::FixedVectorType>(v1->getType()) && get_constant_splat(v2, rotate))
+		{
+			constexpr u64 element_size = llvm_value_t<T>::esize;
+			const u32 rotate_right = static_cast<u32>((element_size - (rotate % element_size)) % element_size);
+
+			if (rotate_right == 0)
+			{
+				return v1;
+			}
+
+			const auto fixed_type = llvm::cast<llvm::FixedVectorType>(v1->getType());
+			const auto data = to_sve_vector(ir, v1);
+			const auto zero = llvm::Constant::getNullValue(data->getType());
+			const auto result = ir->CreateIntrinsic(llvm::Intrinsic::aarch64_sve_xar, {data->getType()}, {data, zero, ir->getInt32(rotate_right)});
+
+			return from_sve_vector(ir, result, fixed_type);
+		}
+#endif
 
 		return ir->CreateCall(llvm_fshl<A1, A1, A2>::get_fshl(ir), {v1, v1, v2});
 	}
@@ -1608,7 +1756,8 @@ struct llvm_ord
 };
 
 template <typename T>
-llvm_ord(T&&) -> llvm_ord<std::enable_if_t<is_llvm_cmp<std::decay_t<T>>::value, T&&>>;
+	requires is_llvm_cmp<std::decay_t<T>>::value
+llvm_ord(T&&) -> llvm_ord<T&&>;
 
 template <typename Cmp, typename T = llvm_common_t<Cmp>>
 struct llvm_uno
@@ -1661,7 +1810,8 @@ struct llvm_uno
 };
 
 template <typename T>
-llvm_uno(T&&) -> llvm_uno<std::enable_if_t<is_llvm_cmp<std::decay_t<T>>::value, T&&>>;
+	requires is_llvm_cmp<std::decay_t<T>>::value
+llvm_uno(T&&) -> llvm_uno<T&&>;
 
 template <typename T1, typename T2>
 inline llvm_cmp<T1, T2, llvm::ICmpInst::ICMP_EQ> operator ==(T1&& a1, T2&& a2)
@@ -2217,7 +2367,7 @@ struct llvm_add_sat
 	static llvm::Function* get_add_sat(llvm::IRBuilder<>* ir)
 	{
 		const auto _module = ir->GetInsertBlock()->getParent()->getParent();
-		return llvm::Intrinsic::getDeclaration(_module, intr, {llvm_value_t<T>::get_type(ir->getContext())});
+		return llvm::Intrinsic::getOrInsertDeclaration(_module, intr, {llvm_value_t<T>::get_type(ir->getContext())});
 	}
 
 	llvm::Value* eval(llvm::IRBuilder<>* ir) const
@@ -2300,7 +2450,7 @@ struct llvm_sub_sat
 	static llvm::Function* get_sub_sat(llvm::IRBuilder<>* ir)
 	{
 		const auto _module = ir->GetInsertBlock()->getParent()->getParent();
-		return llvm::Intrinsic::getDeclaration(_module, intr, {llvm_value_t<T>::get_type(ir->getContext())});
+		return llvm::Intrinsic::getOrInsertDeclaration(_module, intr, {llvm_value_t<T>::get_type(ir->getContext())});
 	}
 
 	llvm::Value* eval(llvm::IRBuilder<>* ir) const
@@ -3022,7 +3172,7 @@ struct llvm_calli
 						if (((std::get<I>(r) = std::get<I>(a).match(v[I], _m), v[I]) && ...))
 						{
 							return std::tuple_cat(std::get<I>(r)...);
-						}	
+						}
 					}
 				}
 			}
@@ -3062,13 +3212,35 @@ protected:
 
 	// Allow PSHUFB intrinsic
 	bool m_use_ssse3 = true;
+#ifdef ARCH_ARM64
+	// all arm CPUS have FMA
+	bool m_use_fma = true;
 
+	// Should be nonsense to set this for ARM,
+	// but this flag is only used in SPU verification
+	// For now, setting this flag will speed up SPU verification
+	// but I will remove this later with explicit parralelism - Whatcookie
+	bool m_use_avx = true;
+
+	// ARMv8 SDOT/UDOT
+	bool m_use_dotprod = false;
+
+	// ARMv8.6 SMMLA/UMMLA
+	bool m_use_i8mm = false;
+
+	// Allow direct TBL2/TBX2 emission.
+	bool m_use_tbl2 = true;
+
+	bool m_use_sve_128 = false;
+
+	bool m_use_sve2_128 = false;
+#else
 	// Allow FMA
 	bool m_use_fma = false;
 
 	// Allow AVX
 	bool m_use_avx = false;
-
+#endif
 	// Allow skylake-x tier AVX-512
 	bool m_use_avx512 = false;
 
@@ -3182,7 +3354,7 @@ public:
 	}
 
 	// Bitcast with immediate constant folding
-	llvm::Value* bitcast(llvm::Value* val, llvm::Type* type) const;
+	llvm::Value* bitcast(llvm::Value* val, llvm::Type* type, std::source_location src_loc = std::source_location::current()) const;
 
 	template <typename T>
 	llvm::Value* bitcast(llvm::Value* val)
@@ -3196,14 +3368,22 @@ public:
 		return {};
 	}
 
-	template <typename T, typename = llvm_common_t<T>>
+	template <typename T>
+	static llvm_place_stealer_t<T> match_stealer()
+	{
+		return {};
+	}
+
+	template <typename T>
+		requires requires { typename llvm_common_t<T>; }
 	static auto match_expr(llvm::Value* v, llvm::Module* _m, T&& expr)
 	{
 		auto r = expr.match(v, _m);
 		return std::tuple_cat(std::make_tuple(v != nullptr), r);
 	}
 
-	template <typename T, typename U, typename = llvm_common_t<T, U>>
+	template <typename T, typename U>
+		requires requires { typename llvm_common_t<T, U>; }
 	auto match_expr(T&& arg, U&& expr) -> decltype(std::tuple_cat(std::make_tuple(false), expr.match(std::declval<llvm::Value*&>(), nullptr)))
 	{
 		auto v = arg.eval(m_ir);
@@ -3238,202 +3418,239 @@ public:
 		return expr_t<T, F>{std::forward<T>(expr), std::move(matcher)};
 	}
 
-	template <typename T, typename = std::enable_if_t<is_llvm_cmp<std::decay_t<T>>::value>>
+	template <typename T>
+		requires is_llvm_cmp<std::decay_t<T>>::value
 	static auto fcmp_ord(T&& cmp_expr)
 	{
 		return llvm_ord{std::forward<T>(cmp_expr)};
 	}
 
-	template <typename T, typename = std::enable_if_t<is_llvm_cmp<std::decay_t<T>>::value>>
+	template <typename T>
+		requires is_llvm_cmp<std::decay_t<T>>::value
 	static auto fcmp_uno(T&& cmp_expr)
 	{
 		return llvm_uno{std::forward<T>(cmp_expr)};
 	}
 
-	template <typename U, typename T, typename = std::enable_if_t<llvm_noncast<U, T>::is_ok>>
+	template <typename U, typename T>
+		requires llvm_noncast<U, T>::is_ok
 	static auto noncast(T&& expr)
 	{
 		return llvm_noncast<U, T>{std::forward<T>(expr)};
 	}
 
-	template <typename U, typename T, typename = std::enable_if_t<llvm_bitcast<U, T>::is_ok>>
+	template <typename U, typename T>
+		requires llvm_bitcast<U, T>::is_ok
 	static auto bitcast(T&& expr)
 	{
 		return llvm_bitcast<U, T>{std::forward<T>(expr)};
 	}
 
-	template <typename U, typename T, typename = std::enable_if_t<llvm_fpcast<U, T>::is_ok>>
+	template <typename U, typename T>
+		requires llvm_fpcast<U, T>::is_ok
 	static auto fpcast(T&& expr)
 	{
 		return llvm_fpcast<U, T>{std::forward<T>(expr)};
 	}
 
-	template <typename U, typename T, typename = std::enable_if_t<llvm_trunc<U, T>::is_ok>>
+	template <typename U, typename T>
+		requires llvm_trunc<U, T>::is_ok
 	static auto trunc(T&& expr)
 	{
 		return llvm_trunc<U, T>{std::forward<T>(expr)};
 	}
 
-	template <typename U, typename T, typename = std::enable_if_t<llvm_sext<U, T>::is_ok>>
+	template <typename U, typename T>
+		requires llvm_sext<U, T>::is_ok
 	static auto sext(T&& expr)
 	{
 		return llvm_sext<U, T>{std::forward<T>(expr)};
 	}
 
-	template <typename U, typename T, typename = std::enable_if_t<llvm_zext<U, T>::is_ok>>
+	template <typename U, typename T>
+		requires llvm_zext<U, T>::is_ok
 	static auto zext(T&& expr)
 	{
 		return llvm_zext<U, T>{std::forward<T>(expr)};
 	}
 
-	template <typename T, typename U, typename V, typename = std::enable_if_t<llvm_select<T, U, V>::is_ok>>
+	template <typename T, typename U, typename V>
+		requires llvm_select<T, U, V>::is_ok
 	static auto select(T&& c, U&& a, V&& b)
 	{
 		return llvm_select<T, U, V>{std::forward<T>(c), std::forward<U>(a), std::forward<V>(b)};
 	}
 
-	template <typename T, typename U, typename = std::enable_if_t<llvm_min<T, U>::is_ok>>
+	template <typename T, typename U>
+		requires llvm_min<T, U>::is_ok
 	static auto min(T&& a, U&& b)
 	{
 		return llvm_min<T, U>{std::forward<T>(a), std::forward<U>(b)};
 	}
 
-	template <typename T, typename U, typename = std::enable_if_t<llvm_min<T, U>::is_ok>>
+	template <typename T, typename U>
+		requires llvm_min<T, U>::is_ok
 	static auto max(T&& a, U&& b)
 	{
 		return llvm_max<T, U>{std::forward<T>(a), std::forward<U>(b)};
 	}
 
-	template <typename T, typename U, typename V, typename = std::enable_if_t<llvm_fshl<T, U, V>::is_ok>>
+	template <typename T, typename U, typename V>
+		requires llvm_fshl<T, U, V>::is_ok
 	static auto fshl(T&& a, U&& b, V&& c)
 	{
 		return llvm_fshl<T, U, V>{std::forward<T>(a), std::forward<U>(b), std::forward<V>(c)};
 	}
 
-	template <typename T, typename U, typename V, typename = std::enable_if_t<llvm_fshr<T, U, V>::is_ok>>
+	template <typename T, typename U, typename V>
+		requires llvm_fshr<T, U, V>::is_ok
 	static auto fshr(T&& a, U&& b, V&& c)
 	{
 		return llvm_fshr<T, U, V>{std::forward<T>(a), std::forward<U>(b), std::forward<V>(c)};
 	}
 
-	template <typename T, typename U, typename = std::enable_if_t<llvm_rol<T, U>::is_ok>>
-	static auto rol(T&& a, U&& b)
+	template <typename T, typename U>
+		requires llvm_rol<T, U>::is_ok
+	auto rol(T&& a, U&& b)
 	{
+#ifdef ARCH_ARM64
+		return llvm_rol<T, U>{std::forward<T>(a), std::forward<U>(b), m_use_sve2_128};
+#else
 		return llvm_rol<T, U>{std::forward<T>(a), std::forward<U>(b)};
+#endif
 	}
 
-	template <typename T, typename U, typename = std::enable_if_t<llvm_add_sat<T, U>::is_ok>>
+	template <typename T, typename U>
+		requires llvm_add_sat<T, U>::is_ok
 	static auto add_sat(T&& a, U&& b)
 	{
 		return llvm_add_sat<T, U>{std::forward<T>(a), std::forward<U>(b)};
 	}
 
-	template <typename T, typename U, typename = std::enable_if_t<llvm_sub_sat<T, U>::is_ok>>
+	template <typename T, typename U>
+		requires llvm_sub_sat<T, U>::is_ok
 	static auto sub_sat(T&& a, U&& b)
 	{
 		return llvm_sub_sat<T, U>{std::forward<T>(a), std::forward<U>(b)};
 	}
 
-	template <typename T, typename U, typename = std::enable_if_t<llvm_extract<T, U>::is_ok>>
+	template <typename T, typename U>
+		requires llvm_extract<T, U>::is_ok
 	static auto extract(T&& v, U&& i)
 	{
 		return llvm_extract<T, U>{std::forward<T>(v), std::forward<U>(i)};
 	}
 
-	template <typename T, typename = std::enable_if_t<llvm_extract<T, llvm_const_int<u32>>::is_ok>>
+	template <typename T>
+		requires llvm_extract<T, llvm_const_int<u32>>::is_ok
 	static auto extract(T&& v, u32 i)
 	{
 		return llvm_extract<T, llvm_const_int<u32>>{std::forward<T>(v), llvm_const_int<u32>{i}};
 	}
 
-	template <typename T, typename U, typename V, typename = std::enable_if_t<llvm_insert<T, U, V>::is_ok>>
+	template <typename T, typename U, typename V>
+		requires llvm_insert<T, U, V>::is_ok
 	static auto insert(T&& v, U&& i, V&& e)
 	{
 		return llvm_insert<T, U, V>{std::forward<T>(v), std::forward<U>(i), std::forward<V>(e)};
 	}
 
-	template <typename T, typename V, typename = std::enable_if_t<llvm_insert<T, llvm_const_int<u32>, V>::is_ok>>
+	template <typename T, typename V>
+		requires llvm_insert<T, llvm_const_int<u32>, V>::is_ok
 	static auto insert(T&& v, u32 i, V&& e)
 	{
 		return llvm_insert<T, llvm_const_int<u32>, V>{std::forward<T>(v), llvm_const_int<u32>{i}, std::forward<V>(e)};
 	}
 
-	template <typename T, typename = std::enable_if_t<llvm_const_int<T>::is_ok>>
+	template <typename T>
+		requires llvm_const_int<T>::is_ok
 	static auto splat(u64 c)
 	{
 		return llvm_const_int<T>{c};
 	}
 
-	template <typename T, typename = std::enable_if_t<llvm_const_float<T>::is_ok>>
+	template <typename T>
+		requires llvm_const_float<T>::is_ok
 	static auto fsplat(f64 c)
 	{
 		return llvm_const_float<T>{c};
 	}
 
-	template <typename T, typename U, typename = std::enable_if_t<llvm_splat<T, U>::is_ok>>
+	template <typename T, typename U>
+		requires llvm_splat<T, U>::is_ok
 	static auto vsplat(U&& v)
 	{
 		return llvm_splat<T, U>{std::forward<U>(v)};
 	}
 
-	template <typename T, typename... Args, typename = std::enable_if_t<llvm_const_vector<sizeof...(Args), T>::is_ok>>
+	template <typename T, typename... Args>
+		requires llvm_const_vector<sizeof...(Args), T>::is_ok
 	static auto build(Args... args)
 	{
 		return llvm_const_vector<sizeof...(Args), T>{static_cast<std::remove_extent_t<T>>(args)...};
 	}
 
-	template <typename T, typename... Args, typename = std::enable_if_t<llvm_zshuffle<sizeof...(Args), T>::is_ok>>
+	template <typename T, typename... Args>
+		requires llvm_zshuffle<sizeof...(Args), T>::is_ok
 	static auto zshuffle(T&& v, Args... indices)
 	{
 		return llvm_zshuffle<sizeof...(Args), T>{std::forward<T>(v), {static_cast<int>(indices)...}};
 	}
 
-	template <typename T, typename U, typename... Args, typename = std::enable_if_t<llvm_shuffle2<sizeof...(Args), T, U>::is_ok>>
+	template <typename T, typename U, typename... Args>
+		requires llvm_shuffle2<sizeof...(Args), T, U>::is_ok
 	static auto shuffle2(T&& v1, U&& v2, Args... indices)
 	{
 		return llvm_shuffle2<sizeof...(Args), T, U>{std::forward<T>(v1), std::forward<U>(v2), {static_cast<int>(indices)...}};
 	}
 
-	template <typename T, typename = std::enable_if_t<llvm_ctlz<T>::is_ok>>
+	template <typename T>
+		requires llvm_ctlz<T>::is_ok
 	static auto ctlz(T&& a)
 	{
 		return llvm_ctlz<T>{std::forward<T>(a)};
 	}
 
-	template <typename T, typename = std::enable_if_t<llvm_ctpop<T>::is_ok>>
+	template <typename T>
+		requires llvm_ctpop<T>::is_ok
 	static auto ctpop(T&& a)
 	{
 		return llvm_ctpop<T>{std::forward<T>(a)};
 	}
 
 	// Average: (a + b + 1) >> 1
-	template <typename T, typename U, typename = std::enable_if_t<llvm_avg<T, U>::is_ok>>
+	template <typename T, typename U>
+		requires llvm_avg<T, U>::is_ok
 	static auto avg(T&& a, U&& b)
 	{
 		return llvm_avg<T, U>{std::forward<T>(a), std::forward<U>(b)};
 	}
 
-	template <typename T, typename = std::enable_if_t<llvm_fsqrt<T>::is_ok>>
+	template <typename T>
+		requires llvm_fsqrt<T>::is_ok
 	static auto fsqrt(T&& a)
 	{
 		return llvm_fsqrt<T>{std::forward<T>(a)};
 	}
 
-	template <typename T, typename = std::enable_if_t<llvm_fabs<T>::is_ok>>
+	template <typename T>
+		requires llvm_fabs<T>::is_ok
 	static auto fabs(T&& a)
 	{
 		return llvm_fabs<T>{std::forward<T>(a)};
 	}
 
 	// Optionally opportunistic hardware FMA, can be used if results are identical for all possible input values
-	template <typename T, typename U, typename V, typename = std::enable_if_t<llvm_fmuladd<T, U, V>::is_ok>>
+	template <typename T, typename U, typename V>
+		requires llvm_fmuladd<T, U, V>::is_ok
 	static auto fmuladd(T&& a, U&& b, V&& c, bool strict_fma)
 	{
 		return llvm_fmuladd<T, U, V>{std::forward<T>(a), std::forward<U>(b), std::forward<V>(c), strict_fma};
 	}
 
 	// Opportunistic hardware FMA, can be used if results are identical for all possible input values
-	template <typename T, typename U, typename V, typename = std::enable_if_t<llvm_fmuladd<T, U, V>::is_ok>>
+	template <typename T, typename U, typename V>
+		requires llvm_fmuladd<T, U, V>::is_ok
 	auto fmuladd(T&& a, U&& b, V&& c)
 	{
 		return llvm_fmuladd<T, U, V>{std::forward<T>(a), std::forward<U>(b), std::forward<V>(c), m_use_fma};
@@ -3474,11 +3691,22 @@ public:
 
 	// Infinite-precision shift left
 	template <typename T, typename U, typename CT = llvm_common_t<T, U>>
-	auto inf_shl(T&& a, U&& b)
+	value_t<CT> inf_shl(T&& a, U&& b)
 	{
 		static constexpr u32 esz = llvm_value_t<CT>::esize;
 
-		return expr(select(b < esz, a << b, splat<CT>(0)), [](llvm::Value*& value, llvm::Module* _m) -> llvm_match_tuple<T, U>
+#ifdef ARCH_ARM64
+		auto sh = eval(std::forward<U>(b));
+		auto k = get_known_bits(sh);
+		const auto max_shift = llvm::APInt(k.Zero.getBitWidth(), esz * 2 - 1);
+
+		if ((k.Zero | max_shift).isAllOnes())
+		{
+			return ushl(std::forward<T>(a), sh);
+		}
+#endif
+
+		auto result = expr(select(b < esz, a << b, splat<CT>(0)), [](llvm::Value*& value, llvm::Module* _m) -> llvm_match_tuple<T, U>
 		{
 			static const auto M = match<CT>();
 
@@ -3496,15 +3724,28 @@ public:
 			value = nullptr;
 			return {};
 		});
+
+		return eval(result);
 	}
 
 	// Infinite-precision logical shift right (unsigned)
 	template <typename T, typename U, typename CT = llvm_common_t<T, U>>
-	auto inf_lshr(T&& a, U&& b)
+	value_t<CT> inf_lshr(T&& a, U&& b)
 	{
 		static constexpr u32 esz = llvm_value_t<CT>::esize;
 
-		return expr(select(b < esz, a >> b, splat<CT>(0)), [](llvm::Value*& value, llvm::Module* _m) -> llvm_match_tuple<T, U>
+#ifdef ARCH_ARM64
+		auto sh = eval(std::forward<U>(b));
+		auto k = get_known_bits(sh);
+		const auto max_shift = llvm::APInt(k.Zero.getBitWidth(), esz * 2 - 1);
+
+		if ((k.Zero | max_shift).isAllOnes())
+		{
+			return ushl(std::forward<T>(a), -sh);
+		}
+#endif
+
+		auto result = expr(select(b < esz, a >> b, splat<CT>(0)), [](llvm::Value*& value, llvm::Module* _m) -> llvm_match_tuple<T, U>
 		{
 			static const auto M = match<CT>();
 
@@ -3522,6 +3763,8 @@ public:
 			value = nullptr;
 			return {};
 		});
+
+		return eval(result);
 	}
 
 	// Infinite-precision arithmetic shift right (signed)
@@ -3554,17 +3797,46 @@ public:
 	llvm::Function* get_intrinsic(llvm::Intrinsic::ID id)
 	{
 		const auto _module = m_ir->GetInsertBlock()->getParent()->getParent();
-		return llvm::Intrinsic::getDeclaration(_module, id, {get_type<Types>()...});
+		return llvm::Intrinsic::getOrInsertDeclaration(_module, id, {get_type<Types>()...});
+	}
+
+	template <typename T1, typename T2, typename T3>
+	value_t<u32[4]> vperm2d128From512(T1 a, T2 b, T3 c)
+	{
+		value_t<u32[4]> result;
+		value_t<u32[16]> perm512;
+
+		const auto data0 = a.eval(m_ir);
+		const auto index128 = b.eval(m_ir);
+		const auto data1 = c.eval(m_ir);
+
+		const auto index512 = m_ir->CreateInsertVector(get_type<u32[16]>(), llvm::UndefValue::get(get_type<u32[16]>()), index128, m_ir->getInt64(0));
+		perm512.value = m_ir->CreateCall(get_intrinsic(llvm::Intrinsic::x86_avx512_vpermi2var_d_512), {data0, index512, data1});
+
+		result.value = m_ir->CreateExtractVector(get_type<u32[4]>(), perm512.value, m_ir->getInt64(0));
+		return result;
 	}
 
 	template <typename T1, typename T2>
-	value_t<u8[16]> gf2p8affineqb(T1 a, T2 b, u8 c)
+	GNUC_X64_TARGET("gfni") value_t<u8[16]> gf2p8affineqb(T1 a, T2 b, u8 c)
 	{
 		value_t<u8[16]> result;
 
 		const auto data0 = a.eval(m_ir);
 		const auto data1 = b.eval(m_ir);
 
+#ifdef ARCH_X64
+		const auto [a_is_const, a_data] = get_const_vector(data0, -1);
+		const auto [b_is_const, b_data] = get_const_vector(data1, -1);
+
+		if (a_is_const && b_is_const)
+		{
+			const auto affine = _mm_xor_si128(_mm_gf2p8affine_epi64_epi8(a_data, b_data, 0), _mm_set1_epi8(c));
+			result.value = llvm::ConstantDataVector::get(m_context, llvm::ArrayRef(static_cast<v128>(affine)._u8.m_data, 16));
+			return result;
+		}
+#endif
+		
 		const auto immediate = (llvm_const_int<u8>{c});
 		const auto imm8 = immediate.eval(m_ir);
 
@@ -3580,9 +3852,245 @@ public:
 		const auto data0 = a.eval(m_ir);
 		const auto data1 = b.eval(m_ir);
 		const auto data2 = c.eval(m_ir);
-		result.value = m_ir->CreateCall(get_intrinsic(llvm::Intrinsic::x86_avx512_vpdpbusd_128), {data0, data1, data2});
+		
+#ifdef ARCH_X64
+		const auto [a_is_const, a_data] = get_const_vector(data0, -1);
+		const auto [b_is_const, b_data] = get_const_vector(data1, -1);
+		const auto [c_is_const, c_data] = get_const_vector(data2, -1);
+
+		if (a_is_const && b_is_const && c_is_const)
+		{
+			__m128i dpbusd;
+			if (utils::has_avx512_icl())
+				dpbusd = _mm_wrapper_dpbusd_avx512vnni(a_data, b_data, c_data);
+			else
+				dpbusd = _mm_wrapper_dpbusd_avxvnni(a_data, b_data, c_data);
+
+			result.value = llvm::ConstantDataVector::get(m_context, llvm::ArrayRef(static_cast<v128>(dpbusd)._u32.m_data, 4));
+			return result;
+		}
+#endif
+
+		result.value = m_ir->CreateCall(get_intrinsic(llvm::Intrinsic::x86_avx512_vpdpbusd_128),
+			{data0, m_ir->CreateBitCast(data1, get_type<u8[16]>()), m_ir->CreateBitCast(data2, get_type<u8[16]>())});
 		return result;
 	}
+
+#ifdef ARCH_ARM64
+template <typename T1, typename T2, typename T3>
+	value_t<u32[4]> udot(T1 a, T2 b, T3 c)
+	{
+		value_t<u32[4]> result;
+
+		const auto data0 = a.eval(m_ir);
+		const auto data1 = b.eval(m_ir);
+		const auto data2 = c.eval(m_ir);
+
+		result.value = m_ir->CreateCall(get_intrinsic<u32[4], u8[16]>(llvm::Intrinsic::aarch64_neon_udot), {data0, data1, data2});
+		return result;
+	}
+
+	template <typename T1, typename T2, typename T3>
+	value_t<u32[4]> sdot(T1 a, T2 b, T3 c)
+	{
+		value_t<u32[4]> result;
+
+		const auto data0 = a.eval(m_ir);
+		const auto data1 = b.eval(m_ir);
+		const auto data2 = c.eval(m_ir);
+
+		result.value = m_ir->CreateCall(get_intrinsic<u32[4], u8[16]>(llvm::Intrinsic::aarch64_neon_sdot), {data0, data1, data2});
+		return result;
+	}
+
+	template <typename T1, typename T2, typename T3>
+	value_t<u32[4]> ummla(T1 a, T2 b, T3 c)
+	{
+		value_t<u32[4]> result;
+
+		const auto data0 = a.eval(m_ir);
+		const auto data1 = b.eval(m_ir);
+		const auto data2 = c.eval(m_ir);
+
+		result.value = m_ir->CreateCall(get_intrinsic<u32[4], u8[16]>(llvm::Intrinsic::aarch64_neon_ummla), {data0, data1, data2});
+		return result;
+	}
+
+	template <typename T1, typename T2, typename T3>
+	value_t<u32[4]> smmla(T1 a, T2 b, T3 c)
+	{
+		value_t<u32[4]> result;
+
+		const auto data0 = a.eval(m_ir);
+		const auto data1 = b.eval(m_ir);
+		const auto data2 = c.eval(m_ir);
+
+		result.value = m_ir->CreateCall(get_intrinsic<u32[4], u8[16]>(llvm::Intrinsic::aarch64_neon_smmla), {data0, data1, data2});
+		return result;
+	}
+
+	template <typename T1, typename T2>
+	value_t<s32[4]> smull(T1 a, T2 b)
+	{
+		value_t<s32[4]> result;
+
+		const auto data0 = a.eval(m_ir);
+		const auto data1 = b.eval(m_ir);
+
+		result.value = m_ir->CreateCall(get_intrinsic<s32[4]>(llvm::Intrinsic::aarch64_neon_smull), {data0, data1});
+		return result;
+	}
+
+	template <typename T1, typename T2>
+	value_t<u32[4]> umull(T1 a, T2 b)
+	{
+		value_t<u32[4]> result;
+
+		const auto data0 = a.eval(m_ir);
+		const auto data1 = b.eval(m_ir);
+
+		result.value = m_ir->CreateCall(get_intrinsic<u32[4]>(llvm::Intrinsic::aarch64_neon_umull), {data0, data1});
+		return result;
+	}
+
+	llvm::Value* to_sve_vector(llvm::Value* value)
+	{
+		if (llvm::isa<llvm::ScalableVectorType>(value->getType()))
+		{
+			return value;
+		}
+
+		const auto fixed_type = llvm::cast<llvm::FixedVectorType>(value->getType());
+		const auto scalable_type = llvm::ScalableVectorType::get(fixed_type->getElementType(), fixed_type->getNumElements());
+		return m_ir->CreateInsertVector(scalable_type, llvm::UndefValue::get(scalable_type), value, m_ir->getInt64(0));
+	}
+
+	llvm::Value* from_sve_vector(llvm::Value* value, llvm::FixedVectorType* fixed_type)
+	{
+		if (value->getType() == fixed_type)
+		{
+			return value;
+		}
+
+		return m_ir->CreateExtractVector(fixed_type, value, m_ir->getInt64(0));
+	}
+
+	llvm::Value* sve_ptrue(llvm::FixedVectorType* fixed_type)
+	{
+		const auto pred_type = llvm::ScalableVectorType::get(m_ir->getInt1Ty(), fixed_type->getNumElements());
+		return m_ir->CreateIntrinsic(llvm::Intrinsic::aarch64_sve_ptrue, {pred_type}, {m_ir->getInt32(31)});
+	}
+
+	llvm::Value* sve_fnmls(llvm::Value* acc, llvm::Value* lhs, llvm::Value* rhs)
+	{
+		const auto fixed_type = llvm::cast<llvm::FixedVectorType>(acc->getType());
+		const auto vacc = to_sve_vector(acc);
+		const auto vlhs = to_sve_vector(lhs);
+		const auto vrhs = to_sve_vector(rhs);
+		const auto result = m_ir->CreateIntrinsic(llvm::Intrinsic::aarch64_sve_fnmls, {vacc->getType()}, {sve_ptrue(fixed_type), vacc, vlhs, vrhs});
+
+		return from_sve_vector(result, fixed_type);
+	}
+
+	template <typename T, typename T1, typename T2>
+	value_t<T> sve_mull(llvm::Intrinsic::ID id, T1 a, T2 b)
+	{
+		value_t<T> result;
+
+		const auto fixed_type = llvm::cast<llvm::FixedVectorType>(get_type<T>());
+		const auto scalable_type = llvm::ScalableVectorType::get(fixed_type->getElementType(), fixed_type->getNumElements());
+		const auto data0 = to_sve_vector(a.eval(m_ir));
+		const auto data1 = to_sve_vector(b.eval(m_ir));
+		const std::array<llvm::Type*, 1> types{scalable_type};
+
+		result.value = from_sve_vector(m_ir->CreateIntrinsic(id, types, {data0, data1}), fixed_type);
+		return result;
+	}
+
+	template <typename T, typename T0, typename T1, typename T2>
+	value_t<T> sve_mlal(llvm::Intrinsic::ID id, T0 acc, T1 a, T2 b)
+	{
+		value_t<T> result;
+
+		const auto fixed_type = llvm::cast<llvm::FixedVectorType>(get_type<T>());
+		const auto scalable_type = llvm::ScalableVectorType::get(fixed_type->getElementType(), fixed_type->getNumElements());
+		const auto data0 = to_sve_vector(acc.eval(m_ir));
+		const auto data1 = to_sve_vector(a.eval(m_ir));
+		const auto data2 = to_sve_vector(b.eval(m_ir));
+		const std::array<llvm::Type*, 1> types{scalable_type};
+
+		result.value = from_sve_vector(m_ir->CreateIntrinsic(id, types, {data0, data1, data2}), fixed_type);
+		return result;
+	}
+
+	template <typename T1, typename T2>
+	value_t<s32[4]> sve_smullb(T1 a, T2 b)
+	{
+		return sve_mull<s32[4]>(llvm::Intrinsic::aarch64_sve_smullb, a, b);
+	}
+
+	template <typename T1, typename T2>
+	value_t<s32[4]> sve_smullt(T1 a, T2 b)
+	{
+		return sve_mull<s32[4]>(llvm::Intrinsic::aarch64_sve_smullt, a, b);
+	}
+
+	template <typename T1, typename T2>
+	value_t<u32[4]> sve_umullb(T1 a, T2 b)
+	{
+		return sve_mull<u32[4]>(llvm::Intrinsic::aarch64_sve_umullb, a, b);
+	}
+
+	template <typename T1, typename T2>
+	value_t<u32[4]> sve_umullt(T1 a, T2 b)
+	{
+		return sve_mull<u32[4]>(llvm::Intrinsic::aarch64_sve_umullt, a, b);
+	}
+
+	template <typename T0, typename T1, typename T2>
+	value_t<s32[4]> sve_smlalb(T0 acc, T1 a, T2 b)
+	{
+		return sve_mlal<s32[4]>(llvm::Intrinsic::aarch64_sve_smlalb, acc, a, b);
+	}
+
+	template <typename T0, typename T1, typename T2>
+	value_t<s32[4]> sve_smlalt(T0 acc, T1 a, T2 b)
+	{
+		return sve_mlal<s32[4]>(llvm::Intrinsic::aarch64_sve_smlalt, acc, a, b);
+	}
+
+	template <typename T0, typename T1, typename T2>
+	value_t<u32[4]> sve_umlalt(T0 acc, T1 a, T2 b)
+	{
+		return sve_mlal<u32[4]>(llvm::Intrinsic::aarch64_sve_umlalt, acc, a, b);
+	}
+
+	template <typename T1, typename T2, typename T = llvm_common_t<T1, T2>>
+	value_t<T> ushl(T1 a, T2 b)
+	{
+		value_t<T> result;
+
+		const auto data0 = a.eval(m_ir);
+		const auto data1 = b.eval(m_ir);
+
+		result.value = m_ir->CreateCall(get_intrinsic<T>(llvm::Intrinsic::aarch64_neon_ushl), {data0, data1});
+		return result;
+	}
+
+	template <typename T1, typename T2>
+	auto addp(T1 a, T2 b)
+	{
+		using T_vector = typename is_llvm_expr<T1>::type;
+		const auto data1 = a.eval(m_ir);
+		const auto data2 = b.eval(m_ir);
+
+		const auto func = get_intrinsic<T_vector>(llvm::Intrinsic::aarch64_neon_addp);
+
+		value_t<T_vector> result;
+		result.value = m_ir->CreateCall(func, {data1, data2});
+		return result;
+	}
+#endif
 
 	template <typename T1, typename T2>
 	value_t<u8[16]> vpermb(T1 a, T2 b)
@@ -3730,13 +4238,27 @@ public:
 	}
 
 	template <typename T1, typename T2, typename T3>
-	value_t<f32[4]> vfixupimmps(T1 a, T2 b, T3 c, u8 d, u8 e)
+	GNUC_X64_TARGET("avx512vl") value_t<f32[4]> vfixupimmps(T1 a, T2 b, T3 c, u8 d, u8 e)
 	{
 		value_t<f32[4]> result;
 
 		const auto data0 = a.eval(m_ir);
 		const auto data1 = b.eval(m_ir);
 		const auto data2 = c.eval(m_ir);
+		
+#ifdef ARCH_X64
+		const auto [a_is_const, a_data] = get_const_vector(data0, -1);
+		const auto [b_is_const, b_data] = get_const_vector(data1, -1);
+		const auto [c_is_const, c_data] = get_const_vector(data2, -1);
+
+		if (a_is_const && b_is_const && c_is_const)
+		{
+			const auto vfixup = _mm_mask_fixupimm_ps(a_data, e, b_data, c_data, 0); // flag reporting doesn't matter for constants
+			result.value = llvm::ConstantDataVector::get(m_context, llvm::ArrayRef(static_cast<v128>(vfixup)._f.m_data, 4));
+			return result;
+		}
+#endif
+		
 		const auto immediate = (llvm_const_int<u32>{d});
 		const auto imm32 = immediate.eval(m_ir);
 		const auto immediate2 = (llvm_const_int<u8>{e});
@@ -3756,7 +4278,8 @@ public:
 		return load_const(g, i, get_type<T>());
 	}
 
-	template <typename T, typename I> requires requires () { std::declval<I>().eval(std::declval<llvm::IRBuilder<>*>()); }
+	template <typename T, typename I>
+		requires requires(I& i, llvm::IRBuilder<>* ir) { i.eval(ir); }
 	value_t<T> load_const(llvm::GlobalVariable* g, I i)
 	{
 		value_t<T> result;
@@ -3776,10 +4299,55 @@ public:
 	template <typename T = v128>
 	llvm::Constant* make_const_vector(T, llvm::Type*, u32 = __builtin_LINE());
 
+	// IR is emitted in a single pass: phi nodes may still be missing their back-edge incoming
+	// values, so any known bits computeKnownBits derives through a phi are unsound for the
+	// final IR. Whether a phi is complete cannot be queried (the CFG edges from not-yet-emitted
+	// predecessors don't exist either), so reject every value whose bits may derive from a phi.
+	static bool is_known_bits_safe(llvm::Value* value)
+	{
+		llvm::SmallPtrSet<const llvm::Value*, 32> visited;
+		llvm::SmallVector<const llvm::Value*, 32> worklist{value};
+
+		while (!worklist.empty())
+		{
+			const llvm::Value* v = worklist.pop_back_val();
+
+			if (!visited.insert(v).second)
+			{
+				continue;
+			}
+
+			if (llvm::isa<llvm::PHINode>(v) || visited.size() > 256)
+			{
+				return false;
+			}
+
+			// Loads don't propagate operand bits; constants and arguments are leaves
+			if (auto i = llvm::dyn_cast<llvm::Instruction>(v); i && !llvm::isa<llvm::LoadInst>(i))
+			{
+				for (const llvm::Use& op : i->operands())
+				{
+					worklist.push_back(op.get());
+				}
+			}
+		}
+
+		return true;
+	}
+
+	llvm::KnownBits get_known_bits_fallback(llvm::Value* value);
+
 	template <typename T>
 	llvm::KnownBits get_known_bits(T a)
 	{
-		return llvm::computeKnownBits(a.eval(m_ir), m_module->getDataLayout());
+		llvm::Value* value = a.eval(m_ir);
+
+		if (!is_known_bits_safe(value))
+		{
+			return get_known_bits_fallback(value);
+		}
+
+		return llvm::computeKnownBits(value, m_module->getDataLayout());
 	}
 
 	template <typename T>
@@ -3787,10 +4355,32 @@ public:
 	{
 		return llvm::KnownBits::makeConstant(llvm::APInt(sizeof(T) * 8, u64(value)));
 	}
+	
+	template <unsigned depth = llvm::MaxAnalysisRecursionDepth, typename T>
+	llvm::KnownFPClass get_known_fp_class(T a, llvm::FPClassTest interested_classes)
+	{
+		static_assert(depth <= llvm::MaxAnalysisRecursionDepth, "Depth parameter can only decrease search. Default is max.");
+
+		const llvm::SimplifyQuery SQ(m_module->getDataLayout());
+		return llvm::computeKnownFPClass(a.eval(m_ir), interested_classes, SQ, llvm::MaxAnalysisRecursionDepth - depth);
+	}
 
 private:
 	// Custom intrinsic table
 	std::unordered_map<std::string_view, std::function<llvm::Value*(llvm::CallInst*)>> m_intrinsics;
+
+#ifdef ARCH_X64
+	// LLVM uses the same intrinsic despite different encodings
+	GNUC_X64_TARGET("avx512vnni,avx512vl") __m128i _mm_wrapper_dpbusd_avx512vnni(__m128i a, __m128i b, __m128i c)
+	{
+		return _mm_dpbusd_epi32(a, b, c);
+	}
+
+	GNUC_X64_TARGET("avxvnni") __m128i _mm_wrapper_dpbusd_avxvnni(__m128i a, __m128i b, __m128i c)
+	{
+		return _mm_dpbusd_avx_epi32(a, b, c);
+	}
+#endif
 
 public:
 	// Call custom intrinsic by name
@@ -3831,6 +4421,15 @@ public:
 		erase_stores({args.value...});
 	}
 
+	// Debug breakpoint
+	void debugtrap()
+	{
+		const auto _rty = llvm::Type::getVoidTy(m_context);
+		const auto type = llvm::FunctionType::get(_rty, {}, false);
+		const auto func = llvm::cast<llvm::Function>(m_ir->GetInsertBlock()->getParent()->getParent()->getOrInsertFunction("llvm.debugtrap", type).getCallee());
+		m_ir->CreateCall(func);
+	}
+
 	template <typename T, typename U>
 	static auto pshufb(T&& a, U&& b)
 	{
@@ -3868,6 +4467,131 @@ public:
 		});
 	}
 
+#ifdef ARCH_ARM64
+	template <typename T1, typename T2>
+	value_t<u8[16]> tbl(T1 a, T2 b)
+	{
+		value_t<u8[16]> result;
+		const auto data0 = a.eval(m_ir);
+		const auto index = b.eval(m_ir);
+		const auto zeros = llvm::ConstantAggregateZero::get(get_type<u8[16]>());
+
+		if (auto c = llvm::dyn_cast<llvm::Constant>(index))
+		{
+			v128 mask{};
+			const auto cv = llvm::dyn_cast<llvm::ConstantDataVector>(c);
+
+			if (cv)
+			{
+				for (u32 i = 0; i < 16; i++)
+				{
+					const u64 b_val = cv->getElementAsInteger(i);
+					mask._u8[i] = (b_val < 16) ? static_cast<u8>(b_val) : static_cast<u8>(16);
+				}
+			}
+
+			if (cv || llvm::isa<llvm::ConstantAggregateZero>(c))
+			{
+				result.value = llvm::ConstantDataVector::get(m_context, llvm::ArrayRef(reinterpret_cast<const u8*>(&mask), 16));
+				result.value = m_ir->CreateZExt(result.value, get_type<u32[16]>());
+				result.value = m_ir->CreateShuffleVector(data0, zeros, result.value);
+				return result;
+			}
+		}
+
+		result.value = m_ir->CreateCall(get_intrinsic<u8[16]>(llvm::Intrinsic::aarch64_neon_tbl1), { data0, index });
+		return result;
+	}
+
+	template <typename T1, typename T2, typename T3>
+	value_t<u8[16]> tbl2(T1 a, T2 b, T3 indices)
+	{
+		value_t<u8[16]> result;
+		const auto data0 = a.eval(m_ir);
+		const auto data1 = b.eval(m_ir);
+		const auto index = indices.eval(m_ir);
+
+		if (m_use_tbl2)
+		{
+			if (auto c = llvm::dyn_cast<llvm::Constant>(index))
+			{
+				v128 mask{};
+				v128 bitmask{};
+				const auto cv = llvm::dyn_cast<llvm::ConstantDataVector>(c);
+
+				if (cv)
+				{
+					for (u32 i = 0; i < 16; i++)
+					{
+						const u64 b_val = cv->getElementAsInteger(i);
+						mask._u8[i] = (b_val < 32) ? static_cast<u8>(b_val) : static_cast<u8>(0);
+						bitmask._u8[i] = (b_val < 32) ? static_cast<u8>(0xFF) : static_cast<u8>(0x00);
+					}
+				}
+				else if (llvm::isa<llvm::ConstantAggregateZero>(c))
+				{
+					bitmask = v128::from8p(0xFF);
+				}
+
+				if (cv || llvm::isa<llvm::ConstantAggregateZero>(c))
+				{
+					auto m_val = llvm::ConstantDataVector::get(m_context, llvm::ArrayRef(reinterpret_cast<const u8*>(&mask), 16));
+					auto m_ext = m_ir->CreateZExt(m_val, get_type<u32[16]>());
+					auto lookup = m_ir->CreateShuffleVector(data0, data1, m_ext);
+
+					auto z_mask = llvm::ConstantDataVector::get(m_context, llvm::ArrayRef(reinterpret_cast<const u8*>(&bitmask), 16));
+					result.value = m_ir->CreateAnd(lookup, z_mask);
+					return result;
+				}
+			}
+
+			result.value = m_ir->CreateCall(get_intrinsic<u8[16]>(llvm::Intrinsic::aarch64_neon_tbl2), { data0, data1, index });
+			return result;
+		}
+
+		const auto data0_lookup = m_ir->CreateCall(get_intrinsic<u8[16]>(llvm::Intrinsic::aarch64_neon_tbl1), { data0, index });
+		const auto data1_index = m_ir->CreateSub(index, llvm::ConstantInt::get(get_type<u8[16]>(), 16));
+		const auto data1_lookup = m_ir->CreateCall(get_intrinsic<u8[16]>(llvm::Intrinsic::aarch64_neon_tbl1), { data1, data1_index });
+
+		result.value = m_ir->CreateOr(data0_lookup, data1_lookup);
+		return result;
+	}
+
+	template <typename T1, typename T2, typename T3>
+	value_t<u8[16]> tbx(T1 fallback, T2 a, T3 indices)
+	{
+		value_t<u8[16]> result;
+		const auto v_fallback = fallback.eval(m_ir);
+		const auto data0 = a.eval(m_ir);
+		const auto index = indices.eval(m_ir);
+
+		result.value = m_ir->CreateCall(get_intrinsic<u8[16]>(llvm::Intrinsic::aarch64_neon_tbx1), { v_fallback, data0, index });
+		return result;
+	}
+
+	template <typename T1, typename T2, typename T3, typename T4>
+	value_t<u8[16]> tbx2(T1 fallback, T2 a, T3 b, T4 indices)
+	{
+		value_t<u8[16]> result;
+		const auto v_fallback = fallback.eval(m_ir);
+		const auto data0 = a.eval(m_ir);
+		const auto data1 = b.eval(m_ir);
+		const auto index = indices.eval(m_ir);
+
+		if (m_use_tbl2)
+		{
+			result.value = m_ir->CreateCall(get_intrinsic<u8[16]>(llvm::Intrinsic::aarch64_neon_tbx2), { v_fallback, data0, data1, index });
+			return result;
+		}
+
+		const auto first_lookup = m_ir->CreateCall(get_intrinsic<u8[16]>(llvm::Intrinsic::aarch64_neon_tbx1), { v_fallback, data0, index });
+		const auto data1_index = m_ir->CreateSub(index, llvm::ConstantInt::get(get_type<u8[16]>(), 16));
+
+		result.value = m_ir->CreateCall(get_intrinsic<u8[16]>(llvm::Intrinsic::aarch64_neon_tbx1), { first_lookup, data1, data1_index });
+		return result;
+	}
+#endif
+
 	// (m << 3) >= 0 ? a : b
 	template <typename T, typename U, typename V>
 	static auto select_by_bit4(T&& m, U&& a, V&& b)
@@ -3875,7 +4599,8 @@ public:
 		return llvm_calli<u8[16], T, U, V>{"any_select_by_bit4", {std::forward<T>(m), std::forward<U>(a), std::forward<V>(b)}};
 	}
 
-	template <typename T, typename = std::enable_if_t<std::is_same_v<llvm_common_t<T>, f32[4]>>>
+	template <typename T>
+		requires std::is_same_v<llvm_common_t<T>, f32[4]>
 	static auto fre(T&& a)
 	{
 #if defined(ARCH_X64)
@@ -3885,7 +4610,8 @@ public:
 #endif
 	}
 
-	template <typename T, typename = std::enable_if_t<std::is_same_v<llvm_common_t<T>, f32[4]>>>
+	template <typename T>
+		requires std::is_same_v<llvm_common_t<T>, f32[4]>
 	static auto frsqe(T&& a)
 	{
 #if defined(ARCH_X64)
@@ -3895,7 +4621,8 @@ public:
 #endif
 	}
 
-	template <typename T, typename U, typename = std::enable_if_t<std::is_same_v<llvm_common_t<T, U>, f32[4]>>>
+	template <typename T, typename U>
+		requires std::is_same_v<llvm_common_t<T, U>, f32[4]>
 	static auto fmax(T&& a, U&& b)
 	{
 #if defined(ARCH_X64)
@@ -3905,7 +4632,8 @@ public:
 #endif
 	}
 
-	template <typename T, typename U, typename = std::enable_if_t<std::is_same_v<llvm_common_t<T, U>, f32[4]>>>
+	template <typename T, typename U>
+		requires std::is_same_v<llvm_common_t<T, U>, f32[4]>
 	static auto fmin(T&& a, U&& b)
 	{
 #if defined(ARCH_X64)
@@ -3915,13 +4643,15 @@ public:
 #endif
 	}
 
-	template <typename T, typename U, typename = std::enable_if_t<std::is_same_v<llvm_common_t<T, U>, u8[16]>>>
+	template <typename T, typename U>
+		requires std::is_same_v<llvm_common_t<T, U>, u8[16]>
 	static auto vdbpsadbw(T&& a, U&& b, u8 c)
 	{
 		return llvm_calli<u16[8], T, U, llvm_const_int<u32>>{"llvm.x86.avx512.dbpsadbw.128", {std::forward<T>(a), std::forward<U>(b), llvm_const_int<u32>{c}}};
 	}
 
-	template <typename T, typename U, typename = std::enable_if_t<std::is_same_v<llvm_common_t<T, U>, f32[4]>>>
+	template <typename T, typename U>
+		requires std::is_same_v<llvm_common_t<T, U>, f32[4]>
 	static auto vrangeps(T&& a, U&& b, u8 c, u8 d)
 	{
 		return llvm_calli<f32[4], T, U, llvm_const_int<u32>, T, llvm_const_int<u8>>{"llvm.x86.avx512.mask.range.ps.128", {std::forward<T>(a), std::forward<U>(b), llvm_const_int<u32>{c}, std::forward<T>(a), llvm_const_int<u8>{d}}};
@@ -3930,7 +4660,7 @@ public:
 
 // Format llvm::SizeType
 template <>
-struct fmt_unveil<llvm::TypeSize, void>
+struct fmt_unveil<llvm::TypeSize>
 {
 	using type = usz;
 
@@ -3962,7 +4692,7 @@ llvm::CallInst* llvm_asm(
 	const std::string& constraints,
 	llvm::LLVMContext& context)
 {
-	llvm::ArrayRef<llvm::Type*> types_ref = std::nullopt;
+	llvm::ArrayRef<llvm::Type*> types_ref {};
 	std::vector<llvm::Type*> types;
 	types.reserve(args.size());
 

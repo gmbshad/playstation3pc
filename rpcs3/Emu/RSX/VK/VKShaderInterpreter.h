@@ -1,7 +1,17 @@
 #pragma once
-#include "VKProgramBuffer.h"
+#include "Emu/RSX/VK/VKProgramPipeline.h"
+#include "Emu/RSX/Program/ProgramStateCache.h"
+#include "Emu/RSX/VK/VKPipelineCompiler.h"
 #include "vkutils/descriptors.h"
 #include <unordered_map>
+
+class VKVertexProgram;
+class VKFragmentProgram;
+
+namespace rsx
+{
+	struct shader_loading_dialog;
+}
 
 namespace vk
 {
@@ -10,15 +20,10 @@ namespace vk
 
 	class shader_interpreter
 	{
-		glsl::shader m_vs;
-
-		std::vector<glsl::program_input> m_vs_inputs;
-		std::vector<glsl::program_input> m_fs_inputs;
+		using async_build_fn_callback = std::function<void(std::shared_ptr<glsl::program>&)>;
 
 		VkDevice m_device = VK_NULL_HANDLE;
-		VkDescriptorSetLayout m_shared_descriptor_layout = VK_NULL_HANDLE;
-		VkPipelineLayout m_shared_pipeline_layout = VK_NULL_HANDLE;
-		glsl::program* m_current_interpreter = nullptr;
+		VkPipelineCache m_driver_pipeline_cache = VK_NULL_HANDLE;
 
 		struct pipeline_key
 		{
@@ -39,34 +44,68 @@ namespace vk
 			}
 		};
 
-		std::unordered_map<pipeline_key, std::unique_ptr<glsl::program>, key_hasher> m_program_cache;
-		std::unordered_map<u64, std::unique_ptr<glsl::shader>> m_fs_cache;
-		vk::descriptor_pool m_descriptor_pool;
+		struct shader_cache_entry_t
+		{
+			std::shared_ptr<VKFragmentProgram> m_fs;
+			std::shared_ptr<VKVertexProgram> m_vs;
+		};
 
-		u32 m_vertex_instruction_start = 0;
-		u32 m_fragment_instruction_start = 0;
-		u32 m_fragment_textures_start = 0;
+		struct pipeline_info_ex_t
+		{
+			u32 vertex_instruction_location = 0;
+			u32 fragment_instruction_location = 0;
+			u32 fragment_textures_location = 0;
+		};
+
+		struct pipeline_cache_entry_t
+		{
+			u32 flags = 0;
+			std::shared_ptr<glsl::program> program;
+		};
+
+		std::unordered_map<pipeline_key, pipeline_cache_entry_t, key_hasher> m_program_cache;
+		std::unordered_map<u64, std::shared_ptr<VKVertexProgram>> m_vs_shader_cache;
+		std::unordered_map<u64, std::shared_ptr<VKFragmentProgram>> m_fs_shader_cache;
+		std::unordered_map<u64, pipeline_info_ex_t> m_pipeline_info_cache;
+
+		mutable shared_mutex m_program_cache_lock;
+		mutable shared_mutex m_vs_shader_cache_lock;
+		mutable shared_mutex m_fs_shader_cache_lock;
 
 		pipeline_key m_current_key{};
+		pipeline_info_ex_t m_current_pipeline_info_ex{};
+		std::shared_ptr<glsl::program> m_current_interpreter;
 
-		std::pair<VkDescriptorSetLayout, VkPipelineLayout> create_layout(VkDevice dev);
-		void create_descriptor_pools(const vk::render_device& dev);
+		std::shared_ptr<VKVertexProgram> build_vs(u64 compiler_opt);
+		std::shared_ptr<VKFragmentProgram> build_fs(u64 compiler_opt);
+		std::shared_ptr<glsl::program> link(const vk::pipeline_props& properties, u64 compiler_opt, bool async = false, async_build_fn_callback async_callback = {});
 
-		void build_vs();
-		glsl::shader* build_fs(u64 compiler_opt);
-		glsl::program* link(const vk::pipeline_props& properties, u64 compiler_opt);
+		u32 init(std::shared_ptr<VKVertexProgram>& vk_prog, u64 compiler_opt) const;
+		u32 init(std::shared_ptr<VKFragmentProgram>& vk_prog, u64 compiler_opt) const;
+
+		const pipeline_info_ex_t* get_pipeline_info_ex(u64 compiler_opt);
 
 	public:
 		void init(const vk::render_device& dev);
 		void destroy();
 
-		glsl::program* get(const vk::pipeline_props& properties, const program_hash_util::fragment_program_utils::fragment_program_metadata& metadata);
+		void preload(rsx::shader_loading_dialog* dlg);
+
+		glsl::program* get(
+			const vk::pipeline_props& properties,
+			const program_hash_util::fragment_program_utils::fragment_program_metadata& fp_metadata,
+			const program_hash_util::vertex_program_utils::vertex_program_metadata& vp_metadata,
+			u32 vp_ctrl,
+			u32 fp_ctrl);
+
+		// Retrieve the shader components that make up the current interpreter
+		std::pair<std::shared_ptr<VKVertexProgram>, std::shared_ptr<VKFragmentProgram>> get_shaders() const;
+
 		bool is_interpreter(const glsl::program* prog) const;
 
 		u32 get_vertex_instruction_location() const;
 		u32 get_fragment_instruction_location() const;
 
-		void update_fragment_textures(const std::array<VkDescriptorImageInfo, 68>& sampled_images, vk::descriptor_set &set);
-		VkDescriptorSet allocate_descriptor_set();
+		void update_fragment_textures(const std::array<VkDescriptorImageInfoEx, 68>& sampled_images);
 	};
 }

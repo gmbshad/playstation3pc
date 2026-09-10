@@ -1,5 +1,6 @@
 #include "stdafx.h"
 
+#include "../../glutils/fbo.h"
 #include "../fsr_pass.h"
 
 #if defined(__GNUC__)
@@ -24,6 +25,8 @@
 #elif defined(__clang__)
 #pragma clang diagnostic pop
 #endif
+
+#include "Emu/system_config.h"
 
 namespace gl
 {
@@ -151,7 +154,7 @@ namespace gl
 		void rcas_pass::configure()
 		{
 			// 0 is actually the sharpest with 2 being the chosen limit. Each progressive unit 'halves' the sharpening intensity.
-			auto cas_attenuation = 2.f - (g_cfg.video.vk.rcas_sharpening_intensity / 50.f);
+			auto cas_attenuation = 2.f - (g_cfg.video.rcas_sharpening_intensity / 50.f);
 			FsrRcasCon(&m_constants_buf[0], cas_attenuation);
 		}
 	}
@@ -177,7 +180,7 @@ namespace gl
 		{
 			return std::make_unique<gl::viewable_image>(
 				GL_TEXTURE_2D,
-				output_w, output_h, 1, 1,
+				output_w, output_h, 1, 1, 1,
 				GL_RGBA8, RSX_FORMAT_CLASS_COLOR);
 		};
 

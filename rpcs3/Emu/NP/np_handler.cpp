@@ -1,17 +1,18 @@
 #include "stdafx.h"
 #include "Emu/system_config.h"
 #include "Emu/NP/np_handler.h"
-#include "Emu/Cell/PPUModule.h"
+#include "Emu/Cell/PPUCallback.h"
 #include "Emu/Cell/Modules/sceNp.h"
 #include "Emu/Cell/Modules/sceNp2.h"
 #include "Emu/Cell/Modules/cellNetCtl.h"
+#include "Emu/Cell/timers.hpp"
 #include "Utilities/StrUtil.h"
 #include "Emu/IdManager.h"
-#include "Emu/NP/np_structs_extra.h"
 #include "Emu/System.h"
 #include "Emu/NP/rpcn_config.h"
 #include "Emu/NP/np_contexts.h"
 #include "Emu/NP/np_helpers.h"
+#include "Emu/NP/signaling_handler.h"
 #include "Emu/RSX/Overlays/overlay_message.h"
 #include "Emu/Cell/lv2/sys_net/network_context.h"
 #include "Emu/Cell/lv2/sys_net/sys_net_helpers.h"
@@ -22,8 +23,8 @@
 #include <iphlpapi.h>
 #else
 #ifdef __clang__
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wold-style-cast"
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wold-style-cast"
 #endif
 #include <sys/socket.h>
 #include <sys/ioctl.h>
@@ -33,7 +34,7 @@
 #include <netdb.h>
 #include <unistd.h>
 #ifdef __clang__
-#pragma GCC diagnostic pop
+#pragma clang diagnostic pop
 #endif
 #endif
 
@@ -42,7 +43,6 @@
 #include <net/if_dl.h>
 #endif
 
-#include "util/asm.hpp"
 #include "util/yaml.hpp"
 
 #include <span>
@@ -59,11 +59,7 @@ namespace np
 {
 	std::string get_players_history_path()
 	{
-#ifdef _WIN32
-		return fs::get_config_dir() + "config/players_history.yml";
-#else
-		return fs::get_config_dir() + "players_history.yml";
-#endif
+		return fs::get_config_dir(true) + "players_history.yml";
 	}
 
 	std::map<std::string, player_history> load_players_history()
@@ -115,12 +111,12 @@ namespace np
 	}
 
 	ticket::ticket(std::vector<u8>&& raw_data)
-		: raw_data(raw_data)
+		: raw_data(std::move(raw_data))
 	{
 		parse();
 	}
 
-	std::size_t ticket::size() const
+	usz ticket::size() const
 	{
 		return raw_data.size();
 	}
@@ -243,7 +239,26 @@ namespace np
 		return true;
 	}
 
-	std::optional<ticket_data> ticket::parse_node(std::size_t index) const
+	std::string ticket::get_service_id() const
+	{
+		if (!parse_success)
+		{
+			return "";
+		}
+
+		const auto& node = nodes[0].data.data_nodes[8];
+		if (node.len != SCE_NP_SERVICE_ID_SIZE)
+		{
+			return "";
+		}
+
+		// Trim null characters
+		const auto& vec = node.data.data_vec;
+		const auto it = std::find(vec.begin(), vec.end(), 0);
+		return std::string(vec.begin(), it);
+	}
+
+	std::optional<ticket_data> ticket::parse_node(usz index) const
 	{
 		if ((index + MIN_TICKET_DATA_SIZE) > size())
 		{
@@ -253,11 +268,11 @@ namespace np
 
 		ticket_data tdata{};
 		const auto* ptr = data() + index;
-		tdata.id = read_from_ptr<be_t<u16>>(ptr);
-		tdata.len = read_from_ptr<be_t<u16>>(ptr + 2);
-		const auto* data_ptr = data() + index + 4;
+		tdata.id = read_from_ptr_unsafe<be_t<u16>>(ptr);
+		tdata.len = read_from_ptr_unsafe<be_t<u16>>(ptr, 2);
+		const usz data_offset = index + 4;
 
-		auto check_size = [&](std::size_t expected) -> bool
+		auto check_size = [&](usz expected) -> bool
 		{
 			if ((index + MIN_TICKET_DATA_SIZE + expected) > size())
 			{
@@ -279,7 +294,7 @@ namespace np
 			{
 				return std::nullopt;
 			}
-			tdata.data.data_u32 = read_from_ptr<be_t<u32>>(data_ptr);
+			tdata.data.data_u32 = read_from_ptr_unsafe<be_t<u32>>(data(), data_offset);
 			break;
 		case 2:
 		case 7:
@@ -287,7 +302,7 @@ namespace np
 			{
 				return std::nullopt;
 			}
-			tdata.data.data_u64 = read_from_ptr<be_t<u64>>(data_ptr);
+			tdata.data.data_u64 = read_from_ptr_unsafe<be_t<u64>>(data(), data_offset);
 			break;
 		case 4:
 		case 8:
@@ -296,7 +311,7 @@ namespace np
 				return std::nullopt;
 			}
 			tdata.data.data_vec = std::vector<u8>(tdata.len);
-			memcpy(tdata.data.data_vec.data(), data_ptr, tdata.len);
+			memcpy(tdata.data.data_vec.data(), data() + data_offset, tdata.len);
 			break;
 		default:
 			if ((tdata.id & 0x3000) == 0x3000)
@@ -306,7 +321,7 @@ namespace np
 					return std::nullopt;
 				}
 
-				std::size_t sub_index = 0;
+				usz sub_index = 0;
 				tdata.data.data_nodes = {};
 				while (sub_index < tdata.len)
 				{
@@ -337,14 +352,14 @@ namespace np
 			return;
 		}
 
-		version = read_from_ptr<be_t<u32>>(data());
+		version = read_from_ptr_unsafe<be_t<u32>>(data());
 		if (version != 0x21010000)
 		{
 			ticket_log.error("Invalid version: 0x%08x", version);
 			return;
 		}
 
-		u32 given_size = read_from_ptr<be_t<u32>>(data() + 4);
+		u32 given_size = read_from_ptr_unsafe<be_t<u32>>(data(), 4);
 		if ((given_size + 8) != size())
 		{
 			ticket_log.error("Size mismatch (gs: %d vs s: %d)", given_size, size());
@@ -372,7 +387,7 @@ namespace np
 			return;
 		}
 
-		if (nodes[0].id != 0x3000 && nodes[1].id != 0x3002)
+		if (nodes[0].id != 0x3000 || nodes[1].id != 0x3002)
 		{
 			ticket_log.error("The 2 blobs ids are incorrect");
 			return;
@@ -416,7 +431,7 @@ namespace np
 			nc.bind_sce_np_port();
 
 			std::lock_guard lock(mutex_rpcn);
-			rpcn = rpcn::rpcn_client::get_instance();
+			rpcn = rpcn::rpcn_client::get_instance(bind_ip);
 		}
 	}
 
@@ -459,19 +474,10 @@ namespace np
 			}
 
 			// Convert bind address
-			conv = {};
-			if (!inet_pton(AF_INET, g_cfg.net.bind_address.to_string().c_str(), &conv))
-			{
-				// Do not set to disconnected on invalid IP just error and continue using default (0.0.0.0)
-				nph_log.error("Provided IP(%s) address for bind is invalid!", g_cfg.net.bind_address.to_string());
-			}
-			else
-			{
-				bind_ip = conv.s_addr;
+			bind_ip = resolve_binding_ip();
 
-				if (bind_ip)
-					local_ip_addr = bind_ip;
-			}
+			if (bind_ip)
+				local_ip_addr = bind_ip;
 
 			if (g_cfg.net.upnp_enabled)
 				upnp.upnp_enable();
@@ -606,6 +612,15 @@ namespace np
 
 	bool np_handler::discover_ether_address()
 	{
+		if (g_cfg.net.derive_mac_from_psid)
+		{
+			const u128 psid = g_cfg.sys.console_psid;
+			memcpy(ether_address.data(), &psid, 6);
+			ether_address[0] &= 0xFE;
+			ether_address[0] |= 0x02;
+			return true;
+		}
+
 #if defined(__FreeBSD__) || defined(__APPLE__)
 		ifaddrs* ifap;
 
@@ -659,7 +674,7 @@ namespace np
 
 		for (; it != end; ++it)
 		{
-			strcpy(ifr.ifr_name, it->ifr_name);
+			strcpy_trunc(ifr.ifr_name, it->ifr_name);
 			if (ioctl(sock, SIOCGIFFLAGS, &ifr) == 0)
 			{
 				if (!(ifr.ifr_flags & IFF_LOOPBACK))
@@ -792,7 +807,14 @@ namespace np
 				break;
 
 			std::lock_guard lock(mutex_rpcn);
-			rpcn = rpcn::rpcn_client::get_instance();
+
+			bool was_already_started = true;
+
+			if (!rpcn)
+			{
+				rpcn = rpcn::rpcn_client::get_instance(bind_ip);
+				was_already_started = false;
+			}
 
 			// Make sure we're connected
 
@@ -812,7 +834,8 @@ namespace np
 				return;
 			}
 
-			rsx::overlays::queue_message(localized_string_id::RPCN_SUCCESS_LOGGED_ON);
+			if (!was_already_started)
+				rsx::overlays::queue_message(localized_string_id::RPCN_SUCCESS_LOGGED_ON);
 
 			string_to_online_name(rpcn->get_online_name(), online_name);
 			string_to_avatar_url(rpcn->get_avatar_url(), avatar_url);
@@ -840,11 +863,24 @@ namespace np
 	{
 		np_memory.release();
 
-		if (g_cfg.net.psn_status == np_psn_status::psn_rpcn)
+		manager_cb = {};
+		manager_cb_arg = {};
+		basic_handler_registered = false;
+		room_event_cb = {};
+		room_event_cb_ctx = 0;
+		room_event_cb_arg = {};
+		room_msg_cb = {};
+		room_msg_cb_ctx = 0;
+		room_msg_cb_arg = {};
+
+		presence_self.pr_status = {};
+		presence_self.pr_data = {};
+		presence_self.advertised = false;
+
+		if (is_connected && is_psn_active && rpcn)
 		{
-			rpcn_log.notice("Disconnecting from RPCN!");
-			std::lock_guard lock(mutex_rpcn);
-			rpcn.reset();
+			rpcn_log.notice("Setting RPCN state to disconnected!");
+			rpcn->reset_state();
 		}
 	}
 
@@ -858,10 +894,13 @@ namespace np
 		auto& data = ::at32(match2_req_results, event_key);
 		data.apply_relocations(dest_addr);
 
-		vm::ptr<void> dest = vm::cast(dest_addr);
+		const u32 size_copied = std::min(size, data.size());
 
-		u32 size_copied = std::min(size, data.size());
-		memcpy(dest.get_ptr(), data.data(), size_copied);
+		if (dest_addr && size_copied)
+		{
+			vm::ptr<void> dest = vm::cast(dest_addr);
+			memcpy(dest.get_ptr(), data.data(), size_copied);
+		}
 
 		np_memory.free(data.addr());
 		match2_req_results.erase(event_key);
@@ -994,7 +1033,7 @@ namespace np
 			}
 		}
 
-		nph_log.notice("basic_event: event:%d, from:%s(%s), size:%d", *event, static_cast<char*>(from->userId.handle.data), static_cast<char*>(from->name.data), *size);
+		nph_log.notice("basic_event: event:%d, from:%s(%s), size:%d", *event, np::npid_to_string(from->userId), static_cast<char*>(from->name.data), *size);
 
 		return CELL_OK;
 	}
@@ -1006,6 +1045,8 @@ namespace np
 
 	void np_handler::set_message_selected(SceNpBasicAttachmentDataId id, u64 msg_id)
 	{
+		std::lock_guard lock(m_mutex_selected_messages);
+
 		switch (id)
 		{
 		case SCE_NP_BASIC_SELECTED_INVITATION_DATA:
@@ -1021,6 +1062,8 @@ namespace np
 
 	std::optional<shared_ptr<std::pair<std::string, message_data>>> np_handler::get_message_selected(SceNpBasicAttachmentDataId id)
 	{
+		std::lock_guard lock(m_mutex_selected_messages);
+
 		switch (id)
 		{
 		case SCE_NP_BASIC_SELECTED_INVITATION_DATA:
@@ -1040,6 +1083,8 @@ namespace np
 
 	void np_handler::clear_message_selected(SceNpBasicAttachmentDataId id)
 	{
+		std::lock_guard lock(m_mutex_selected_messages);
+
 		switch (id)
 		{
 		case SCE_NP_BASIC_SELECTED_INVITATION_DATA:
@@ -1055,7 +1100,33 @@ namespace np
 
 	void np_handler::send_message(const message_data& msg_data, const std::set<std::string>& npids)
 	{
+		rpcn_log.notice("Sending message to \"%s\":", fmt::merge(npids, "\",\""));
+		msg_data.print();
+
 		get_rpcn()->send_message(msg_data, npids);
+	}
+
+	bool np_handler::select_invitation(u64 msg_id)
+	{
+		const auto message = get_message(msg_id);
+
+		if (!message || message.value()->second.mainType != SCE_NP_BASIC_MESSAGE_MAIN_TYPE_INVITE)
+		{
+			rpcn_log.error("Cannot select invalid invitation: msg_id=%d", msg_id);
+			return false;
+		}
+
+		set_message_selected(SCE_NP_BASIC_SELECTED_INVITATION_DATA, msg_id);
+
+		if (sysutil_send_system_cmd(CELL_SYSUTIL_NP_INVITATION_SELECTED, 0) <= 0)
+		{
+			clear_message_selected(SCE_NP_BASIC_SELECTED_INVITATION_DATA);
+			rpcn_log.error("Failed to notify the game about selected invitation: msg_id=%d", msg_id);
+			return false;
+		}
+
+		get_rpcn()->mark_message_used(msg_id);
+		return true;
 	}
 
 	void np_handler::operator()()
@@ -1077,61 +1148,64 @@ namespace np
 				auto replies = rpcn->get_replies();
 				for (auto& reply : replies)
 				{
-					const u16 command     = reply.second.first;
+					const rpcn::CommandType command = static_cast<rpcn::CommandType>(reply.second.first);
 					const u32 req_id      = reply.first;
 					std::vector<u8>& data = reply.second.second;
 
 					// Every reply should at least contain a return value/error code
 					ensure(data.size() >= 1);
+					const auto error = static_cast<rpcn::ErrorType>(data[0]);
+					vec_stream reply_data(data, 1);
 
 					switch (command)
 					{
-					case rpcn::CommandType::GetWorldList: reply_get_world_list(req_id, data); break;
-					case rpcn::CommandType::CreateRoom: reply_create_join_room(req_id, data); break;
-					case rpcn::CommandType::JoinRoom: reply_join_room(req_id, data); break;
-					case rpcn::CommandType::LeaveRoom: reply_leave_room(req_id, data); break;
-					case rpcn::CommandType::SearchRoom: reply_search_room(req_id, data); break;
-					case rpcn::CommandType::GetRoomDataExternalList: reply_get_roomdata_external_list(req_id, data); break;
-					case rpcn::CommandType::SetRoomDataExternal: reply_set_roomdata_external(req_id, data); break;
-					case rpcn::CommandType::GetRoomDataInternal: reply_get_roomdata_internal(req_id, data); break;
-					case rpcn::CommandType::SetRoomDataInternal: reply_set_roomdata_internal(req_id, data); break;
-					case rpcn::CommandType::GetRoomMemberDataInternal: reply_get_roommemberdata_internal(req_id, data); break;
-					case rpcn::CommandType::SetRoomMemberDataInternal: reply_set_roommemberdata_internal(req_id, data); break;
-					case rpcn::CommandType::SetUserInfo: reply_set_userinfo(req_id, data); break;
-					case rpcn::CommandType::PingRoomOwner: reply_get_ping_info(req_id, data); break;
-					case rpcn::CommandType::SendRoomMessage: reply_send_room_message(req_id, data); break;
-					case rpcn::CommandType::RequestSignalingInfos: reply_req_sign_infos(req_id, data); break;
-					case rpcn::CommandType::RequestTicket: reply_req_ticket(req_id, data); break;
-					case rpcn::CommandType::GetBoardInfos: reply_get_board_infos(req_id, data); break;
-					case rpcn::CommandType::RecordScore: reply_record_score(req_id, data); break;
-					case rpcn::CommandType::RecordScoreData: reply_record_score_data(req_id, data); break;
-					case rpcn::CommandType::GetScoreData: reply_get_score_data(req_id, data); break;
-					case rpcn::CommandType::GetScoreRange: reply_get_score_range(req_id, data); break;
-					case rpcn::CommandType::GetScoreFriends: reply_get_score_friends(req_id, data); break;
-					case rpcn::CommandType::GetScoreNpid: reply_get_score_npid(req_id, data); break;
-					case rpcn::CommandType::TusSetMultiSlotVariable: reply_tus_set_multislot_variable(req_id, data); break;
-					case rpcn::CommandType::TusGetMultiSlotVariable: reply_tus_get_multislot_variable(req_id, data); break;
-					case rpcn::CommandType::TusGetMultiUserVariable: reply_tus_get_multiuser_variable(req_id, data); break;
-					case rpcn::CommandType::TusGetFriendsVariable: reply_tus_get_friends_variable(req_id, data); break;
-					case rpcn::CommandType::TusAddAndGetVariable: reply_tus_add_and_get_variable(req_id, data); break;
-					case rpcn::CommandType::TusTryAndSetVariable: reply_tus_try_and_set_variable(req_id, data); break;
-					case rpcn::CommandType::TusDeleteMultiSlotVariable: reply_tus_delete_multislot_variable(req_id, data); break;
-					case rpcn::CommandType::TusSetData: reply_tus_set_data(req_id, data); break;
-					case rpcn::CommandType::TusGetData: reply_tus_get_data(req_id, data); break;
-					case rpcn::CommandType::TusGetMultiSlotDataStatus: reply_tus_get_multislot_data_status(req_id, data); break;
-					case rpcn::CommandType::TusGetMultiUserDataStatus: reply_tus_get_multiuser_data_status(req_id, data); break;
-					case rpcn::CommandType::TusGetFriendsDataStatus: reply_tus_get_friends_data_status(req_id, data); break;
-					case rpcn::CommandType::TusDeleteMultiSlotData: reply_tus_delete_multislot_data(req_id, data); break;
-					case rpcn::CommandType::CreateRoomGUI: reply_create_room_gui(req_id, data); break;
-					case rpcn::CommandType::JoinRoomGUI: reply_join_room_gui(req_id, data); break;
-					case rpcn::CommandType::LeaveRoomGUI: reply_leave_room_gui(req_id, data); break;
-					case rpcn::CommandType::GetRoomListGUI: reply_get_room_list_gui(req_id, data); break;
-					case rpcn::CommandType::SetRoomSearchFlagGUI: reply_set_room_search_flag_gui(req_id, data); break;
-					case rpcn::CommandType::GetRoomSearchFlagGUI: reply_get_room_search_flag_gui(req_id, data); break;
-					case rpcn::CommandType::SetRoomInfoGUI: reply_set_room_info_gui(req_id, data); break;
-					case rpcn::CommandType::GetRoomInfoGUI: reply_get_room_info_gui(req_id, data); break;
-					case rpcn::CommandType::QuickMatchGUI: reply_quickmatch_gui(req_id, data); break;
-					case rpcn::CommandType::SearchJoinRoomGUI: reply_searchjoin_gui(req_id, data); break;
+					case rpcn::CommandType::GetWorldList: reply_get_world_list(req_id, error, reply_data); break;
+					case rpcn::CommandType::CreateRoom: reply_create_join_room(req_id, error, reply_data); break;
+					case rpcn::CommandType::JoinRoom: reply_join_room(req_id, error, reply_data); break;
+					case rpcn::CommandType::LeaveRoom: reply_leave_room(req_id, error, reply_data); break;
+					case rpcn::CommandType::SearchRoom: reply_search_room(req_id, error, reply_data); break;
+					case rpcn::CommandType::GetRoomDataExternalList: reply_get_roomdata_external_list(req_id, error, reply_data); break;
+					case rpcn::CommandType::GetRoomMemberDataExternalList: reply_get_room_member_data_external_list(req_id, error, reply_data); break;
+					case rpcn::CommandType::SetRoomDataExternal: reply_set_roomdata_external(req_id, error); break;
+					case rpcn::CommandType::GetRoomDataInternal: reply_get_roomdata_internal(req_id, error, reply_data); break;
+					case rpcn::CommandType::SetRoomDataInternal: reply_set_roomdata_internal(req_id, error); break;
+					case rpcn::CommandType::GetRoomMemberDataInternal: reply_get_roommemberdata_internal(req_id, error, reply_data); break;
+					case rpcn::CommandType::SetRoomMemberDataInternal: reply_set_roommemberdata_internal(req_id, error); break;
+					case rpcn::CommandType::SetUserInfo: reply_set_userinfo(req_id, error); break;
+					case rpcn::CommandType::PingRoomOwner: reply_get_ping_info(req_id, error, reply_data); break;
+					case rpcn::CommandType::SendRoomMessage: reply_send_room_message(req_id, error); break;
+					case rpcn::CommandType::RequestSignalingInfos: reply_req_sign_infos(req_id, error, reply_data); break;
+					case rpcn::CommandType::RequestTicket: reply_req_ticket(req_id, error, reply_data); break;
+					case rpcn::CommandType::GetBoardInfos: reply_get_board_infos(req_id, error, reply_data); break;
+					case rpcn::CommandType::RecordScore: reply_record_score(req_id, error, reply_data); break;
+					case rpcn::CommandType::RecordScoreData: reply_record_score_data(req_id, error); break;
+					case rpcn::CommandType::GetScoreData: reply_get_score_data(req_id, error, reply_data); break;
+					case rpcn::CommandType::GetScoreRange: reply_get_score_range(req_id, error, reply_data); break;
+					case rpcn::CommandType::GetScoreFriends: reply_get_score_friends(req_id, error, reply_data); break;
+					case rpcn::CommandType::GetScoreNpid: reply_get_score_npid(req_id, error, reply_data); break;
+					case rpcn::CommandType::TusSetMultiSlotVariable: reply_tus_set_multislot_variable(req_id, error); break;
+					case rpcn::CommandType::TusGetMultiSlotVariable: reply_tus_get_multislot_variable(req_id, error, reply_data); break;
+					case rpcn::CommandType::TusGetMultiUserVariable: reply_tus_get_multiuser_variable(req_id, error, reply_data); break;
+					case rpcn::CommandType::TusGetFriendsVariable: reply_tus_get_friends_variable(req_id, error, reply_data); break;
+					case rpcn::CommandType::TusAddAndGetVariable: reply_tus_add_and_get_variable(req_id, error, reply_data); break;
+					case rpcn::CommandType::TusTryAndSetVariable: reply_tus_try_and_set_variable(req_id, error, reply_data); break;
+					case rpcn::CommandType::TusDeleteMultiSlotVariable: reply_tus_delete_multislot_variable(req_id, error); break;
+					case rpcn::CommandType::TusSetData: reply_tus_set_data(req_id, error); break;
+					case rpcn::CommandType::TusGetData: reply_tus_get_data(req_id, error, reply_data); break;
+					case rpcn::CommandType::TusGetMultiSlotDataStatus: reply_tus_get_multislot_data_status(req_id, error, reply_data); break;
+					case rpcn::CommandType::TusGetMultiUserDataStatus: reply_tus_get_multiuser_data_status(req_id, error, reply_data); break;
+					case rpcn::CommandType::TusGetFriendsDataStatus: reply_tus_get_friends_data_status(req_id, error, reply_data); break;
+					case rpcn::CommandType::TusDeleteMultiSlotData: reply_tus_delete_multislot_data(req_id, error); break;
+					case rpcn::CommandType::CreateRoomGUI: reply_create_room_gui(req_id, error, reply_data); break;
+					case rpcn::CommandType::JoinRoomGUI: reply_join_room_gui(req_id, error, reply_data); break;
+					case rpcn::CommandType::LeaveRoomGUI: reply_leave_room_gui(req_id, error, reply_data); break;
+					case rpcn::CommandType::GetRoomListGUI: reply_get_room_list_gui(req_id, error, reply_data); break;
+					case rpcn::CommandType::SetRoomSearchFlagGUI: reply_set_room_search_flag_gui(req_id, error); break;
+					case rpcn::CommandType::GetRoomSearchFlagGUI: reply_get_room_search_flag_gui(req_id, error, reply_data); break;
+					case rpcn::CommandType::SetRoomInfoGUI: reply_set_room_info_gui(req_id, error); break;
+					case rpcn::CommandType::GetRoomInfoGUI: reply_get_room_info_gui(req_id, error, reply_data); break;
+					case rpcn::CommandType::QuickMatchGUI: reply_quickmatch_gui(req_id, error, reply_data); break;
+					case rpcn::CommandType::SearchJoinRoomGUI: reply_searchjoin_gui(req_id, error, reply_data); break;
 					default: fmt::throw_exception("Unknown reply(%d) received!", command); break;
 					}
 				}
@@ -1139,22 +1213,23 @@ namespace np
 				auto notifications = rpcn->get_notifications();
 				for (auto& notif : notifications)
 				{
+					vec_stream noti_data(notif.second);
+
 					switch (notif.first)
 					{
-					case rpcn::NotificationType::UserJoinedRoom: notif_user_joined_room(notif.second); break;
-					case rpcn::NotificationType::UserLeftRoom: notif_user_left_room(notif.second); break;
-					case rpcn::NotificationType::RoomDestroyed: notif_room_destroyed(notif.second); break;
-					case rpcn::NotificationType::UpdatedRoomDataInternal: notif_updated_room_data_internal(notif.second); break;
-					case rpcn::NotificationType::UpdatedRoomMemberDataInternal: notif_updated_room_member_data_internal(notif.second); break;
-					case rpcn::NotificationType::SignalP2PConnect: notif_p2p_connect(notif.second); break;
-					case rpcn::NotificationType::RoomMessageReceived: notif_room_message_received(notif.second); break;
-					case rpcn::NotificationType::SignalingInfo: notif_signaling_info(notif.second); break;
-					case rpcn::NotificationType::MemberJoinedRoomGUI: notif_member_joined_room_gui(notif.second); break;
-					case rpcn::NotificationType::MemberLeftRoomGUI: notif_member_left_room_gui(notif.second); break;
-					case rpcn::NotificationType::RoomDisappearedGUI: notif_room_disappeared_gui(notif.second); break;
-					case rpcn::NotificationType::RoomOwnerChangedGUI: notif_room_owner_changed_gui(notif.second); break;
-					case rpcn::NotificationType::UserKickedGUI: notif_user_kicked_gui(notif.second); break;
-					case rpcn::NotificationType::QuickMatchCompleteGUI: notif_quickmatch_complete_gui(notif.second); break;
+					case rpcn::NotificationType::UserJoinedRoom: notif_user_joined_room(noti_data); break;
+					case rpcn::NotificationType::UserLeftRoom: notif_user_left_room(noti_data); break;
+					case rpcn::NotificationType::RoomDestroyed: notif_room_destroyed(noti_data); break;
+					case rpcn::NotificationType::UpdatedRoomDataInternal: notif_updated_room_data_internal(noti_data); break;
+					case rpcn::NotificationType::UpdatedRoomMemberDataInternal: notif_updated_room_member_data_internal(noti_data); break;
+					case rpcn::NotificationType::RoomMessageReceived: notif_room_message_received(noti_data); break;
+					case rpcn::NotificationType::SignalingHelper: notif_signaling_helper(noti_data); break;
+					case rpcn::NotificationType::MemberJoinedRoomGUI: notif_member_joined_room_gui(noti_data); break;
+					case rpcn::NotificationType::MemberLeftRoomGUI: notif_member_left_room_gui(noti_data); break;
+					case rpcn::NotificationType::RoomDisappearedGUI: notif_room_disappeared_gui(noti_data); break;
+					case rpcn::NotificationType::RoomOwnerChangedGUI: notif_room_owner_changed_gui(noti_data); break;
+					case rpcn::NotificationType::UserKickedGUI: notif_user_kicked_gui(noti_data); break;
+					case rpcn::NotificationType::QuickMatchCompleteGUI: notif_quickmatch_complete_gui(noti_data); break;
 					default: fmt::throw_exception("Unknown notification(%d) received!", notif.first); break;
 					}
 				}
@@ -1191,16 +1266,22 @@ namespace np
 				}
 
 				auto messages = rpcn->get_new_messages();
-				if (basic_handler_registered)
+
+				for (const auto msg_id : messages)
 				{
-					for (const auto msg_id : messages)
+					const auto opt_msg = rpcn->get_message(msg_id);
+
+					if (!opt_msg)
 					{
-						const auto opt_msg = rpcn->get_message(msg_id);
-						if (!opt_msg)
-						{
-							continue;
-						}
-						const auto& msg = opt_msg.value();
+						continue;
+					}
+
+					const auto& msg = opt_msg.value();
+					const localized_string_id loc_id = (msg->second.mainType == SCE_NP_BASIC_MESSAGE_MAIN_TYPE_INVITE) ? localized_string_id::CELL_NP_MESSAGE_INVITE_RECEIVED : localized_string_id::CELL_NP_MESSAGE_OTHER_RECEIVED;
+					rsx::overlays::queue_message(get_localized_string(loc_id, msg->first.c_str()), 6'000'000);
+
+					if (basic_handler_registered)
+					{
 						if (strncmp(msg->second.commId.data, basic_handler.context.data, sizeof(basic_handler.context.data) - 1) == 0)
 						{
 							u32 event;
@@ -1251,7 +1332,7 @@ namespace np
 		}
 	}
 
-	bool np_handler::error_and_disconnect(const std::string& error_msg)
+	bool np_handler::error_and_disconnect(std::string_view error_msg)
 	{
 		rpcn_log.error("%s", error_msg);
 		rpcn.reset();
@@ -1259,19 +1340,20 @@ namespace np
 		return false;
 	}
 
-	u32 np_handler::generate_callback_info(SceNpMatching2ContextId ctx_id, vm::cptr<SceNpMatching2RequestOptParam> optParam, SceNpMatching2Event event_type)
+	u32 np_handler::generate_callback_info(SceNpMatching2ContextId ctx_id, vm::cptr<SceNpMatching2RequestOptParam> optParam, SceNpMatching2Event event_type, bool abortable)
 	{
-		callback_info ret;
-
 		const auto ctx = get_match2_context(ctx_id);
 		ensure(ctx);
 
 		const u32 req_id = get_req_id(optParam ? optParam->appReqId : ctx->default_match2_optparam.appReqId);
 
-		ret.ctx_id = ctx_id;
-		ret.cb_arg = (optParam && optParam->cbFuncArg) ? optParam->cbFuncArg : ctx->default_match2_optparam.cbFuncArg;
-		ret.cb     = (optParam && optParam->cbFunc) ? optParam->cbFunc : ctx->default_match2_optparam.cbFunc;
-		ret.event_type = event_type;
+		callback_info ret{
+			.ctx_id = ctx_id,
+			.cb = (optParam && optParam->cbFunc) ? optParam->cbFunc : ctx->default_match2_optparam.cbFunc,
+			.cb_arg = (optParam && optParam->cbFuncArg) ? optParam->cbFuncArg : ctx->default_match2_optparam.cbFuncArg,
+			.event_type = event_type,
+			.abortable = abortable,
+		};
 
 		nph_log.trace("Callback used is 0x%x with req_id %d", ret.cb, req_id);
 
@@ -1296,16 +1378,22 @@ namespace np
 		return cb_info;
 	}
 
-	bool np_handler::abort_request(u32 req_id)
+	error_code np_handler::abort_request(u32 req_id)
 	{
-		auto cb_info_opt = take_pending_request(req_id);
+		std::lock_guard lock(mutex_pending_requests);
 
-		if (!cb_info_opt)
-			return false;
+		if (!pending_requests.contains(req_id))
+			return SCE_NP_MATCHING2_ERROR_REQUEST_NOT_FOUND;
 
-		cb_info_opt->queue_callback(req_id, 0, SCE_NP_MATCHING2_ERROR_ABORTED, 0);
+		if (!::at32(pending_requests, req_id).abortable)
+			return SCE_NP_MATCHING2_ERROR_CANNOT_ABORT;
 
-		return true;
+		const auto cb_info = std::move(::at32(pending_requests, req_id));
+		pending_requests.erase(req_id);
+
+		cb_info.queue_callback(req_id, 0, SCE_NP_MATCHING2_ERROR_ABORTED, 0);
+
+		return CELL_OK;
 	}
 
 	event_data& np_handler::allocate_req_result(u32 event_key, u32 max_size, u32 initial_size)
@@ -1317,7 +1405,7 @@ namespace np
 
 	player_history& np_handler::get_player_and_set_timestamp(const SceNpId& npid, u64 timestamp)
 	{
-		std::string npid_str = std::string(npid.handle.data);
+		std::string npid_str = np::npid_to_string(npid);
 
 		if (!players_history.contains(npid_str))
 		{
@@ -1329,6 +1417,24 @@ namespace np
 		auto& history = ::at32(players_history, npid_str);
 		history.timestamp = timestamp;
 		return history;
+	}
+
+	u32 np_handler::get_clan_ticket_ready() const
+	{
+		return clan_ticket_ready.load();
+	}
+
+	ticket np_handler::get_clan_ticket() const
+	{
+		clan_ticket_ready.wait(0, atomic_wait_timeout{60'000'000'000}); // 60 seconds
+
+		if (!clan_ticket_ready.load())
+		{
+			rpcn_log.error("Failed to get clan ticket within timeout.");
+			return ticket{};
+		}
+
+		return clan_ticket;
 	}
 
 	constexpr usz MAX_HISTORY_ENTRIES = 200;
@@ -1379,7 +1485,7 @@ namespace np
 		return req_id;
 	}
 
-	u32 np_handler::get_players_history_count(u32 options)
+	u32 np_handler::get_players_history_count(u32 options) const
 	{
 		const bool all_history = (options == SCE_NP_BASIC_PLAYERS_HISTORY_OPTIONS_ALL);
 
@@ -1397,7 +1503,7 @@ namespace np
 			}));
 	}
 
-	bool np_handler::get_player_history_entry(u32 options, u32 index, SceNpId* npid)
+	bool np_handler::get_player_history_entry(u32 options, u32 index, SceNpId* npid) const
 	{
 		const bool all_history = (options == SCE_NP_BASIC_PLAYERS_HISTORY_OPTIONS_ALL);
 
@@ -1405,14 +1511,13 @@ namespace np
 
 		if (all_history)
 		{
+			if (index >= players_history.size())
+				return false;
+
 			auto it = players_history.begin();
 			std::advance(it, index);
-
-			if (it != players_history.end())
-			{
-				string_to_npid(it->first, *npid);
-				return true;
-			}
+			string_to_npid(it->first, *npid);
+			return true;
 		}
 		else
 		{
@@ -1440,7 +1545,7 @@ namespace np
 	void np_handler::save_players_history()
 	{
 #ifdef _WIN32
-		const std::string path_to_cfg = fs::get_config_dir() + "config/";
+		const std::string path_to_cfg = fs::get_config_dir(true);
 		if (!fs::create_path(path_to_cfg))
 		{
 			nph_log.error("Could not create path: %s", path_to_cfg);
@@ -1519,7 +1624,7 @@ namespace np
 			}
 		}
 
-		if (send_update && is_psn_active)
+		if (is_psn_active && (!presence_self.advertised || send_update))
 		{
 			std::lock_guard lock(mutex_rpcn);
 
@@ -1528,8 +1633,35 @@ namespace np
 				return;
 			}
 
+			presence_self.advertised = true;
 			rpcn->send_presence(presence_self.pr_com_id, presence_self.pr_title, presence_self.pr_status, presence_self.pr_comment, presence_self.pr_data);
 		}
+	}
+
+	void np_handler::rpcn_trophy_unlock(const SceNpCommunicationId& communication_id, s32 trophy_id, s64 timestamp)
+	{
+		if (!is_psn_active || g_cfg.net.psn_status != np_psn_status::psn_rpcn)
+			return;
+
+		std::lock_guard lock(mutex_rpcn);
+		if (!rpcn || !rpcn->is_authentified())
+			return;
+
+		rpcn->unlock_trophy(communication_id, trophy_id, timestamp);
+	}
+
+	std::vector<std::pair<s32, s64>> np_handler::rpcn_trophy_sync(
+		const SceNpCommunicationId& communication_id,
+		const std::vector<std::pair<s32, s64>>& local_unlocked)
+	{
+		if (!is_psn_active || g_cfg.net.psn_status != np_psn_status::psn_rpcn)
+			return {};
+
+		std::lock_guard lock(mutex_rpcn);
+		if (!rpcn || !rpcn->is_authentified())
+			return {};
+
+		return rpcn->sync_trophies(communication_id, local_unlocked);
 	}
 
 	template <typename T>
@@ -1578,7 +1710,7 @@ namespace np
 			return SCE_NP_BASIC_ERROR_NOT_CONNECTED;
 		}
 
-		auto friend_infos = rpcn->get_friend_presence_by_npid(std::string(npid.handle.data));
+		auto friend_infos = rpcn->get_friend_presence_by_npid(np::npid_to_string(npid));
 		if (!friend_infos)
 		{
 			return SCE_NP_BASIC_ERROR_INVALID_ARGUMENT;
@@ -1611,6 +1743,11 @@ namespace np
 	std::pair<error_code, std::vector<SceNpMatching2RoomMemberId>> np_handler::local_get_room_memberids(SceNpMatching2RoomId room_id, s32 sort_method)
 	{
 		return np_cache.get_memberids(room_id, sort_method);
+	}
+
+	std::pair<error_code, std::optional<SceNpMatching2SignalingOptParam>> np_handler::local_get_signaling_opt_param(SceNpMatching2RoomId room_id)
+	{
+		return np_cache.get_opt_param(room_id);
 	}
 
 	error_code np_handler::local_get_room_member_data(SceNpMatching2RoomId room_id, SceNpMatching2RoomMemberId member_id, const std::vector<SceNpMatching2AttributeId>& binattrs_list, SceNpMatching2RoomMemberDataInternal* ptr_member, u32 addr_data, u32 size_data, u32 ctx_id)
@@ -1685,6 +1822,31 @@ namespace np
 			return {};
 
 		return ctx;
+	}
+
+	void np_handler::callback_info::queue_callback(u32 req_id, u32 event_key, s32 error_code, u32 data_size) const
+	{
+		if (cb)
+		{
+			sysutil_register_cb([=, ctx_id = this->ctx_id, event_type = this->event_type, cb = this->cb, cb_arg = this->cb_arg](ppu_thread& cb_ppu) -> s32
+				{
+					sceNp2.trace("Calling callback 0x%x with req_id %d, event_type: 0x%x, error_code: 0x%x", cb, req_id, event_type, error_code);
+					cb(cb_ppu, ctx_id, req_id, event_type, event_key, error_code, data_size, cb_arg);
+					return 0;
+				});
+		}
+	}
+
+	SceNpMatching2MemoryInfo np_handler::get_memory_info() const
+	{
+		auto [m_size, m_usage, m_max_usage] = np_memory.get_stats();
+
+		SceNpMatching2MemoryInfo mem_info{};
+		mem_info.totalMemSize = m_size;
+		mem_info.curMemUsage = m_usage;
+		mem_info.maxMemUsage = m_max_usage;
+
+		return mem_info;
 	}
 
 } // namespace np

@@ -5,6 +5,7 @@
 #include "Emu/Cell/lv2/sys_usbd.h"
 #include "Emu/Io/turntable_config.h"
 #include "Input/pad_thread.h"
+#include "Emu/system_config.h"
 
 LOG_CHANNEL(turntable_log, "TURN");
 
@@ -51,6 +52,16 @@ usb_device_turntable::usb_device_turntable(u32 controller_index, const std::arra
 
 usb_device_turntable::~usb_device_turntable()
 {
+}
+
+std::shared_ptr<usb_device> usb_device_turntable::make_instance(u32 controller_index, const std::array<u8, 7>& location)
+{
+	return std::make_shared<usb_device_turntable>(controller_index, location);
+}
+
+u16 usb_device_turntable::get_num_emu_devices()
+{
+	return static_cast<u16>(g_cfg.io.turntable.get());
 }
 
 void usb_device_turntable::control_transfer(u8 bmRequestType, u8 bRequest, u16 wValue, u16 wIndex, u16 wLength, u32 buf_size, u8* buf, UsbTransfer* transfer)
@@ -151,20 +162,20 @@ void usb_device_turntable::interrupt_transfer(u32 buf_size, u8* buf, u32 /*endpo
 	// All other bufs are always 0x00
 
 	std::lock_guard lock(pad::g_pad_mutex);
-	const auto handler = pad::get_current_handler();
+	const auto handler = pad::get_pad_thread();
 	const auto& pads   = handler->GetPads();
 	const auto& pad    = ::at32(pads, m_controller_index);
 
-	if (!(pad->m_port_status & CELL_PAD_STATUS_CONNECTED))
+	if (!pad->is_connected() || pad->is_copilot())
 		return;
 
 	const auto& cfg = ::at32(g_cfg_turntable.players, m_controller_index);
-	cfg->handle_input(pad, true, [&buf](turntable_btn btn, u16 value, bool pressed)
+	cfg->handle_input(pad, true, [&buf](const auto& value, bool& /*abort*/)
 		{
-			if (!pressed)
+			if (!value.pressed)
 				return;
 
-			switch (btn)
+			switch (value.btn)
 			{
 			case turntable_btn::blue:
 				buf[0] |= 0x01;   // Square Button
@@ -265,7 +276,7 @@ void usb_device_turntable::interrupt_transfer(u32 buf_size, u8* buf, u32 /*endpo
 				break;
 			case turntable_btn::right_turntable:
 				// DJ Hero does not register input if the turntable is 0, so force it to 1.
-				buf[6] = std::max(1, 255 - value); // Right Turntable
+				buf[6] = std::max(1, 255 - value.to_8bit()); // Right Turntable
 				// DJ Hero requires turntables to be centered at 128.
 				// If this axis ends up centered at 127, force it to 128.
 				if (buf[6] == 127)
@@ -274,13 +285,19 @@ void usb_device_turntable::interrupt_transfer(u32 buf_size, u8* buf, u32 /*endpo
 				}
 				break;
 			case turntable_btn::crossfader:
-				buf[21] = ((255 - value) & 0x3F) << 2; // Crossfader, lower 6 bits
-				buf[22] = ((255 - value) & 0xC0) >> 6; // Crossfader, upper 2 bits
+			{
+				const u16 val = value.to_10bit(); // ensure 10-bit range
+				buf[21] = (val & 0xFF);         // Crossfader, lower 8 bits
+				buf[22] = (val >> 8) & 0x03;    // Crossfader, upper 2 bits
 				break;
+			}
 			case turntable_btn::effects_dial:
-				buf[19] = (value & 0x3F) << 2; // Effects Dial, lower 6 bits
-				buf[20] = (value & 0xC0) >> 6; // Effects Dial, upper 2 bits
+			{
+				const u16 val = value.to_10bit(); // ensure 10-bit range
+				buf[19] = (val & 0xFF);         // Effects Dial, lower 8 bits
+				buf[20] = (val >> 8) & 0x03;    // Effects Dial, upper 2 bits
 				break;
+			}
 			case turntable_btn::count:
 				break;
 			}

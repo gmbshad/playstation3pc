@@ -42,7 +42,7 @@ enum : u32
 	PKG_FILE_ENTRY_KNOWN_BITS     = 0xff | PKG_FILE_ENTRY_PSP | PKG_FILE_ENTRY_OVERWRITE,
 };
 
-enum : u32
+enum pkg_content_type : u32
 {
 	PKG_CONTENT_TYPE_UNKNOWN_1      = 0x01, // ?
 	PKG_CONTENT_TYPE_UNKNOWN_2      = 0x02, // ?
@@ -63,18 +63,39 @@ enum : u32
 	PKG_CONTENT_TYPE_VMC            = 0x11, // VMC
 	PKG_CONTENT_TYPE_PS2_CLASSIC    = 0x12, // ?PS2Classic? Seen on PS2 classic
 	PKG_CONTENT_TYPE_UNKNOWN_5      = 0x13, // ?
-	PKG_CONTENT_TYPE_PSP_REMASTERED = 0x14, // ?
+	PKG_CONTENT_TYPE_PSP_REMASTERED = 0x14, // PSP Remastered
 	PKG_CONTENT_TYPE_PSP2_GD        = 0x15, // PSVita Game Data
 	PKG_CONTENT_TYPE_PSP2_AC        = 0x16, // PSVita Additional Content
 	PKG_CONTENT_TYPE_PSP2_LA        = 0x17, // PSVita LiveArea
-	PKG_CONTENT_TYPE_PSM_1          = 0x18, // PSVita PSM ?
+	PKG_CONTENT_TYPE_PSM            = 0x18, // PSVita PSM
 	PKG_CONTENT_TYPE_WT             = 0x19, // Web TV ?
-	PKG_CONTENT_TYPE_UNKNOWN_6      = 0x1A, // ?
-	PKG_CONTENT_TYPE_UNKNOWN_7      = 0x1B, // ?
-	PKG_CONTENT_TYPE_UNKNOWN_8      = 0x1C, // ?
-	PKG_CONTENT_TYPE_PSM_2          = 0x1D, // PSVita PSM ?
-	PKG_CONTENT_TYPE_UNKNOWN_9      = 0x1E, // ?
+	PKG_CONTENT_TYPE_PS4_GD         = 0x1A, // PS4 GameData
+	PKG_CONTENT_TYPE_PS4_AC         = 0x1B, // PS4 Additional Content
+	PKG_CONTENT_TYPE_PS4_AL         = 0x1C, // PS4 Additional License
+	PKG_CONTENT_TYPE_PSM_UNITY      = 0x1D, // PSVita PSM for Unity
+	PKG_CONTENT_TYPE_PS4_DP         = 0x1E, // PS4 Delta patch
 	PKG_CONTENT_TYPE_PSP2_THEME     = 0x1F, // PSVita Theme
+	PKG_CONTENT_TYPE_PS5_GAME_DATA  = 0x20, // PS5 GameData
+};
+
+enum pkg_flag : u32
+{
+	PKG_FLAG_0x01              = 0x01,
+	PKG_FLAG_EBOOT             = 0x02,
+	PKG_FLAG_REQUIRE_LICENSE   = 0x04,
+	PKG_FLAG_HDD_MC            = 0x08,
+	PKG_FLAG_PATCH             = 0x10,
+	PKG_FLAG_0x20              = 0x20,
+	PKG_FLAG_RENAME_DIRECTORY  = 0x40,
+	PKG_FLAG_EDAT              = 0x80,
+	PKG_FLAG_0x100             = 0x100,
+	PKG_FLAG_EMULATOR          = 0x200,
+	PKG_FLAG_VSH_MODULE        = 0x400,
+	PKG_FLAG_DISC_BOUND        = 0x800,
+	PKG_FLAG_UNKNOWN           = 0x1000,
+	PKG_FLAG_PS_VITA_CARD      = 0x2000,
+	PKG_FLAG_PS_VITA_NON_GAME  = 0x4000,
+	PKG_FLAG_0x8000            = 0x8000,
 };
 
 // Structs
@@ -126,7 +147,7 @@ struct PKGEntry
 struct PKGMetaData
 {
 private:
-	static std::string to_hex_string(u8 buf[], usz size)
+	static std::string to_hex_string(const u8* buf, usz size)
 	{
 		std::stringstream sstream;
 		for (usz i = 0; i < size; i++)
@@ -135,7 +156,7 @@ private:
 		}
 		return sstream.str();
 	}
-	static std::string to_hex_string(u8 buf[], usz size, usz dotpos)
+	static std::string to_hex_string(const u8* buf, usz size, usz dotpos)
 	{
 		std::string result = to_hex_string(buf, size);
 		if (result.size() > dotpos)
@@ -305,20 +326,16 @@ struct package_install_result
 		app_version,
 		other
 	} error = error_type::no_error;
-	struct version
+	struct versions
 	{
+		std::string app_ver;
 		std::string expected;
-		std::string found;
+		std::string installed;
 	} version;
 };
 
 class package_reader
 {
-	struct thread_key
-	{
-		const usz unique_num = umax;
-	};
-
 	struct install_entry
 	{
 		typename std::map<std::string, install_entry*>::value_type* weak_reference{};
@@ -337,7 +354,7 @@ class package_reader
 	};
 
 public:
-	package_reader(const std::string& path);
+	package_reader(const std::string& path, fs::file file = {});
 	~package_reader();
 
 	enum result
@@ -352,27 +369,35 @@ public:
 	};
 
 	bool is_valid() const { return m_is_valid; }
+	const PKGHeader& get_header() const { return m_header; }
+	const PKGMetaData& get_metadata() const { return m_metadata; }
 	package_install_result check_target_app_version() const;
-	static package_install_result extract_data(std::deque<package_reader>& readers, std::deque<std::string>& bootable_paths);
-	psf::registry get_psf() const { return m_psf; }
+	static package_install_result extract_data(std::deque<package_reader>& readers, std::deque<std::string>& bootable_paths, bool from_optical_drive);
+	const psf::registry& get_psf() const { return m_psf; }
 	result get_result() const { return m_result; };
 
 	int get_progress(int maximum = 100) const;
 
 	void abort_extract();
 
+	fs::file& file()
+	{
+		return m_file;
+	}
+
 private:
 	bool read_header();
 	bool read_metadata();
 	bool read_param_sfo();
-	bool decrypt_data();
+	bool set_decryption_key();
+	bool read_entries(std::vector<PKGEntry>& entries);
 	void archive_seek(s64 new_offset, const fs::seek_mode damode = fs::seek_set);
 	u64 archive_read(void* data_ptr, u64 num_bytes);
 	bool set_install_path();
 	bool fill_data(std::map<std::string, install_entry*>& all_install_entries);
-	std::span<const char> archive_read_block(u64 offset, void* data_ptr, u64 num_bytes);
-	std::span<const char> decrypt(u64 offset, u64 size, const uchar* key, thread_key thread_data_key = {0});
-	void extract_worker(thread_key thread_data_key);
+	std::span<const char> archive_read_block(u64 offset, std::span<u8> dst, u64 num_bytes);
+	usz decrypt(u64 offset, u64 size, const uchar* key, std::span<u8> local_buf);
+	void extract_worker();
 
 	std::deque<install_entry> m_install_entries;
 	std::string m_install_path;
@@ -383,6 +408,7 @@ private:
 	bool m_was_null = false;
 
 	static constexpr usz BUF_SIZE = 8192 * 1024; // 8 MB
+	static constexpr usz BUF_PADDING = 32;
 
 	bool m_is_valid = false;
 	result m_result = result::not_started;
@@ -390,7 +416,6 @@ private:
 	std::string m_path{};
 	std::string m_install_dir{};
 	fs::file m_file{};
-	std::vector<std::unique_ptr<u128[]>> m_bufs{};
 	std::array<uchar, 16> m_dec_key{};
 
 	PKGHeader m_header{};

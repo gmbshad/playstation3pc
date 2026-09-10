@@ -14,6 +14,10 @@
 #define CAN_OVERCOMMIT
 #endif
 
+#if defined(__APPLE__)
+#include <mutex>
+#endif
+
 LOG_CHANNEL(jit_log, "JIT");
 
 void jit_announce(uptr func, usz size, std::string_view name)
@@ -118,7 +122,7 @@ static u8* get_jit_memory()
 	// Reserve 2G memory (magic static)
 	static void* const s_memory2 = []() -> void*
 	{
-		void* ptr = utils::memory_reserve(0x80000000);
+		void* ptr = utils::memory_reserve(0x80000000, true);
 #ifdef CAN_OVERCOMMIT
 		utils::memory_commit(ptr, 0x80000000);
 		utils::memory_protect(ptr, 0x40000000, utils::protection::wx);
@@ -145,6 +149,12 @@ static u8* add_jit_memory(usz size, usz align)
 	{
 		// Return subrange info
 		return pointer;
+	}
+
+	if (!size && align == 1)
+	{
+		// Return memory top address
+		return pointer + (Ctr.load() & 0xffff'ffff);
 	}
 
 	u64 olda, newa;
@@ -211,7 +221,7 @@ const asmjit::Environment& jit_runtime_base::environment() const noexcept
 	return g_env;
 }
 
-void* jit_runtime_base::_add(asmjit::CodeHolder* code) noexcept
+void* jit_runtime_base::_add(asmjit::CodeHolder* code, usz align) noexcept
 {
 	ensure(!code->flatten());
 	ensure(!code->resolveUnresolvedLinks());
@@ -219,7 +229,7 @@ void* jit_runtime_base::_add(asmjit::CodeHolder* code) noexcept
 	if (!codeSize)
 		return nullptr;
 
-	auto p = ensure(this->_alloc(codeSize, 64));
+	auto p = ensure(this->_alloc(codeSize, align));
 	ensure(!code->relocateToBase(uptr(p)));
 
 	{
@@ -231,6 +241,11 @@ void* jit_runtime_base::_add(asmjit::CodeHolder* code) noexcept
 
 		for (asmjit::Section* section : code->_sections)
 		{
+			if (section->offset() + section->bufferSize() > utils::align<usz>(codeSize, align))
+			{
+				fmt::throw_exception("CodeHolder section exceeds range: Section->offset: 0x%x, Section->bufferSize: 0x%x, alloted-memory=0x%x", section->offset(), section->bufferSize(), utils::align<usz>(codeSize, align));
+			}
+
 			std::memcpy(p + section->offset(), section->data(), section->bufferSize());
 		}
 	}
@@ -268,6 +283,18 @@ u8* jit_runtime::alloc(usz size, usz align, bool exec) noexcept
 	}
 }
 
+u8* jit_runtime::peek(bool exec) noexcept
+{
+	if (exec)
+	{
+		return add_jit_memory<s_code_pos, 0x0, utils::protection::wx>(0, 1);
+	}
+	else
+	{
+		return add_jit_memory<s_data_pos, 0x40000000, utils::protection::rw>(0, 1);
+	}
+}
+
 void jit_runtime::initialize()
 {
 	if (!s_code_init.empty() || !s_data_init.empty())
@@ -289,10 +316,10 @@ void jit_runtime::finalize() noexcept
 #endif
 	// Reset JIT memory
 #ifdef CAN_OVERCOMMIT
-	utils::memory_reset(get_jit_memory(), 0x80000000);
+	utils::memory_reset(get_jit_memory(), 0x80000000, true);
 	utils::memory_protect(get_jit_memory(), 0x40000000, utils::protection::wx);
 #else
-	utils::memory_decommit(get_jit_memory(), 0x80000000);
+	utils::memory_decommit(get_jit_memory(), 0x80000000, true);
 #endif
 
 	s_code_pos = 0;
@@ -321,15 +348,7 @@ jit_runtime_base& asmjit::get_global_runtime()
 	{
 		custom_runtime() noexcept
 		{
-			// Search starting in first 2 GiB of memory
-			for (u64 addr = size;; addr += size)
-			{
-				if (auto ptr = utils::memory_reserve(size, reinterpret_cast<void*>(addr)))
-				{
-					m_pos.raw() = static_cast<uchar*>(ptr);
-					break;
-				}
-			}
+			ensure(m_pos.raw() = static_cast<uchar*>(utils::memory_reserve(size, true)));
 
 			// Initialize "end" pointer
 			m_max = m_pos + size;

@@ -83,11 +83,16 @@ layout(location=0) in vec4 in_regs[16];
 #define RSX_FP_REGISTER_TYPE_CONSTANT 2
 #define RSX_FP_REGISTER_TYPE_UNKNOWN 3
 
+#define RSX_FP_PRECISION_SATURATE 4
+
 #define CELL_GCM_SHADER_CONTROL_DEPTH_EXPORT 0xe
 #define CELL_GCM_SHADER_CONTROL_32_BITS_EXPORTS 0x40
 
-#define GET_BITS(word, offset, count) bitfieldExtract(inst.words[word], offset, count)
-#define TEST_BIT(word, offset) (GET_BITS(word, offset, 1) > 0)
+#define GET_BITS(bitfield, offset, count) bitfieldExtract(bitfield, offset, count)
+#define TEST_BIT(bitfield, offset) (GET_BITS(bitfield, offset, 1) > 0)
+
+#define GET_INST_BITS(word, offset, count) GET_BITS(inst.words[word], offset, count)
+#define TEST_INST_BIT(word, offset) (GET_INST_BITS(word, offset, 1) > 0)
 
 #define select mix
 #define reg_mov(d, s, m) d = select(d, s, m)
@@ -98,6 +103,7 @@ uint ur0, ur1;     // GP unsigned register (scalar)
 uvec4 uvr0;        // GP unsigned register (vector)
 bvec4 bvr0, bvr1;  // GP boolean register (vector)
 float sr0;         // GP scalar register
+int ir0;           // GP scalar register (scalar)
 
 vec4 vrr;          // value return (dst register)
 vec4 s0, s1, s2;   // instruction src (src0, src1, src2)
@@ -174,7 +180,7 @@ int counter = 0;
 
 vec4 read_src(const in int index)
 {
-	ur0 = GET_BITS(index + 1, 0, 2);
+	ur0 = GET_INST_BITS(index + 1, 0, 2);
 
 	switch (ur0)
 	{
@@ -183,14 +189,14 @@ vec4 read_src(const in int index)
 		switch(index)
 		{
 		case 0:
-			ur1 = GET_BITS(1, 2, 6); break;
+			ur1 = GET_INST_BITS(1, 2, 6); break;
 		case 1:
-			ur1 = GET_BITS(2, 2, 6); break;
+			ur1 = GET_INST_BITS(2, 2, 6); break;
 		case 2:
-			ur1 = GET_BITS(3, 2, 6); break;
+			ur1 = GET_INST_BITS(3, 2, 6); break;
 		}
 
-		if (TEST_BIT(index + 1, 8))
+		if (TEST_INST_BIT(index + 1, 8))
 		{
 			vr0 = regs16[ur1];
 		}
@@ -202,7 +208,7 @@ vec4 read_src(const in int index)
 	}
 	case RSX_FP_REGISTER_TYPE_INPUT:
 	{
-		ur1 = GET_BITS(0, 13, 4);
+		ur1 = GET_INST_BITS(0, 13, 4);
 		switch (ur1)
 		{
 		case 0:
@@ -235,27 +241,32 @@ vec4 read_src(const in int index)
 	}
 	}
 
-	ur1 = GET_BITS(index + 1, 9, 8);
+	ur1 = GET_INST_BITS(index + 1, 9, 8);
 	vr0 = shuffle(vr0, ur1);
+
+	if (GET_INST_BITS(2, 19 + index * 3, 3) == RSX_FP_PRECISION_SATURATE)
+	{
+		vr0 = clamp(select(vr0, vr_zero, isnan(vr0)), 0., 1.);
+	}
 
 	// abs
 	if (index == 0)
 	{
-		if (TEST_BIT(1, 29)) vr0 = abs(vr0);
+		if (TEST_INST_BIT(1, 29)) vr0 = abs(vr0);
 	}
 	else
 	{
 		ur1 = index + 1;
-		if (TEST_BIT(ur1, 18)) vr0 = abs(vr0);
+		if (TEST_INST_BIT(ur1, 18)) vr0 = abs(vr0);
 	}
 
 	// neg
-	return (TEST_BIT(index + 1, 17))? -vr0 : vr0;
+	return (TEST_INST_BIT(index + 1, 17))? -vr0 : vr0;
 }
 
 vec4 read_cond()
 {
-	return shuffle(cc[GET_BITS(1, 31, 1)], GET_BITS(1, 21, 8));
+	return shuffle(cc[GET_INST_BITS(1, 31, 1)], GET_INST_BITS(1, 21, 8));
 }
 
 bvec4 decode_cond(const in uint mode, const in vec4 cond)
@@ -283,7 +294,7 @@ bvec4 decode_cond(const in uint mode, const in vec4 cond)
 
 bool check_cond()
 {
-	ur0 = GET_BITS(1, 18, 3);
+	ur0 = GET_INST_BITS(1, 18, 3);
 	if (ur0 == 0x7)
 	{
 		return true;
@@ -351,36 +362,36 @@ vec3 _texcoord_xform(const in vec3 coord, const in sampler_info params)
 
 vec4 _texture(in vec4 coord, float bias)
 {
-	ur0 = GET_BITS(0, 17, 4);
+	ur0 = GET_INST_BITS(0, 17, 4);
 	if (!IS_TEXTURE_RESIDENT(ur0))
 	{
 		return vr_zero;
 	}
 
 	ur1 = ur0 + ur0;
-	const uint type = bitfieldExtract(texture_control, int(ur1), 2);
+	const uint type = GET_BITS(texture_control, int(ur1), 2);
 
 	switch (type)
 	{
 	case RSX_SAMPLE_TEXTURE_1D:
-		coord.x = _texcoord_xform(coord.x, texture_parameters[ur0]);
+		coord.x = _texcoord_xform(coord.x, texture_parameters[ur0 + texture_base_index]);
 		vr0 = texture(SAMPLER1D(ur0), coord.x, bias);
 		break;
 	case RSX_SAMPLE_TEXTURE_2D:
-		coord.xy = _texcoord_xform(coord.xy, texture_parameters[ur0]);
+		coord.xy = _texcoord_xform(coord.xy, texture_parameters[ur0 + texture_base_index]);
 		vr0 = texture(SAMPLER2D(ur0), coord.xy, bias);
 		break;
 	case RSX_SAMPLE_TEXTURE_CUBE:
-		coord.xyz = _texcoord_xform(coord.xyz, texture_parameters[ur0]);
+		coord.xyz = _texcoord_xform(coord.xyz, texture_parameters[ur0 + texture_base_index]);
 		vr0 = texture(SAMPLERCUBE(ur0), coord.xyz, bias);
 		break;
 	case RSX_SAMPLE_TEXTURE_3D:
-		coord.xyz = _texcoord_xform(coord.xyz, texture_parameters[ur0]);
+		coord.xyz = _texcoord_xform(coord.xyz, texture_parameters[ur0 + texture_base_index]);
 		vr0 = texture(SAMPLER3D(ur0), coord.xyz, bias);
 		break;
 	}
 
-	if (TEST_BIT(0, 21))
+	if (TEST_INST_BIT(0, 21))
 	{
 		vr0 = vr0 * 2. - 1.;
 	}
@@ -390,36 +401,36 @@ vec4 _texture(in vec4 coord, float bias)
 
 vec4 _textureLod(in vec4 coord, float lod)
 {
-	ur0 = GET_BITS(0, 17, 4);
+	ur0 = GET_INST_BITS(0, 17, 4);
 	if (!IS_TEXTURE_RESIDENT(ur0))
 	{
 		return vr_zero;
 	}
 
 	ur1 = ur0 + ur0;
-	const uint type = bitfieldExtract(texture_control, int(ur1), 2);
+	const uint type = GET_BITS(texture_control, int(ur1), 2);
 
 	switch (type)
 	{
 	case RSX_SAMPLE_TEXTURE_1D:
-		coord.x = _texcoord_xform(coord.x, texture_parameters[ur0]);
+		coord.x = _texcoord_xform(coord.x, texture_parameters[ur0 + texture_base_index]);
 		vr0 = textureLod(SAMPLER1D(ur0), coord.x, lod);
 		break;
 	case RSX_SAMPLE_TEXTURE_2D:
-		coord.xy = _texcoord_xform(coord.xy, texture_parameters[ur0]);
+		coord.xy = _texcoord_xform(coord.xy, texture_parameters[ur0 + texture_base_index]);
 		vr0 = textureLod(SAMPLER2D(ur0), coord.xy, lod);
 		break;
 	case RSX_SAMPLE_TEXTURE_CUBE:
-		coord.xyz = _texcoord_xform(coord.xyz, texture_parameters[ur0]);
+		coord.xyz = _texcoord_xform(coord.xyz, texture_parameters[ur0 + texture_base_index]);
 		vr0 = textureLod(SAMPLERCUBE(ur0), coord.xyz, lod);
 		break;
 	case RSX_SAMPLE_TEXTURE_3D:
-		coord.xyz = _texcoord_xform(coord.xyz, texture_parameters[ur0]);
+		coord.xyz = _texcoord_xform(coord.xyz, texture_parameters[ur0 + texture_base_index]);
 		vr0 = textureLod(SAMPLER3D(ur0), coord.xyz, lod);
 		break;
 	}
 
-	if (TEST_BIT(0, 21))
+	if (TEST_INST_BIT(0, 21))
 	{
 		// Normal-expand, v = 2v - 1
 		vr0 += vr0;
@@ -436,27 +447,16 @@ void write_dst(const in vec4 value)
 	uvr0 = uvec4(uint(1 << 9), uint(1 << 10), uint(1 << 11), uint(1 << 12));
 	bvr0 = bvec4(uvr0 & inst.words.xxxx);
 
-	if (TEST_BIT(0, 8)) // SET COND
-	{
-		ur0 = GET_BITS(1, 30, 1);
-		reg_mov(cc[ur0], value, bvr0);
-	}
-
-	if (TEST_BIT(0, 30)) // NO DEST
-	{
-		return;
-	}
-
-	ur1 = GET_BITS(2, 28, 3);
+	ur1 = GET_INST_BITS(2, 28, 3);
 	sr0 = modifier_scale[ur1];
 	vr0 = value * sr0;
 
-	if (TEST_BIT(0, 31)) // SAT
+	if (TEST_INST_BIT(0, 31)) // SAT
 	{
 		vr0 = clamp(vr0, 0, 1);
 	}
 
-	ur0 = GET_BITS(1, 18, 3);
+	ur0 = GET_INST_BITS(1, 18, 3);
 	if (ur0 != 0x7)
 	{
 		vr1 = read_cond();
@@ -464,8 +464,20 @@ void write_dst(const in vec4 value)
 		bvr0 = bvec4(uvec4(bvr0) & uvec4(bvr1));
 	}
 
-	ur1 = GET_BITS(0, 1, 6);
-	if (TEST_BIT(0, 7))
+	// FIXME - HWTEST: Are CC registers affected by scale and SAT modifiers?
+	if (TEST_INST_BIT(0, 8)) // SET COND
+	{
+		ur0 = GET_INST_BITS(1, 30, 1);
+		reg_mov(cc[ur0], vr0, bvr0);
+	}
+
+	if (TEST_INST_BIT(0, 30)) // NO DEST
+	{
+		return;
+	}
+
+	ur1 = GET_INST_BITS(0, 1, 6);
+	if (TEST_INST_BIT(0, 7))
 	{
 		reg_mov(regs16[ur1], vr0, bvr0);
 	}
@@ -481,14 +493,18 @@ void initialize()
 	// NOTE: Register count is the number of 'full' registers that will be consumed. Hardware seems to do some renaming.
 	// NOTE: Attempting to zero-initialize all the registers will slow things to a crawl!
 
-	uint register_count = bitfieldExtract(shader_control, 24, 6);
-	ur0 = 0, ur1 = 0;
-	while (register_count > 0)
-	{
-		regs32[ur0++] = vr_zero;
-		regs16[ur1++] = vr_zero;
-		regs16[ur1++] = vr_zero;
-		register_count--;
+	const uint register_count = GET_BITS(shader_control, 24, 6);
+	const uint regs32_count = min(register_count, 48u);
+	const uint regs16_count = min(register_count << 1u, 48u);
+
+	ur0 = regs32_count;
+	while (ur0 > 0) {
+		regs32[--ur0] = vr_zero;
+	}
+
+	ur0 = regs16_count;
+	while (ur0 > 0) {
+		regs16[--ur0] = vr_zero;
 	}
 
 	// Fog coord
@@ -526,8 +542,12 @@ void initialize()
 
 	// WPOS
 	vr0 = vec4(abs(wpos_scale), wpos_scale, 1., 1.);
-	vr1 = vec4(0., wpos_bias, 0., 0.);
+	vr1 = vec4(wpos_bias, 0., 0.);
 	wpos = gl_FragCoord * vr0 + vr1;
+
+	// Other
+	cc[0] = vr_zero;
+	cc[1] = vr_zero;
 })"
 
 R"(
@@ -545,6 +565,9 @@ void main()
 	ur1 = ur0 & 31u;                               // address % 32 -> fetch bit offset
 	ur1 = (1u << ur1);                             // address mask
 	uvr0.x = (ur0 >> 7u);                          // address to uvec4 row (each row has 32x4 bits)
+#ifdef VULKAN
+	uvr0.x += _fs_stipple_pattern_array_offset;     // Address base offset. Only applies to vulkan.
+#endif
 	ur0 = (ur0 >> 5u) & 3u;                        // address to uvec4 word (address / 32) % 4
 
 	if ((stipple_pattern[uvr0.x][ur0] & ur1) == 0u)
@@ -587,11 +610,11 @@ void main()
 			((fp_instructions[ip] << 8) & uvec4(0xFF00FF00)) |
 			((fp_instructions[ip] >> 8) & uvec4(0x00FF00FF));
 
-		inst.opcode = GET_BITS(0, 24, 6);
-		inst.end = TEST_BIT(0, 0);
+		inst.opcode = GET_INST_BITS(0, 24, 6);
+		inst.end = TEST_INST_BIT(0, 0);
 
 #ifdef WITH_FLOW_CTRL
-		if (TEST_BIT(2, 31))
+		if (TEST_INST_BIT(2, 31))
 		{
 			// Flow control
 			switch (inst.opcode | (1 << 6))
@@ -599,23 +622,24 @@ void main()
 			//case RSX_FP_OPCODE_CAL:
 				// Function call not yet found in the wild for this hw class
 			case RSX_FP_OPCODE_RET:
-				inst.end = true;
+				if (check_cond()) inst.end = true;
 				continue;
 			case RSX_FP_OPCODE_IFE:
+				ur0 = GET_INST_BITS(2, 0, 31); // ELSE addr
 				if (check_cond())
 				{
-					// Go down IF path
-					if (inst.words.z < inst.words.w)
+					// We've entered the IF block. Set up an exit trap to skip the ELSE block.
+					if (ur0 < inst.words.w)                  // If ELSE address is before ENDIF address..
 					{
-						test_addr = int(inst.words.z >> 2);
-						jump_addr = int(inst.words.w >> 2);
+						test_addr = int(ur0 >> 2u);           // When we reach ELSE block...
+						jump_addr = int(inst.words.w >> 2u);  // Jump to ENDIF
 					}
 					// If simple IF..ENDIF, do nothing
 				}
 				else
 				{
-					// Go to ELSE path
-					ip = int(inst.words.z >> 2);
+					// Go to ELSE path. If ELSE is not provided, it matches ENDIF address.
+					ip = int(ur0 >> 2u);
 					inst_length = 0;
 				}
 				continue;
@@ -623,18 +647,29 @@ void main()
 			case RSX_FP_OPCODE_REP:
 				if (check_cond())
 				{
-					counter = int(GET_BITS(2, 2, 8) - GET_BITS(2, 10, 8));
-					counter /= int(GET_BITS(2, 19, 8));
-					loop_start_addr = ip + 1;
-					loop_end_addr = int(inst.words.w >> 2);
+					ur0 = GET_INST_BITS(2, 10, 8);                // Start
+					ur1 = GET_INST_BITS(2, 2, 8);                 // End
+					if (ur1 > ur0)
+					{
+						counter = int(ur1 - ur0 - 1);             // RANGE
+						ir0 = int(GET_INST_BITS(2, 19, 8));       // STEP
+						counter = max(counter, 0) / max(ir0, 1);  // ITERATIONS
+
+						loop_start_addr = ip + 1;
+						loop_end_addr = int(inst.words.w >> 2);
+						continue;
+					}
 				}
-				else
-				{
-					ip = int(inst.words.w >> 2);
-					inst_length = 0;
-				}
+
+				// Failed cond check or 0 iterations encoded
+				ip = int(inst.words.w >> 2);
+				inst_length = 0;
 				continue;
 			case RSX_FP_OPCODE_BRK:
+				if (!check_cond())
+				{
+					continue;
+				}
 				if (loop_end_addr > 0)
 				{
 					ip = loop_end_addr;
@@ -684,7 +719,7 @@ void main()
 		case RSX_FP_OPCODE_RCP:
 			vrr = (1.f / s0.xxxx); break;
 		case RSX_FP_OPCODE_RSQ:
-			vrr = inversesqrt(s0.xxxx); break;
+			vrr = inversesqrt(abs(s0.x)).xxxx; break;
 		case RSX_FP_OPCODE_EX2:
 			vrr = exp2(s0.xxxx); break;
 		case RSX_FP_OPCODE_LG2:
@@ -698,7 +733,11 @@ void main()
 		case RSX_FP_OPCODE_SIN:
 			vrr = sin(s0.xxxx); break;
 		case RSX_FP_OPCODE_NRM:
-			vrr.xyz = normalize(s0.xyz); break;
+			vrr = normalize(s0.xyz).xyzz; break;
+		case RSX_FP_OPCODE_LIT:
+			vrr = _builtin_lit(s0); break;
+		case RSX_FP_OPCODE_LIF:
+			vrr = _builtin_lif(s0); break;
 
 #ifdef WITH_TEXTURES
 		case RSX_FP_OPCODE_TEX:
@@ -713,7 +752,7 @@ void main()
 		case RSX_FP_OPCODE_PK4:
 			vrr = vec4(uintBitsToFloat(packSnorm4x8(s0))); break;
 		case RSX_FP_OPCODE_PK16:
-			vrr = vec4(uintBitsToFloat(packSnorm2x16(s0.xy))); break;
+			vrr = vec4(uintBitsToFloat(packUnorm2x16(s0.xy))); break;
 		case RSX_FP_OPCODE_PKG:
 			// Should be similar to PKB but with gamma correction, see description of PK4UBG in khronos page
 		case RSX_FP_OPCODE_PKB:
@@ -723,7 +762,7 @@ void main()
 		case RSX_FP_OPCODE_UP4:
 			vrr = unpackSnorm4x8(floatBitsToUint(s0.x)); break;
 		case RSX_FP_OPCODE_UP16:
-			vrr = unpackSnorm2x16(floatBitsToUint(s0.x)).xyxy; break;
+			vrr = unpackUnorm2x16(floatBitsToUint(s0.x)).xyxy; break;
 		case RSX_FP_OPCODE_UPG:
 			// Same as UPB with gamma correction
 		case RSX_FP_OPCODE_UPB:
@@ -774,7 +813,7 @@ void main()
 				vrr = s0 / s1.xxxx; break;
 			case RSX_FP_OPCODE_DIVSQ:
 				bvr0 = bvec4(s0);
-				sr0 = inversesqrt(s1.x);
+				sr0 = inversesqrt(abs(s1.x));
 				vr0 = s0 * sr0;
 				vrr = select(s0, vr0, bvr0);
 				break;
@@ -804,18 +843,19 @@ void main()
 			case RSX_FP_OPCODE_MAD:
 				vrr = fma(s0, s1, s2); break;
 			case RSX_FP_OPCODE_LRP:
-				vrr = mix(s1, s2, s0); break;
+				vrr = mix(s2, s1, s0); break;
 			case RSX_FP_OPCODE_DP2A:
 				vrr = dot(s0.xy, s1.xy).xxxx + s2.xxxx; break;
+			default:
+				// Fallback - just write zero
+				vrr = vr_zero;
 			}
 		}
 #if 0
-		// Other
-		case RSX_FP_OPCODE_BEM:
-		case RSX_FP_OPCODE_BEMLUM:
-		case RSX_FP_OPCODE_LIT:
-		case RSX_FP_OPCODE_LIF:
-		case RSX_FP_OPCODE_TIMESWTEX:
+		//Other (missing in HW)
+		//case RSX_FP_OPCODE_BEM:
+		//case RSX_FP_OPCODE_BEMLUM:
+		//case RSX_FP_OPCODE_TIMESWTEX:
 #endif
 		write_dst(vrr);
 	}
@@ -854,6 +894,14 @@ void main()
 #endif
 #ifdef ALPHA_TEST_NEQUAL
 	if (ocol0.a == alpha_ref) discard; // nequal
+#endif
+
+#ifdef _ENABLE_ROP_CHANNEL_REMAPPING
+	const uint ROP_remap = get_ROP_channel_remap();
+	ocol0 = remap_ROP_output(ocol0, ROP_remap);
+	ocol1 = remap_ROP_output(ocol1, ROP_remap);
+	ocol2 = remap_ROP_output(ocol2, ROP_remap);
+	ocol3 = remap_ROP_output(ocol3, ROP_remap);
 #endif
 }
 

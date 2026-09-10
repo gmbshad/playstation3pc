@@ -40,7 +40,7 @@ public:
 	{
 		std::lock_guard lock(m_mutex);
 
-		if (cfg_pad_btn<T>* item = get_button(id))
+		if (const cfg_pad_btn<T>* item = get_button(id))
 		{
 			return item->get();
 		}
@@ -52,7 +52,7 @@ public:
 	{
 		std::lock_guard lock(m_mutex);
 
-		if (cfg_pad_btn<T>* item = get_button(id))
+		if (const cfg_pad_btn<T>* item = get_button(id))
 		{
 			return item->get_default();
 		}
@@ -88,28 +88,67 @@ public:
 		button_map.clear();
 	}
 
-	void handle_input(std::shared_ptr<Pad> pad, bool press_only, const std::function<void(T, u16, bool)>& func) const
+	struct input_value
 	{
-		if (!pad)
+	public:
+		T btn = {};
+		pad_button pad_btn = pad_button::pad_button_max_enum;
+		u16 value = 0;
+		u16 max_value = 255;
+		bool pressed = false;
+
+		u8 to_8bit() const
+		{
+			if (max_value == 255) return static_cast<u8>(value & 0x00FF);
+			return static_cast<u8>(std::clamp(255.0f * (static_cast<f32>(std::min(value, max_value)) / ensure(max_value)), 0.0f, 255.0f));
+		}
+
+		u16 to_10bit() const
+		{
+			if (max_value == 1023) return value & 0x03FF;
+			return static_cast<u16>(std::clamp(1023.0f * (static_cast<f32>(std::min(value, max_value)) / ensure(max_value)), 0.0f, 1023.0f));
+		}
+
+	private:
+
+	};
+
+	void handle_input(std::shared_ptr<Pad> pad, bool press_only, const std::function<void(const input_value&, bool&)>& func) const
+	{
+		if (!func || !pad || pad->is_copilot())
 			return;
 
-		for (const Button& button : pad->m_buttons)
+		for (const ButtonExternal& button : pad->m_buttons_external)
 		{
 			if (button.m_pressed || !press_only)
 			{
-				handle_input(func, button.m_offset, button.m_outKeyCode, button.m_value, button.m_pressed, true);
+				if (handle_input_internal(func, button.m_offset, button.m_outKeyCode, button.m_value, 255, button.m_pressed, true))
+				{
+					return;
+				}
 			}
 		}
 
-		for (const AnalogStick& stick : pad->m_sticks)
+		for (const AnalogStickExternal& stick : pad->m_sticks_external)
 		{
-			handle_input(func, stick.m_offset, get_axis_keycode(stick.m_offset, stick.m_value), stick.m_value, true, true);
+			if (handle_input_internal(func, stick.m_offset, get_axis_keycode(stick.m_offset, stick.m_value), stick.m_value, 255, true, true))
+			{
+				return;
+			}
+		}
+
+		for (const AnalogSensor& sensor : pad->m_sensors)
+		{
+			if (handle_input_internal(func, sensor.m_offset, sensor.m_keyCode, sensor.m_value, 1023, true, false))
+			{
+				return;
+			}
 		}
 	}
 
-	void handle_input(const Mouse& mouse, const std::function<void(T, u16, bool)>& func) const
+	void handle_input(const Mouse& mouse, const std::function<void(const input_value&, bool&)>& func) const
 	{
-		for (int i = 0; i < 7; i++)
+		for (int i = 0; i < 8; i++)
 		{
 			const MouseButtonCodes cell_code = get_mouse_button_code(i);
 			if ((mouse.buttons & cell_code))
@@ -117,7 +156,11 @@ public:
 				const pad_button button = static_cast<pad_button>(static_cast<int>(pad_button::mouse_button_1) + i);
 				const u32 offset = pad_button_offset(button);
 				const u32 keycode = pad_button_keycode(button);
-				handle_input(func, offset, keycode, 255, true, true);
+
+				if (handle_input_internal(func, offset, keycode, 255, 255, true, true))
+				{
+					return;
+				}
 			}
 		}
 	}
@@ -163,8 +206,10 @@ protected:
 		return empty_set;
 	}
 
-	void handle_input(const std::function<void(T, u16, bool)>& func, u32 offset, u32 keycode, u16 value, bool pressed, bool check_axis) const
+	bool handle_input_internal(const std::function<void(const input_value&, bool&)>& func, u32 offset, u32 keycode, u16 value, u16 max_value, bool pressed, bool check_axis) const
 	{
+		if (!func) return false;
+
 		m_mutex.lock();
 
 		const auto& btns = find_button(offset, keycode);
@@ -180,24 +225,35 @@ protected:
 				case CELL_PAD_BTN_OFFSET_ANALOG_LEFT_Y:
 				case CELL_PAD_BTN_OFFSET_ANALOG_RIGHT_X:
 				case CELL_PAD_BTN_OFFSET_ANALOG_RIGHT_Y:
-					handle_input(func, offset, static_cast<u32>(axis_direction::both), value, pressed, false);
-					break;
+					return handle_input_internal(func, offset, static_cast<u32>(axis_direction::both), value, max_value, pressed, false);
 				default:
 					break;
 				}
 			}
-			return;
+			return false;
 		}
+
+		bool abort = false;
 
 		for (const auto& btn : btns)
 		{
-			if (btn && func)
+			if (btn)
 			{
-				func(btn->btn_id(), value, pressed);
+				const input_value params
+				{
+					.btn = btn->btn_id(),
+					.pad_btn = btn->get(),
+					.value = value,
+					.max_value = max_value,
+					.pressed = pressed
+				};
+				func(params, abort);
+				if (abort) break;
 			}
 		}
 
 		m_mutex.unlock();
+		return abort;
 	}
 };
 
@@ -221,7 +277,7 @@ struct emulated_pads_config : cfg::node
 		m_mutex.lock();
 
 		bool result = false;
-		const std::string cfg_name = fmt::format("%sconfig/%s.yml", fs::get_config_dir(), cfg_id);
+		const std::string cfg_name = fmt::format("%s%s.yml", fs::get_config_dir(true), cfg_id);
 		cfg_log.notice("Loading %s config: %s", cfg_id, cfg_name);
 
 		from_default();
@@ -258,7 +314,7 @@ struct emulated_pads_config : cfg::node
 	{
 		std::lock_guard lock(m_mutex);
 
-		const std::string cfg_name = fmt::format("%sconfig/%s.yml", fs::get_config_dir(), cfg_id);
+		const std::string cfg_name = fmt::format("%s%s.yml", fs::get_config_dir(true), cfg_id);
 		cfg_log.notice("Saving %s config to '%s'", cfg_id, cfg_name);
 
 		if (!fs::create_path(fs::get_parent_dir(cfg_name)))

@@ -6,7 +6,7 @@
 namespace utils
 {
 	template <typename T>
-	concept FastRandomAccess = requires (T& obj)
+	concept FastRandomAccess = requires (const T& obj)
 	{
 		std::data(obj)[std::size(obj)];
 	};
@@ -18,20 +18,17 @@ namespace utils
 	};
 
 	template <typename T>
-	concept Bitcopy = (std::is_arithmetic_v<T>) || (std::is_enum_v<T>) || Integral<T> || requires ()
+	concept Bitcopy = (std::is_arithmetic_v<T>) || (std::is_enum_v<T>) || Integral<T> || typename T::enable_bitcopy()();
+
+	template <typename T>
+	concept TupleAlike = (!FastRandomAccess<T>) && requires ()
 	{
-		std::enable_if_t<std::conjunction_v<typename T::enable_bitcopy>>();
+		std::tuple_size<std::remove_cvref_t<T>>::value;
 	};
 
 	template <typename T>
-	concept TupleAlike = requires ()
-	{
-		std::tuple_size<std::remove_cv_t<T>>::value;
-	};
 
-	template <typename T>
-	concept ListAlike = requires (T& obj) { obj.insert(obj.end(), std::declval<typename T::value_type>()); };
-
+	concept ListAlike = requires(std::remove_cvref_t<T>& obj, T::value_type item) { obj.insert(obj.end(), std::move(item)); };
 	struct serial;
 
 	struct serialization_file_handler
@@ -124,7 +121,7 @@ public:
 			m_expect_little_data = value;
 		}
 
-		// Return true if small amounts of both input and output memory are expected (performance hint)  
+		// Return true if small amounts of both input and output memory are expected (performance hint)
 		bool expect_little_data() const
 		{
 			return m_expect_little_data;
@@ -209,9 +206,12 @@ public:
 			return true;
 		}
 
-		template <typename T> requires Integral<T>
+		template <uint MaxBits = 0, typename T> requires Integral<T> && (MaxBits <= sizeof(T) * 8)
 		bool deserialize_vle(T& value)
 		{
+			using unsigned_type = std::make_unsigned_t<T>;
+			unsigned_type result{};
+			constexpr u32 bit_width = MaxBits ? sizeof(T) * 8 : MaxBits;
 			value = {};
 
 			for (u32 i = 0;; i += 7)
@@ -223,11 +223,24 @@ public:
 					return false;
 				}
 
-				value |= static_cast<T>(byte_data % 0x80) << i;
+				const unsigned_type payload = static_cast<unsigned_type>(byte_data % 0x80);
+
+				if (i >= bit_width || payload > (~unsigned_type{} >> i))
+				{
+					return false;
+				}
+
+				result |= payload << i;
 
 				if (!(byte_data & 0x80))
 				{
+					value = static_cast<T>(result);
 					break;
+				}
+
+				if (i > bit_width - 7)
+				{
+					return false;
 				}
 			}
 
@@ -247,6 +260,15 @@ public:
 		bool serialize(T& obj)
 		{
 			return raw_serialize(std::addressof(obj), sizeof(obj));
+		}
+
+		template <typename T>
+		static constexpr usz c_tup_size = std::tuple_size_v<std::conditional_t<TupleAlike<T>, std::remove_cvref_t<T>, std::tuple<>>>;
+
+		template <typename T>
+		static std::remove_cvref_t<T>& as_nonconst(T&& arg) noexcept
+		{
+			return const_cast<std::remove_cvref_t<T>&>(static_cast<const T&>(arg));
 		}
 
 		// std::vector, std::basic_string
@@ -284,14 +306,21 @@ public:
 			}
 
 			usz size = 0;
-			if (!deserialize_vle(size))
+			if (!deserialize_vle<28>(size))
 			{
 				return false;
 			}
 
 			if constexpr (Bitcopy<typename T::value_type>)
 			{
-				if (!raw_serialize([&](){ obj.resize(size); return obj.data(); }, sizeof(obj[0]) * size))
+				if (size > static_cast<usz>(umax) / sizeof(obj[0]))
+				{
+					return false;
+				}
+
+				const usz data_size = sizeof(obj[0]) * size;
+
+				if (!raw_serialize([&](){ obj.resize(size); return obj.data(); }, data_size))
 				{
 					obj.clear();
 					return false;
@@ -327,9 +356,24 @@ public:
 			{
 				for (auto&& value : obj)
 				{
-					if (!serialize(value))
+					if constexpr (c_tup_size<decltype(*std::data(obj))> == 2)
 					{
-						return false;
+						if (!serialize(as_nonconst(std::get<0>(value))))
+						{
+							return false;
+						}
+
+						if (!serialize(as_nonconst(std::get<1>(value))))
+						{
+							return false;
+						}
+					}
+					else
+					{
+						if (!serialize(value))
+						{
+							return false;
+						}
 					}
 				}
 
@@ -347,9 +391,24 @@ public:
 
 				for (auto&& value : obj)
 				{
-					if (!serialize(value))
+					if constexpr (c_tup_size<decltype(value)> == 2)
 					{
-						return false;
+						if (!serialize(as_nonconst(std::get<0>(value))))
+						{
+							return false;
+						}
+
+						if (!serialize(as_nonconst(std::get<1>(value))))
+						{
+							return false;
+						}
+					}
+					else
+					{
+						if (!serialize(value))
+						{
+							return false;
+						}
 					}
 				}
 
@@ -364,7 +423,7 @@ public:
 			}
 
 			usz size = 0;
-			if (!deserialize_vle(size))
+			if (!deserialize_vle<28>(size))
 			{
 				return false;
 			}
@@ -388,7 +447,8 @@ public:
 			return true;
 		}
 
-		template <typename T> requires requires (T& obj) { (obj.*(&T::operator()))(std::declval<stx::exact_t<utils::serial&>>()); }
+		template <typename T>
+			requires requires(T& obj, utils::serial& ar) { (obj.*(&T::operator()))(stx::exact_t<utils::serial&>(ar)); }
 		bool serialize(T& obj)
 		{
 			obj(*this);
@@ -412,7 +472,7 @@ public:
 		}
 
 		// std::pair, std::tuple
-		template <typename T> requires TupleAlike<T> && (!FastRandomAccess<T>)
+		template <typename T> requires TupleAlike<T>
 		bool serialize(T& obj)
 		{
 			return serialize_tuple(obj);
@@ -423,7 +483,7 @@ public:
 		bool operator()(Args&&... args) noexcept
 		{
 			return ((AUDIT(!std::is_const_v<std::remove_reference_t<Args>> || is_writing())
-				, serialize(const_cast<std::remove_cvref_t<Args>&>(static_cast<const Args&>(args)))), ...);
+				, serialize(as_nonconst(args))), ...);
 		}
 
 		// Code style utility, for when utils::serial is a pointer for example
@@ -514,35 +574,53 @@ public:
 
 		template <typename T> requires (std::is_copy_constructible_v<std::remove_const_t<T>>) && (std::is_constructible_v<std::remove_const_t<T>> || Bitcopy<std::remove_const_t<T>> ||
 			std::is_constructible_v<std::remove_const_t<T>, stx::exact_t<serial&>> || TupleAlike<std::remove_const_t<T>>)
-		operator T() noexcept
+		explicit operator T() noexcept
 		{
 			AUDIT(!is_writing());
 
 			using type = std::remove_const_t<T>;
+			using not_tuple_t = std::conditional_t<TupleAlike<T>, char, type>;
 
 			if constexpr (Bitcopy<T>)
 			{
-				u8 buf[sizeof(type)]{};
+				u8 buf[sizeof(not_tuple_t)]{};
 				ensure(raw_serialize(buf, sizeof(buf)));
-				return std::bit_cast<type>(buf);
-			}
-			else if constexpr (std::is_constructible_v<type, stx::exact_t<serial&>>)
-			{
-				return type(stx::exact_t<serial&>(*this));
-			}
-			else if constexpr (std::is_constructible_v<type>)
-			{
-				type value{};
-				ensure(serialize(value));
-				return value;
+				return std::bit_cast<not_tuple_t>(buf);
 			}
 			else if constexpr (TupleAlike<T>)
 			{
-				static_assert(std::tuple_size_v<type> == 2, "Unimplemented tuple serialization!");
+				constexpr int tup_size = c_tup_size<type>;
 
-				auto first = operator std::remove_cvref_t<decltype(std::get<0>(std::declval<type&>()))>();
-				return type{ std::move(first)
-					, operator std::remove_cvref_t<decltype(std::get<1>(std::declval<type&>()))> };
+				static_assert(tup_size == 2 || tup_size == 4, "Unimplemented tuple serialization!");
+
+				using first_t  = typename std::tuple_element<std::min(0, tup_size - 1), type>::type;
+				using second_t = typename std::tuple_element<std::min(1, tup_size - 1), type>::type;
+				using third_t  = typename std::tuple_element<std::min(2, tup_size - 1), type>::type;
+				using fourth_t = typename std::tuple_element<std::min(3, tup_size - 1), type>::type;
+
+				first_t first = this->operator first_t();
+
+				if constexpr (tup_size == 4)
+				{
+					second_t second = this->operator second_t();
+					third_t third = this->operator third_t();
+
+					return type{ std::move(first), std::move(second), std::move(third), this->operator fourth_t() };
+				}
+				else
+				{
+					return type{ std::move(first), this->operator second_t() };
+				}
+			}
+			else if constexpr (std::is_constructible_v<type, stx::exact_t<serial&>>)
+			{
+				return not_tuple_t(stx::exact_t<serial&>(*this));
+			}
+			else if constexpr (std::is_constructible_v<type>)
+			{
+				not_tuple_t value{};
+				ensure(serialize(value));
+				return value;
 			}
 		}
 

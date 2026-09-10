@@ -8,6 +8,7 @@
 #include "Crypto/unself.h"
 #include "Loader/ELF.h"
 
+#include "Emu/Cell/PPUFunction.h"
 #include "Emu/Cell/PPUThread.h"
 #include "Emu/Cell/ErrorCodes.h"
 #include "Crypto/unedat.h"
@@ -63,8 +64,8 @@ extern const std::map<std::string_view, int> g_prx_list
 	{ "libcelpenc.sprx", 0 },
 	{ "libddpdec.sprx", 0 },
 	{ "libdivxdec.sprx", 0 },
-	{ "libdmux.sprx", 0 },
-	{ "libdmuxpamf.sprx", 0 },
+	{ "libdmux.sprx", 1 },
+	{ "libdmuxpamf.sprx", 1 },
 	{ "libdtslbrdec.sprx", 0 },
 	{ "libfiber.sprx", 0 },
 	{ "libfont.sprx", 0 },
@@ -115,7 +116,7 @@ extern const std::map<std::string_view, int> g_prx_list
 	{ "libssl.sprx", 0 },
 	{ "libsvc1d.sprx", 0 },
 	{ "libsync2.sprx", 0 },
-	{ "libsysmodule.sprx", 0 },
+	{ "libsysmodule.sprx", 1 },
 	{ "libsysutil.sprx", 1 },
 	{ "libsysutil_ap.sprx", 1 },
 	{ "libsysutil_authdialog.sprx", 1 },
@@ -177,6 +178,9 @@ extern const std::map<std::string_view, int> g_prx_list
 
 bool ppu_register_library_lock(std::string_view libname, bool lock_lib);
 
+extern error_code sysmoduleModuleStart(ppu_thread& ppu, u32 args, vm::ptr<void> argp);
+extern error_code sysmoduleModuleStop(ppu_thread& ppu);
+
 static error_code prx_load_module(const std::string& vpath, u64 flags, vm::ptr<sys_prx_load_module_option_t> /*pOpt*/, fs::file src = {}, s64 file_offset = 0)
 {
 	if (flags != 0)
@@ -232,12 +236,18 @@ static error_code prx_load_module(const std::string& vpath, u64 flags, vm::ptr<s
 	{
 		const auto prx = idm::make_ptr<lv2_obj, lv2_prx>();
 
+		if (name == "libsysmodule.sprx")
+		{
+			prx->start = vm::cast(g_fxo->get<ppu_function_manager>().func_addr(FIND_FUNC(sysmoduleModuleStart)));
+			prx->stop = vm::cast(g_fxo->get<ppu_function_manager>().func_addr(FIND_FUNC(sysmoduleModuleStop)));
+		}
+
 		prx->name = std::move(name);
 		prx->path = std::move(path);
 
 		sys_prx.warning("Ignored module: \"%s\" (id=0x%x)", vpath, idm::last_id());
 
-		return not_an_error(idm::last_id());
+		return not_an_error(idm::last_id<lv2_prx>());
 	};
 
 	if (ignore)
@@ -265,7 +275,7 @@ static error_code prx_load_module(const std::string& vpath, u64 flags, vm::ptr<s
 
 	u128 klic = g_fxo->get<loaded_npdrm_keys>().last_key();
 
-	src = decrypt_self(std::move(src), reinterpret_cast<u8*>(&klic), nullptr, true);
+	src = decrypt_self(std::move(src), reinterpret_cast<u8*>(&klic));
 
 	if (!src)
 	{
@@ -300,7 +310,7 @@ static error_code prx_load_module(const std::string& vpath, u64 flags, vm::ptr<s
 
 	sys_prx.success("Loaded module: \"%s\" (id=0x%x)", vpath, idm::last_id());
 
-	return not_an_error(idm::last_id());
+	return not_an_error(idm::last_id<lv2_prx>());
 }
 
 fs::file make_file_view(fs::file&& file, u64 offset, u64 size);
@@ -310,11 +320,11 @@ std::function<void(void*)> lv2_prx::load(utils::serial& ar)
 	[[maybe_unused]] const s32 version = GET_SERIALIZATION_VERSION(lv2_prx_overlay);
 
 	const std::string path = vfs::get(ar.pop<std::string>());
-	const s64 offset = ar;
-	const u32 state = ar;
+	const s64 offset{ar};
+	const u32 state{ar};
 
 	usz seg_count = 0;
-	ar.deserialize_vle(seg_count);
+	ar.deserialize_vle<9>(seg_count);
 
 	shared_ptr<lv2_prx> prx;
 
@@ -337,7 +347,7 @@ std::function<void(void*)> lv2_prx::load(utils::serial& ar)
 		{
 			u128 klic = g_fxo->get<loaded_npdrm_keys>().last_key();
 			file = make_file_view(std::move(file), offset, umax);
-			prx = ppu_load_prx(ppu_prx_object{decrypt_self(std::move(file), reinterpret_cast<u8*>(&klic))}, false, path, 0, &ar);
+			prx = ppu_load_prx(ppu_prx_object{decrypt_self(std::move(file), reinterpret_cast<u8*>(&klic))}, false, path, offset, &ar);
 			prx->m_loaded_flags = std::move(loaded_flags);
 			prx->m_external_loaded_flags = std::move(external_flags);
 
@@ -358,7 +368,7 @@ std::function<void(void*)> lv2_prx::load(utils::serial& ar)
 			for (usz i = 0; i < seg_count; i++)
 			{
 				auto& seg = prx->segs.emplace_back();
-				seg.addr = ar;
+				ar(seg.addr);
 				seg.size = 1; // TODO
 			}
 		}
@@ -380,7 +390,9 @@ void lv2_prx::save(utils::serial& ar)
 {
 	USING_SERIALIZATION_VERSION(lv2_prx_overlay);
 
-	ar(vfs::retrieve(path), offset, state);
+	const std::string vpath = vfs::retrieve(path);
+
+	ar(vpath, offset, state);
 
 	// Save segments count
 	ar.serialize_vle(segs.size());
@@ -391,10 +403,18 @@ void lv2_prx::save(utils::serial& ar)
 		ar(m_external_loaded_flags);
 	}
 
+	std::string segments;
+
 	for (const ppu_segment& seg : segs)
 	{
-		if (seg.type == 0x1u && seg.size) ar(seg.addr);
+		if (seg.type == 0x1u && seg.size)
+		{
+			fmt::append(segments, " 0x%x", seg.addr);
+			ar(seg.addr);
+		}
 	}
+
+	(vpath.empty() ? sys_prx.error : sys_prx.success)("lv2_prx::save(): vpath='%s', offset=0x%x, state=%x, segments:%s", vpath, offset, +state, segments);
 }
 
 error_code sys_prx_get_ppu_guid(ppu_thread& ppu)
@@ -899,7 +919,7 @@ error_code _sys_prx_register_library(ppu_thread& ppu, vm::ptr<void> library)
 			{
 				for (u32 lib_addr = prx.exports_start, index = 0; lib_addr < prx.exports_end; index++, lib_addr += vm::read8(lib_addr) ? vm::read8(lib_addr) : sizeof_lib)
 				{
-					if (std::memcpy(vm::base(lib_addr), mem_copy.data(), sizeof_lib) == 0)
+					if (std::memcmp(vm::base(lib_addr), mem_copy.data(), sizeof_lib) == 0)
 					{
 						atomic_storage<char>::release(prx.m_external_loaded_flags[index], true);
 						return true;
@@ -1034,7 +1054,7 @@ error_code _sys_prx_get_module_info(ppu_thread& ppu, u32 id, u64 flags, vm::ptr<
 		return CELL_EFAULT;
 	}
 
-	if (pOpt->info->size != pOpt->info.size())
+	if (pOpt->info->size != pOpt->info.size() && pOpt->info_v2->size != pOpt->info_v2.size())
 	{
 		return CELL_EINVAL;
 	}
@@ -1072,6 +1092,14 @@ error_code _sys_prx_get_module_info(ppu_thread& ppu, u32 id, u64 flags, vm::ptr<
 		pOpt->info->segments_num = i;
 	}
 
+	if (pOpt->info_v2->size == pOpt->info_v2.size())
+	{
+		pOpt->info_v2->exports_addr = prx->exports_start;
+		pOpt->info_v2->exports_size = prx->exports_end - prx->exports_start;
+		pOpt->info_v2->imports_addr = prx->imports_start;
+		pOpt->info_v2->imports_size = prx->imports_end - prx->imports_start;
+	}
+
 	return CELL_OK;
 }
 
@@ -1079,11 +1107,30 @@ error_code _sys_prx_get_module_id_by_name(ppu_thread& ppu, vm::cptr<char> name, 
 {
 	ppu.state += cpu_flag::wait;
 
-	sys_prx.todo("_sys_prx_get_module_id_by_name(name=%s, flags=%d, pOpt=*0x%x)", name, flags, pOpt);
+	sys_prx.warning("_sys_prx_get_module_id_by_name(name=%s, flags=%d, pOpt=*0x%x)", name, flags, pOpt);
 
-	//if (realName == "?") ...
+	std::string module_name;
+	if (!vm::read_string(name.addr(), 28, module_name))
+	{
+		return CELL_EINVAL;
+	}
 
-	return not_an_error(CELL_PRX_ERROR_UNKNOWN_MODULE);
+	const auto [prx, id] = idm::select<lv2_obj, lv2_prx>([&](u32 id, lv2_prx& prx) -> u32
+	{
+		if (strncmp(module_name.c_str(), prx.module_info_name, sizeof(prx.module_info_name)) == 0)
+		{
+			return id;
+		}
+
+		return 0;
+	});
+
+	if (!id)
+	{
+		return CELL_PRX_ERROR_UNKNOWN_MODULE;
+	}
+
+	return not_an_error(id);
 }
 
 error_code _sys_prx_get_module_id_by_address(ppu_thread& ppu, u32 addr)

@@ -1,10 +1,10 @@
 #include "stdafx.h"
-#include "Emu/RSX/rsx_utils.h"
+#include "Emu/RSX/Utils/algorithm.hpp"
 #include "RSXContext.h"
 
 namespace rsx
 {
-	GCM_tile_reference GCM_context::get_tiled_memory_region(const utils::address_range& range) const
+	GCM_tile_reference GCM_context::get_tiled_memory_region(const utils::address_range32& range) const
 	{
 		if (rsx::get_location(range.start) != CELL_GCM_LOCATION_MAIN)
 		{
@@ -27,9 +27,12 @@ namespace rsx
 			}
 
 			const auto tile_base_address = iomap_table.get_addr(tile.offset);
-			const auto tile_range = utils::address_range::start_length(tile_base_address, tile.size);
+			const auto tile_range = utils::address_range32::start_length(tile_base_address, tile.size);
 
-			if (range.inside(tile_range))
+			// NOTE: Some games will use contiguous ranges over multiple tiles.
+			// For such reasons, checking range.inside(tile_range) is not good enough.
+			// Instead, check for the first tile in the sequence.
+			if (range.overlaps(tile_range) && tile_range.overlaps(range.start))
 			{
 				ensure(tile_base_address + 1);
 				return { .base_address = tile_base_address, .tile = &tile };
@@ -39,12 +42,12 @@ namespace rsx
 		return {};
 	}
 
-	utils::address_range GCM_tile_reference::tile_align(const utils::address_range& range) const
+	utils::address_range32 GCM_tile_reference::tile_align(const utils::address_range32& range) const
 	{
 		const auto alignment = 64 * tile->pitch;
 		const u32 start_offset = rsx::align_down2(range.start - base_address, alignment);
 		const u32 end_offset = rsx::align2(range.end - base_address + 1, alignment);
 
-		return utils::address_range::start_length(start_offset + base_address, end_offset - start_offset);
+		return utils::address_range32::start_length(start_offset + base_address, end_offset - start_offset);
 	}
 }

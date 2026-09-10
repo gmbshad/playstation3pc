@@ -4,11 +4,8 @@
 #include "util/atomic.hpp"
 #include "util/shared_ptr.hpp"
 
+#include <thread>
 #include <string>
-#include <concepts>
-
-#include "mutex.h"
-#include "lockless.h"
 
 // Hardware core layout
 enum class native_core_arrangement : u32
@@ -100,7 +97,7 @@ class thread_future
 	thread_future* prev{};
 
 protected:
-	atomic_t<void(*)(thread_base*, thread_future*)> exec{};
+	atomic_t<void(*)(const thread_base*, thread_future*)> exec{};
 
 	atomic_t<u32> done{0};
 
@@ -132,7 +129,7 @@ public:
 	const native_entry entry_point;
 
 	// Set name for debugger
-	static void set_name(std::string);
+	static void set_name(std::string name);
 
 private:
 	// Thread handle (platform-specific)
@@ -235,11 +232,7 @@ public:
 	}
 
 	// Set current thread name (not recommended)
-	static void set_name(std::string name)
-	{
-		g_tls_this_thread->m_tname.store(make_single<std::string>(name));
-		g_tls_this_thread->set_name(std::move(name));
-	}
+	static void set_name(std::string name);
 
 	// Set thread name (not recommended)
 	template <typename T>
@@ -322,6 +315,9 @@ public:
 	// Exit.
 	[[noreturn]] static void emergency_exit(std::string_view reason);
 
+	// Exit the current named thread as errored without reporting a fatal error.
+	[[noreturn]] static void silent_exit() noexcept;
+
 	// Get current thread (may be nullptr)
 	static thread_base* get_current()
 	{
@@ -378,13 +374,23 @@ private:
 	static const u64 process_affinity_mask;
 };
 
+#if defined(__has_cpp_attribute)
+#if __has_cpp_attribute(no_unique_address)
+#define NO_UNIQUE_ADDRESS [[no_unique_address]]
+#else
+#define NO_UNIQUE_ADDRESS
+#endif
+#else
+#define NO_UNIQUE_ADDRESS
+#endif
+
 // Used internally
 template <bool Discard, typename Ctx, typename... Args>
 class thread_future_t : public thread_future, result_storage<Ctx, std::conditional_t<Discard, int, void>, Args...>
 {
-	[[no_unique_address]] decltype(std::make_tuple(std::forward<Args>(std::declval<Args>())...)) m_args;
+	NO_UNIQUE_ADDRESS decltype(std::make_tuple(std::forward<Args>(std::declval<Args>())...)) m_args;
 
-	[[no_unique_address]] Ctx m_func;
+	NO_UNIQUE_ADDRESS Ctx m_func;
 
 	using future = thread_future_t;
 
@@ -393,7 +399,7 @@ public:
 		: m_args(std::forward<Args>(args)...)
 		, m_func(std::forward<Ctx>(func))
 	{
-		thread_future::exec.raw() = +[](thread_base* tb, thread_future* tf)
+		thread_future::exec.raw() = +[](const thread_base* tb, thread_future* tf)
 		{
 			const auto _this = static_cast<future*>(tf);
 
@@ -459,6 +465,8 @@ public:
 namespace stx
 {
 	struct launch_retainer;
+
+	extern atomic_t<u32> g_launch_retainer;
 }
 
 // Derived from the callable object Context, possibly a lambda
@@ -475,6 +483,11 @@ class named_thread final : public Context, result_storage<Context>, thread_base
 
 	u64 entry_point2()
 	{
+		while (u32 value = stx::g_launch_retainer)
+		{
+			stx::g_launch_retainer.wait(value);
+		}
+
 		thread::initialize([]()
 		{
 			if constexpr (!result::empty)
@@ -769,7 +782,7 @@ public:
 		}
 
 		// Move the context (if movable)
-		new (static_cast<void*>(m_threads + m_count - 1)) Thread(std::string(name) + std::to_string(m_count - 1), std::forward<Context>(f));
+		new (static_cast<void*>(m_threads + m_count - 1)) Thread(std::string(name) + std::to_string(m_count), std::forward<Context>(f));
 	}
 
 	// Constructor with a function performed before adding more threads
@@ -787,31 +800,30 @@ public:
 		m_count = 0;
 
 		// Create all threads
-		for (u32 i = 0; i < count - 1; i++)
+		for (; m_count < count - 1; m_count++)
 		{
 			// Copy the context
 			std::remove_cvref_t<Context> context(static_cast<const Context&>(f));
 
 			// Perform the check and additional preparations for each context
-			if (!std::invoke(std::forward<CheckAndPrepare>(check), i, context))
+			if (!std::invoke(std::forward<CheckAndPrepare>(check), m_count, context))
 			{
 				return;
 			}
 
-			m_count++;
-			new (static_cast<void*>(m_threads + i)) Thread(std::string(name) + std::to_string(i + 1), std::move(context));
+			new (static_cast<void*>(m_threads + m_count)) Thread(std::string(name) + std::to_string(m_count + 1), std::move(context));
 		}
 
 		// Move the context (if movable)
 		std::remove_cvref_t<Context> context(std::forward<Context>(f));
 
-		if (!std::invoke(std::forward<CheckAndPrepare>(check), m_count - 1, context))
+		if (!std::invoke(std::forward<CheckAndPrepare>(check), m_count, context))
 		{
 			return;
 		}
 
+		new (static_cast<void*>(m_threads + m_count)) Thread(std::string(name) + std::to_string(m_count + 1), std::move(context));
 		m_count++;
-		new (static_cast<void*>(m_threads + m_count - 1)) Thread(std::string(name) + std::to_string(m_count - 1), std::move(context));
 	}
 
 	// Default constructor
@@ -893,3 +905,6 @@ public:
 		::operator delete(static_cast<void*>(m_threads), std::align_val_t{alignof(Thread)});
 	}
 };
+
+usz map_workload(std::string_view thread_name, usz thread_count, usz count, std::function<void(usz)>&& func);
+usz map_workload(std::string_view thread_name, usz thread_count, std::function<void()>&& func);

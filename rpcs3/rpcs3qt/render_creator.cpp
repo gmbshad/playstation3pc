@@ -1,22 +1,19 @@
 #include "render_creator.h"
 
-#include <QMessageBox>
-
 #include "Utilities/Thread.h"
 
 #if defined(HAVE_VULKAN)
-#include "Emu/RSX/VK/vkutils/instance.hpp"
+#include "Emu/RSX/VK/vkutils/instance.h"
 #endif
 
 #include <chrono>
 #include <condition_variable>
 #include <mutex>
-#include <thread>
 #include <util/logs.hpp>
 
 LOG_CHANNEL(cfg_log, "CFG");
 
-render_creator::render_creator(QObject *parent) : QObject(parent)
+render_creator::render_creator()
 {
 #if defined(HAVE_VULKAN)
 	// Some drivers can get stuck when checking for vulkan-compatible gpus, f.ex. if they're waiting for one to get
@@ -42,7 +39,7 @@ render_creator::render_creator(QObject *parent) : QObject(parent)
 		if (device_enum_context.create("RPCS3", true))
 		{
 			device_enum_context.bind();
-			std::vector<vk::physical_device>& gpus = device_enum_context.enumerate_devices();
+			const std::vector<vk::physical_device>& gpus = device_enum_context.enumerate_devices();
 
 			lock.lock();
 
@@ -74,21 +71,8 @@ render_creator::render_creator(QObject *parent) : QObject(parent)
 	}())
 	{
 		enum_thread.release(); // Detach thread (destructor is not called)
-
-		cfg_log.error("Vulkan device enumeration timed out");
-		const auto button = QMessageBox::critical(nullptr, tr("Vulkan Check Timeout"),
-			tr("Querying for Vulkan-compatible devices is taking too long. This is usually caused by malfunctioning "
-				"graphics drivers, reinstalling them could fix the issue.\n\n"
-				"Selecting ignore starts the emulator without Vulkan support."),
-			QMessageBox::Ignore | QMessageBox::Abort, QMessageBox::Abort);
-
-		if (button != QMessageBox::Ignore)
-		{
-			abort_requested = true;
-			return;
-		}
-
 		supports_vulkan = false;
+		vulkan_timed_out = true;
 	}
 	else
 	{
@@ -98,20 +82,12 @@ render_creator::render_creator(QObject *parent) : QObject(parent)
 #endif
 
 	// Graphics Adapter
-	Vulkan = render_info(vulkan_adapters, supports_vulkan, emu_settings_type::VulkanAdapter, true);
+	Vulkan = render_info(vulkan_adapters, supports_vulkan, emu_settings_type::VulkanAdapter);
 	OpenGL = render_info();
 	NullRender = render_info();
 
 #ifdef __APPLE__
 	OpenGL.supported = false;
-
-	if (!Vulkan.supported)
-	{
-		QMessageBox::warning(nullptr,
-							 tr("Warning"),
-							 tr("Vulkan is not supported on this Mac.\n"
-								"No graphics will be rendered."));
-	}
 #endif
 
 	renderers = { &Vulkan, &OpenGL, &NullRender };

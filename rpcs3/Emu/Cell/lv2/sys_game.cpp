@@ -10,6 +10,7 @@
 #include "Utilities/StrUtil.h"
 #include "Utilities/Thread.h"
 
+#include "Emu/Cell/timers.hpp"
 #include "sys_game.h"
 
 LOG_CHANNEL(sys_game);
@@ -47,12 +48,12 @@ public:
 		return true;
 	}
 
-	bool write(u8* buffer)
+	bool write(const u8* buffer)
 	{
 		if (!buffer)
 			return false;
 
-		storage.store(read_from_ptr<be_t<v128>>(buffer));
+		storage.store(read_from_ptr_unsafe<be_t<v128>>(buffer));
 		written = true;
 
 		return true;

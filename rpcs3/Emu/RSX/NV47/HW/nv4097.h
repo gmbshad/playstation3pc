@@ -55,6 +55,8 @@ namespace rsx
 
 		void set_render_mode(context* ctx, u32, u32 arg);
 
+		void set_shading_mode(context* ctx, u32 reg, u32 arg);
+
 		void set_zcull_render_enable(context* ctx, u32, u32);
 
 		void set_zcull_stats_enable(context* ctx, u32, u32);
@@ -86,6 +88,8 @@ namespace rsx
 		void set_blend_factor(context* ctx, u32 reg, u32 arg);
 
 		void set_transform_constant_load(context* ctx, u32 reg, u32 arg);
+
+		void set_aa_control(context* ctx, u32 reg, u32 arg);
 
 #define RSX(ctx) ctx->rsxthr
 #define REGS(ctx) (&rsx::method_registers)
@@ -221,12 +225,12 @@ namespace rsx
 			}
 		};
 
-		template<u32 index>
-		struct set_texture_dirty_bit
+		template <u32 index>
+		struct set_fragment_texture_dirty_bit
 		{
-			static void impl(context* ctx, u32 /*reg*/, u32 /*arg*/)
+			static void impl(context* ctx, u32 /*reg*/, u32 arg)
 			{
-				util::set_fragment_texture_dirty_bit(ctx, index);
+				util::set_fragment_texture_dirty_bit(ctx, arg, index);
 			}
 		};
 

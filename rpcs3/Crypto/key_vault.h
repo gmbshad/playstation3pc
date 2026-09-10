@@ -30,7 +30,7 @@ struct SELF_KEY
 	u8 priv[0x15]{};
 	u32 curve_type{};
 
-	SELF_KEY(u64 ver_start, u64 ver_end, u16 rev, u32 type, const std::string& e, const std::string& r, const std::string& pb, const std::string& pr, u32 ct);
+	SELF_KEY(u64 ver_start, u64 ver_end, u16 rev, u32 type, std::string_view e, std::string_view r, std::string_view pb, std::string_view pr, u32 ct);
 };
 
 constexpr u32 PASSPHRASE_KEY_LEN = 16;
@@ -319,13 +319,13 @@ class KeyVault
 	std::vector<SELF_KEY> sk_LDR_arr{};
 	std::vector<SELF_KEY> sk_UNK7_arr{};
 	std::vector<SELF_KEY> sk_NPDRM_arr{};
-	std::unique_ptr<u8[]> klicensee_key{};
+	u8 klicensee_key[16]{};
 
 public:
 	KeyVault();
 	SELF_KEY FindSelfKey(u32 type, u16 revision, u64 version);
-	void SetKlicenseeKey(u8* key);
-	u8* GetKlicenseeKey() const;
+	void SetKlicenseeKey(const u8* key);
+	const u8* GetKlicenseeKey() const;
 
 private:
 	void LoadSelfLV0Keys();
@@ -347,4 +347,4 @@ private:
 };
 
 // RAP to RIF function.
-void rap_to_rif(unsigned char* rap, unsigned char* rif);
+void rap_to_rif(const unsigned char* rap, unsigned char* rif);

@@ -1,11 +1,7 @@
 #include "stdafx.h"
 #include "Utilities/File.h"
-#include "Crypto/md5.h"
-#include "Crypto/aes.h"
 #include "skylander_dialog.h"
 #include "Emu/Io/Skylander.h"
-
-#include "util/asm.hpp"
 
 #include <QLabel>
 #include <QGroupBox>
@@ -21,7 +17,7 @@ skylander_dialog* skylander_dialog::inst = nullptr;
 std::optional<std::tuple<u8, u16, u16>> skylander_dialog::sky_slots[UI_SKY_NUM];
 QString last_skylander_path;
 
-const std::map<const std::pair<const u16, const u16>, const std::string> list_skylanders = {
+static const std::map<const std::pair<const u16, const u16>, const std::string> list_skylanders = {
     {{0, 0x0000}, "Whirlwind"},
     {{0, 0x1801}, "Series 2 Whirlwind"},
     {{0, 0x1C02}, "Polar Whirlwind"},
@@ -168,9 +164,9 @@ const std::map<const std::pair<const u16, const u16>, const std::string> list_sk
     {{205, 0x0000}, "Sky Iron Shield"},
     {{206, 0x0000}, "Winged Boots"},
     {{207, 0x0000}, "Sparx the Dragonfly"},
-    {{208, 0x0000}, "Dragonfire Cannon"},
+    {{208, 0x1206}, "Dragonfire Cannon"},
     {{208, 0x1602}, "Golden Dragonfire Cannon"},
-    {{209, 0x0000}, "Scorpion Striker"},
+    {{209, 0x1206}, "Scorpion Striker"},
     {{210, 0x3002}, "Biter's Bane"},
     {{210, 0x3008}, "Sorcerous Skull"},
     {{210, 0x300B}, "Axe of Illusion"},
@@ -305,15 +301,15 @@ const std::map<const std::pair<const u16, const u16>, const std::string> list_sk
     {{509, 0x0000}, "Small Fry"},
     {{510, 0x0000}, "Drobit"},
     {{519, 0x0000}, "Trigger Snappy"},
-    {{526, 0x0000}, "Whisper Elf"},
-    {{540, 0x0000}, "Barkley"},
+    {{526, 0x3000}, "Whisper Elf"},
+    {{540, 0x3000}, "Barkley"},
     {{540, 0x3402}, "Gnarly Barkley"},
-    {{541, 0x0000}, "Thumpling"},
+    {{541, 0x3000}, "Thumpling"},
     {{514, 0x0000}, "Gill Runt"},
-    {{542, 0x0000}, "Mini-Jini"},
+    {{542, 0x3000}, "Mini-Jini"},
     {{503, 0x0000}, "Spry"},
     {{504, 0x0000}, "Hijinx"},
-    {{543, 0x0000}, "Eye Small"},
+    {{543, 0x1000}, "Eye Small"},
     {{601, 0x0000}, "King Pen"},
     {{602, 0x0000}, "Tri-Tip"},
     {{603, 0x0000}, "Chopscotch"},
@@ -423,15 +419,15 @@ const std::map<const std::pair<const u16, const u16>, const std::string> list_sk
     {{3013, 0x2206}, "LightCore Grim Creeper"},
     {{3014, 0x0000}, "Rip Tide"},
     {{3015, 0x0000}, "Punk Shock"},
-    {{3200, 0x0000}, "Battle Hammer"},
-    {{3201, 0x0000}, "Sky Diamond"},
-    {{3202, 0x0000}, "Platinum Sheep"},
-    {{3203, 0x0000}, "Groove Machine"},
+    {{3200, 0x2000}, "Battle Hammer"},
+    {{3201, 0x2000}, "Sky Diamond"},
+    {{3202, 0x2000}, "Platinum Sheep"},
+    {{3203, 0x2000}, "Groove Machine"},
     {{3204, 0x0000}, "UFO Hat"},
-    {{3300, 0x0000}, "Sheep Wreck Island"},
-    {{3301, 0x0000}, "Tower of Time"},
-    {{3302, 0x0000}, "Fiery Forge"},
-    {{3303, 0x0000}, "Arkeyan Crossbow"},
+    {{3300, 0x2000}, "Sheep Wreck Island"},
+    {{3301, 0x2000}, "Tower of Time"},
+    {{3302, 0x2206}, "Fiery Forge"},
+    {{3303, 0x2206}, "Arkeyan Crossbow"},
     {{3220, 0x0000}, "Jet Stream"},
     {{3221, 0x0000}, "Tomb Buggy"},
     {{3222, 0x0000}, "Reef Ripper"},
@@ -506,7 +502,8 @@ const std::map<const std::pair<const u16, const u16>, const std::string> list_sk
 
 u16 skylander_crc16(u16 init_value, const u8* buffer, u32 size)
 {
-	const unsigned short CRC_CCITT_TABLE[256] = {0x0000, 0x1021, 0x2042, 0x3063, 0x4084, 0x50A5, 0x60C6, 0x70E7, 0x8108, 0x9129, 0xA14A, 0xB16B, 0xC18C, 0xD1AD, 0xE1CE, 0xF1EF, 0x1231, 0x0210, 0x3273,
+	constexpr unsigned short CRC_CCITT_TABLE[256] = {
+	    0x0000, 0x1021, 0x2042, 0x3063, 0x4084, 0x50A5, 0x60C6, 0x70E7, 0x8108, 0x9129, 0xA14A, 0xB16B, 0xC18C, 0xD1AD, 0xE1CE, 0xF1EF, 0x1231, 0x0210, 0x3273,
 	    0x2252, 0x52B5, 0x4294, 0x72F7, 0x62D6, 0x9339, 0x8318, 0xB37B, 0xA35A, 0xD3BD, 0xC39C, 0xF3FF, 0xE3DE, 0x2462, 0x3443, 0x0420, 0x1401, 0x64E6, 0x74C7, 0x44A4, 0x5485, 0xA56A, 0xB54B, 0x8528,
 	    0x9509, 0xE5EE, 0xF5CF, 0xC5AC, 0xD58D, 0x3653, 0x2672, 0x1611, 0x0630, 0x76D7, 0x66F6, 0x5695, 0x46B4, 0xB75B, 0xA77A, 0x9719, 0x8738, 0xF7DF, 0xE7FE, 0xD79D, 0xC7BC, 0x48C4, 0x58E5, 0x6886,
 	    0x78A7, 0x0840, 0x1861, 0x2802, 0x3823, 0xC9CC, 0xD9ED, 0xE98E, 0xF9AF, 0x8948, 0x9969, 0xA90A, 0xB92B, 0x5AF5, 0x4AD4, 0x7AB7, 0x6A96, 0x1A71, 0x0A50, 0x3A33, 0x2A12, 0xDBFD, 0xCBDC, 0xFBBF,
@@ -589,7 +586,7 @@ skylander_creator_dialog::skylander_creator_dialog(QWidget* parent)
 
 	setLayout(vbox_panel);
 
-	connect(combo_skylist, QOverload<int>::of(&QComboBox::currentIndexChanged), [=](int index)
+	connect(combo_skylist, &QComboBox::currentIndexChanged, [=](int index)
 	{
 		const u32 sky_info = combo_skylist->itemData(index).toUInt();
 		if (sky_info != 0xFFFFFFFF)
@@ -643,19 +640,18 @@ skylander_creator_dialog::skylander_creator_dialog(QWidget* parent)
 		}
 
 		std::array<u8, 0x40 * 0x10> buf{};
-		const auto data = buf.data();
 		// Set the block permissions
-		write_to_ptr<le_t<u32>>(data, 0x36, 0x690F0F0F);
+		write_to_ptr<le_t<u32>>(buf, 0x36, 0x690F0F0F);
 		for (u32 index = 1; index < 0x10; index++)
 		{
-			write_to_ptr<le_t<u32>>(data, (index * 0x40) + 0x36, 0x69080F7F);
+			write_to_ptr<le_t<u32>>(buf, (index * 0x40) + 0x36, 0x69080F7F);
 		}
 		// Set the skylander infos
-		write_to_ptr<le_t<u16>>(data, (sky_id | sky_var) + 1);
-		write_to_ptr<le_t<u16>>(data, 0x10, sky_id);
-		write_to_ptr<le_t<u16>>(data, 0x1C, sky_var);
+		write_to_ptr<le_t<u16>>(buf, (sky_id | sky_var) + 1);
+		write_to_ptr<le_t<u16>>(buf, 0x10, sky_id);
+		write_to_ptr<le_t<u16>>(buf, 0x1C, sky_var);
 		// Set checksum
-		write_to_ptr<le_t<u16>>(data, 0x1E, skylander_crc16(0xFFFF, data, 0x1E));
+		write_to_ptr<le_t<u16>>(buf, 0x1E, skylander_crc16(0xFFFF, buf.data(), 0x1E));
 
 		sky_file.write(buf.data(), buf.size());
 		sky_file.close();
@@ -666,7 +662,7 @@ skylander_creator_dialog::skylander_creator_dialog(QWidget* parent)
 
 	connect(btn_cancel, &QAbstractButton::clicked, this, &QDialog::reject);
 
-	connect(co_compl, QOverload<const QString&>::of(&QCompleter::activated),[=](const QString& text)
+	connect(co_compl, qOverload<const QString&>(&QCompleter::activated), [=](const QString& text)
 	{
 		combo_skylist->setCurrentText(text);
 		combo_skylist->setCurrentIndex(combo_skylist->findText(text));
@@ -799,10 +795,10 @@ void skylander_dialog::load_skylander_path(u8 slot, const QString& path)
 
 	clear_skylander(slot);
 
-	u16 sky_id  = reinterpret_cast<le_t<u16>&>(data[0x10]);
-	u16 sky_var = reinterpret_cast<le_t<u16>&>(data[0x1C]);
+	const u16 sky_id  = reinterpret_cast<le_t<u16>&>(data[0x10]);
+	const u16 sky_var = reinterpret_cast<le_t<u16>&>(data[0x1C]);
 
-	u8 portal_slot  = g_skyportal.load_skylander(data.data(), std::move(sky_file));
+	const u8 portal_slot  = g_skyportal.load_skylander(data, std::move(sky_file));
 	sky_slots[slot] = std::tuple(portal_slot, sky_id, sky_var);
 
 	update_edits();

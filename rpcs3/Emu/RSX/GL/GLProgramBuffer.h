@@ -1,10 +1,9 @@
 #pragma once
 #include "GLVertexProgram.h"
 #include "GLFragmentProgram.h"
-#include "GLHelpers.h"
 #include "GLPipelineCompiler.h"
 #include "../Program/ProgramStateCache.h"
-#include "../rsx_utils.h"
+#include "../Utils/rsx_utils.h"
 
 struct GLTraits
 {
@@ -102,6 +101,13 @@ struct GLTraits
 			// Bind locations 0 and 1 to the stream buffers
 			program->uniforms[0] = GL_STREAM_BUFFER_START + 0;
 			program->uniforms[1] = GL_STREAM_BUFFER_START + 1;
+
+			// Optional inputs
+			int location = 0;
+			if (program->uniforms.has_location("frag_depth", &location))
+			{
+				program->uniforms[location] = GL_TEMP_IMAGE_SLOT(0);
+			}
 		};
 
 		auto pipeline = compiler->compile(flags, post_create_func, post_link_func, callback);
@@ -136,13 +142,13 @@ struct GLProgramBuffer : public program_state_cache<GLTraits>
 	template <typename... Args>
 	void add_pipeline_entry(const RSXVertexProgram& vp, const RSXFragmentProgram& fp, void* &props, Args&& ...args)
 	{
-		get_graphics_pipeline(vp, fp, props, false, false, std::forward<Args>(args)...);
+		get_graphics_pipeline(nullptr, vp, fp, props, false, false, std::forward<Args>(args)...);
 	}
 
-	void preload_programs(const RSXVertexProgram& vp, const RSXFragmentProgram& fp)
+	void preload_programs(rsx::program_cache_hint_t* cache_hint, const RSXVertexProgram& vp, const RSXFragmentProgram& fp)
 	{
-		search_vertex_program(vp);
-		search_fragment_program(fp);
+		search_vertex_program(cache_hint, vp);
+		search_fragment_program(cache_hint, fp);
 	}
 
 	bool check_cache_missed() const

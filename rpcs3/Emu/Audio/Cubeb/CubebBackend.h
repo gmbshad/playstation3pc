@@ -1,7 +1,5 @@
 #pragma once
 
-#include <memory>
-#include "Utilities/mutex.h"
 #include "util/atomic.hpp"
 #include "Emu/Audio/AudioBackend.h"
 
@@ -53,6 +51,7 @@ private:
 	static long data_cb(cubeb_stream* stream, void* user_ptr, void const* input_buffer, void* output_buffer, long nframes);
 	static void state_cb(cubeb_stream* stream, void* user_ptr, cubeb_state state);
 	static void device_collection_changed_cb(cubeb* context, void* user_ptr);
+	static void log_cb(const char *fmt, ...);
 
 	struct device_handle
 	{
@@ -62,5 +61,4 @@ private:
 	};
 
 	device_handle GetDevice(std::string_view dev_id = "");
-	device_handle GetDefaultDeviceAlt(AudioFreq freq, AudioSampleSize sample_size, u32 ch_cnt);
 };

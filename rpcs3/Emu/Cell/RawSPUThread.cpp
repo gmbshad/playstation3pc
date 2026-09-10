@@ -2,8 +2,9 @@
 #include "Emu/IdManager.h"
 #include "Loader/ELF.h"
 #include "util/asm.hpp"
+#include "timers.hpp"
 
-#include "Emu/Cell/RawSPUThread.h"
+#include "SPUThread.h"
 
 inline void try_start(spu_thread& spu)
 {
@@ -39,8 +40,64 @@ bool spu_thread::read_reg(const u32 addr, u32& value)
 {
 	const u32 offset = addr - (RAW_SPU_BASE_ADDR + RAW_SPU_OFFSET * index) - RAW_SPU_PROB_OFFSET;
 
-	spu_log.trace("RawSPU[%u]: Read32(0x%x, offset=0x%x)", index, addr, offset);
+	const auto [old_stats, is_changed] = mmio_stats.fetch_op([&](raw_spu_log_stats_t& old)
+	{
+		if (old.mmio_offset == offset)
+		{
+			const u64 current = get_system_time();
 
+			if (current - old.mmio_time >= 1500)
+			{
+				old.mmio_time = current;
+				return true;
+			}
+
+			return false;
+		}
+
+		old.mmio_offset = offset;
+		return true;
+	});
+
+	std::string log_message = fmt::format("RawSPU[%u]: read_reg(0x%x, offset=0x%x)", index, addr, offset);
+
+	if (is_changed)
+	{
+		spu_log.trace("%s", log_message);
+	}
+
+	struct logger_end_t
+	{
+		u32 offset;
+		const u32* value;
+		atomic_t<raw_spu_log_stats_t>* stats;
+		std::string log_message;
+
+		~logger_end_t() noexcept
+		{
+			const auto [old, value_changed] = stats->fetch_op([&](raw_spu_log_stats_t& old)
+			{
+				if (old.mmio_offset == offset)
+				{
+					if (old.mmio_value != *value)
+					{
+						const u64 current = get_system_time();
+						old.mmio_time = current;
+						old.mmio_value = *value;
+						return true;
+					}
+				}
+
+				return false;
+			});
+
+			if (value_changed)
+			{
+				spu_log.trace("%s: value=0x%x", log_message, *value);
+			}
+		}
+	} logger_end{offset, &value, &mmio_stats, std::move(log_message)};
+	
 	switch (offset)
 	{
 	case MFC_CMDStatus_offs:
@@ -130,6 +187,18 @@ bool spu_thread::read_reg(const u32 addr, u32& value)
 		return true;
 	}
 
+	case Prxy_QueryMask_offs:
+	{
+		value = mfc_prxy_mask;
+		return true;
+	}
+
+	case Prxy_QueryType_offs:
+	{
+		value = 0;
+		return true;
+	}
+
 	case SPU_Out_MBox_offs:
 	{
 		value = ch_out_mbox.pop();
@@ -138,7 +207,29 @@ bool spu_thread::read_reg(const u32 addr, u32& value)
 
 	case SPU_MBox_Status_offs:
 	{
-		value = (ch_out_mbox.get_count() & 0xff) | ((4 - ch_in_mbox.get_count()) << 8 & 0xff00) | (ch_out_intr_mbox.get_count() << 16 & 0xff0000);
+		// Load channel counts atomically
+		auto counts = std::make_tuple(ch_out_mbox.get_count(), ch_in_mbox.get_count(), ch_out_intr_mbox.get_count());
+
+		while (true)
+		{
+			atomic_fence_acquire();
+
+			const auto counts_check = std::make_tuple(ch_out_mbox.get_count(), ch_in_mbox.get_count(), ch_out_intr_mbox.get_count());
+
+			if (counts_check == counts)
+			{
+				break;
+			}
+
+			// Update and reload
+			counts = counts_check;
+		}
+
+		const u32 out_mbox = std::get<0>(counts);
+		const u32 in_mbox = 4 - std::get<1>(counts);
+		const u32 intr_mbox = std::get<2>(counts);
+
+		value = (out_mbox & 0xff) | ((in_mbox << 8) & 0xff00) | ((intr_mbox << 16) & 0xff0000);
 		return true;
 	}
 
@@ -168,7 +259,7 @@ bool spu_thread::read_reg(const u32 addr, u32& value)
 	}
 	}
 
-	spu_log.error("RawSPU[%u]: Read32(0x%x): unknown/illegal offset (0x%x)", index, addr, offset);
+	spu_log.error("RawSPU[%u]: read_reg(0x%x): unknown/illegal offset (0x%x)", index, addr, offset);
 	return false;
 }
 
@@ -176,19 +267,37 @@ bool spu_thread::write_reg(const u32 addr, const u32 value)
 {
 	const u32 offset = addr - (RAW_SPU_BASE_ADDR + RAW_SPU_OFFSET * index) - RAW_SPU_PROB_OFFSET;
 
-	spu_log.trace("RawSPU[%u]: Write32(0x%x, offset=0x%x, value=0x%x)", index, addr, offset, value);
+	const auto [old_stats, is_changed] = mmio_stats.fetch_op([&](raw_spu_log_stats_t& old)
+	{
+		if (old.mmio_offset == offset && old.mmio_value == value)
+		{
+			const u64 current = get_system_time();
+
+			if (current - old.mmio_time >= 500)
+			{
+				old.mmio_time = current;
+				return true;
+			}
+
+			return false;
+		}
+
+		old.mmio_offset = offset;
+		old.mmio_value = value;
+		return true;
+	});
+
+	if (is_changed)
+	{
+		spu_log.trace("RawSPU[%u]: write_reg(0x%x, offset=0x%x, value=0x%x)", index, addr, offset, value);
+	}
 
 	switch (offset)
 	{
 	case MFC_LSA_offs:
 	{
-		if (value >= SPU_LS_SIZE)
-		{
-			break;
-		}
-
 		std::lock_guard lock(mfc_prxy_mtx);
-		mfc_prxy_cmd.lsa = value;
+		mfc_prxy_cmd.lsa = value & (SPU_LS_SIZE - 1);
 		mfc_prxy_write_state.lsa = true;
 		return true;
 	}
@@ -331,7 +440,7 @@ bool spu_thread::write_reg(const u32 addr, const u32 value)
 	}
 	}
 
-	spu_log.error("RawSPU[%u]: Write32(0x%x, value=0x%x): unknown/illegal offset (0x%x)", index, addr, value, offset);
+	spu_log.error("RawSPU[%u]: write_reg(0x%x, value=0x%x): unknown/illegal offset (0x%x)", index, addr, value, offset);
 	return false;
 }
 
@@ -345,6 +454,8 @@ bool spu_thread::test_is_problem_state_register_offset(u32 offset, bool for_read
 		case MFC_QStatus_offs:
 		case SPU_Out_MBox_offs:
 		case SPU_MBox_Status_offs:
+		case Prxy_QueryType_offs:
+		case Prxy_QueryMask_offs:
 		case SPU_Status_offs:
 		case Prxy_TagStatus_offs:
 		case SPU_NPC_offs:
@@ -391,6 +502,12 @@ void spu_load_exec(const spu_exec_object& elf)
 	{
 		if (prog.p_type == 0x1u /* LOAD */ && prog.p_memsz)
 		{
+			if (prog.p_vaddr >= SPU_LS_SIZE || prog.p_filesz > SPU_LS_SIZE - prog.p_vaddr)
+			{
+				spu_log.error("spu_load_exec: skipping segment with vaddr=0x%x filesz=0x%x (exceeds LS=0x%x)", prog.p_vaddr, prog.p_filesz, static_cast<u32>(SPU_LS_SIZE));
+				continue;
+			}
+
 			std::memcpy(spu->_ptr<void>(prog.p_vaddr), prog.bin.data(), prog.p_filesz);
 		}
 	}
@@ -460,6 +577,12 @@ void spu_load_rel_exec(const spu_rel_object& elf)
 	{
 		if (shdr.sh_type == sec_type::sht_progbits && shdr.sh_flags().all_of(sh_flag::shf_alloc))
 		{
+			if (offs >= SPU_LS_SIZE || shdr.sh_size > SPU_LS_SIZE - offs)
+			{
+				spu_log.error("spu_load_rel_exec: skipping section at offs=0x%x sh_size=0x%x (exceeds LS=0x%x)", offs, shdr.sh_size, static_cast<u32>(SPU_LS_SIZE));
+				break;
+			}
+
 			std::memcpy(spu->_ptr<void>(offs), shdr.get_bin().data(), shdr.sh_size);
 			offs = utils::align<u32>(offs + shdr.sh_size, 4);
 		}

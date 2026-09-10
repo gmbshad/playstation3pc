@@ -1,11 +1,8 @@
 #include "settings.h"
 
-#include "qt_utils.h"
-
 #include "Utilities/File.h"
 
-settings::settings(QObject* parent) : QObject(parent),
-	m_settings_dir(ComputeSettingsDir())
+settings::settings(QObject* parent) : QObject(parent)
 {
 }
 
@@ -14,7 +11,7 @@ settings::~settings()
 	sync();
 }
 
-void settings::sync()
+void settings::sync() const
 {
 	if (m_settings)
 	{
@@ -22,12 +19,7 @@ void settings::sync()
 	}
 }
 
-QString settings::GetSettingsDir() const
-{
-	return m_settings_dir.absolutePath();
-}
-
-QString settings::ComputeSettingsDir()
+QString settings::GetSettingsDir()
 {
 	return QString::fromStdString(fs::get_config_dir()) + "/GuiConfigs/";
 }

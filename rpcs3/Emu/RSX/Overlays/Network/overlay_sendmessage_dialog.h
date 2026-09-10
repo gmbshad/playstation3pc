@@ -15,7 +15,7 @@ namespace rsx
 			struct list_entry : horizontal_layout
 			{
 			public:
-				list_entry(const std::string& msg);
+				list_entry(std::string_view msg);
 			};
 
 			shared_mutex m_mutex;
@@ -29,7 +29,7 @@ namespace rsx
 			animation_color_interpolate fade_animation;
 
 			std::string get_current_selection() const;
-			void reload(const std::string& previous_selection);
+			void reload(std::string_view previous_selection);
 
 		public:
 			sendmessage_dialog();
@@ -40,7 +40,7 @@ namespace rsx
 			compiled_resource get_compiled() override;
 
 			error_code Exec(message_data& msg_data, std::set<std::string>& npids) override;
-			void callback_handler(u16 ntype, const std::string& username, bool status) override;
+			void callback_handler(rpcn::NotificationType ntype, const std::string& username, bool status) override;
 		};
 	}
 }

@@ -93,7 +93,7 @@ namespace rsx
 
 				std::array<u8, 0x10000 / 4> register_properties{};
 
-				for (const auto &method : ignorable_ranges)
+				for (const auto& method : ignorable_ranges)
 				{
 					for (u32 i = 0; i < method.second; ++i)
 					{
@@ -159,7 +159,7 @@ namespace rsx
 			u32 get_pos() const { return m_internal_get; }
 			u32 last_cmd() const { return m_cmd; }
 			void sync_get() const;
-			std::span<const u32> get_current_arg_ptr() const;
+			std::span<const u32> get_current_arg_ptr(u32 length_in_words) const;
 			u32 get_remaining_args_count() const { return m_remaining_commands; }
 			void restore_state(u32 cmd, u32 count);
 			void inc_get(bool wait);

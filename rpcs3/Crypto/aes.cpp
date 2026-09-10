@@ -598,7 +598,10 @@ int aes_setkey_dec( aes_context *ctx, const unsigned char *key, unsigned int key
     *RK++ = *SK++;
     *RK++ = *SK++;
 
+#if defined(__SSE2__) || defined(_M_X64)
 done:
+#endif
+
     // Wipe the stack buffer clean
     std::fill_n(reinterpret_cast<volatile char*>(&cty), sizeof(cty), 0);
 
@@ -894,7 +897,7 @@ unsigned char const_Zero[16] = {
 	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
 };
 
-void leftshift_onebit(unsigned char *input, unsigned char *output)
+void leftshift_onebit(const unsigned char *input, unsigned char *output)
 {
 	int i;
     unsigned char overflow = 0;
@@ -907,7 +910,7 @@ void leftshift_onebit(unsigned char *input, unsigned char *output)
 	}
 }
 
-void xor_128(unsigned char *a, unsigned char *b, unsigned char *out)
+void xor_128(const unsigned char *a, const unsigned char *b, unsigned char *out)
 {
 	int i;
 	for (i = 0; i < 16; i++)
@@ -942,7 +945,7 @@ void generate_subkey(aes_context *ctx, unsigned char *K1, unsigned char *K2)
     }
 }
 
-void padding(unsigned char *lastb, unsigned char *pad, size_t length)
+void padding(const unsigned char *lastb, unsigned char *pad, size_t length)
 {
 	for (unsigned int i = 0; i < 16; i++)
 	{
@@ -955,7 +958,7 @@ void padding(unsigned char *lastb, unsigned char *pad, size_t length)
 	}
 }
 
-void aes_cmac(aes_context *ctx, size_t length, unsigned char *input, unsigned char *output)
+void aes_cmac(aes_context *ctx, size_t length, const unsigned char *input, unsigned char *output)
 {
     unsigned char X[16], Y[16], M_last[16], padded[16];
     unsigned char K1[16], K2[16];

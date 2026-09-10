@@ -16,14 +16,14 @@ namespace rsx
 	{
 		struct TIU_slot
 		{
-			float scale[3];
-			float bias[3];
-			float clamp_min[2];
-			float clamp_max[2];
-			u32 remap;
-			u32 control;
+			float scale[3] {};
+			float bias[3] {};
+			float clamp_min[2] {};
+			float clamp_max[2] {};
+			u32 remap {};
+			u32 control {};
 		}
-		slots_[16]; // QT headers will collide with any variable named 'slots' because reasons
+		slots_[16] {}; // QT headers will collide with any variable named 'slots' because reasons
 
 		TIU_slot& operator[](u32 index) { return slots_[index]; }
 
@@ -67,6 +67,9 @@ namespace rsx
 		// Translates an incoming range of constants against our mapping.
 		// If there is no linear mapping available, return -1, otherwise returns the translated index of the first slot
 		// TODO: Move this somewhere else during refactor
-		int TranslateConstantsRange(int first_index, int count) const;
+		int translate_constants_range(int first_index, int count) const;
+
+		// Returns true if this program consumes any constants in the range [first, first + count - 1]
+		bool overlaps_constants_range(int first_index, int count) const;
 	};
 }

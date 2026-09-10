@@ -6,6 +6,7 @@
 #include "Emu/Cell/PPUModule.h"
 #include "Emu/Cell/lv2/sys_event.h"
 #include "Emu/IdManager.h"
+#include "Emu/Cell/timers.hpp"
 
 #include <cmath>
 
@@ -59,11 +60,6 @@ void fmt_class_string<CellCameraFormat>::format(std::string& out, u64 arg)
 		return unknown;
 	});
 }
-
-// Temporarily
-#ifndef _MSC_VER
-#pragma GCC diagnostic ignored "-Wunused-parameter"
-#endif
 
 // **************
 // * Prototypes *
@@ -148,9 +144,44 @@ void camera_context::save(utils::serial& ar)
 		return;
 	}
 
-	GET_OR_USE_SERIALIZATION_VERSION(ar.is_writing(), cellCamera);
+	const s32 version = GET_OR_USE_SERIALIZATION_VERSION(ar.is_writing(), cellCamera);
 
 	ar(notify_data_map, start_timestamp_us, read_mode, is_streaming, is_attached, is_open, info, attr, frame_num);
+
+	if (ar.is_writing() || version >= 2)
+	{
+		ar(is_attached_dirty);
+	}
+
+	if (!ar.is_writing())
+	{
+		if (is_open)
+		{
+			if (!open_camera())
+			{
+				cellCamera.error("Failed to open camera while loading savestate");
+			}
+			else if (is_streaming && !start_camera())
+			{
+				cellCamera.error("Failed to start camera while loading savestate");
+			}
+		}
+	}
+}
+
+gem_camera_shared::gem_camera_shared(utils::serial& ar)
+{
+	save(ar);
+}
+
+void gem_camera_shared::save(utils::serial& ar)
+{
+	const s32 version = GET_OR_USE_SERIALIZATION_VERSION(ar.is_writing(), cellCamera);
+
+	if (ar.is_writing() || version >= 2)
+	{
+		ar(frame_timestamp_us, width, height, size, format);
+	}
 }
 
 static bool check_dev_num(s32 dev_num)
@@ -366,7 +397,7 @@ error_code check_init_and_open(s32 dev_num)
 }
 
 // This represents a recurring subfunction throughout libCamera
-error_code check_resolution(s32 dev_num)
+error_code check_resolution(s32 /*dev_num*/)
 {
 	// TODO: Some sort of connection check maybe?
 	//if (error == CELL_CAMERA_ERROR_RESOLUTION_UNKNOWN)
@@ -377,7 +408,7 @@ error_code check_resolution(s32 dev_num)
 	return CELL_OK;
 }
 
-// This represents a oftenly used sequence in libCamera (usually the beginning of a subfunction).
+// This represents an often used sequence in libCamera (usually the beginning of a subfunction).
 // There also exist common sequences for mutex lock/unlock by the way.
 error_code check_resolution_ex(s32 dev_num)
 {
@@ -435,7 +466,6 @@ error_code cellCameraInit()
 		g_camera.attr[CELL_CAMERA_USBLOAD] = { 4 };
 		break;
 	}
-
 	case fake_camera_type::eyetoy2:
 	{
 		g_camera.attr[CELL_CAMERA_SATURATION] = { 64 };
@@ -455,7 +485,6 @@ error_code cellCameraInit()
 		g_camera.attr[CELL_CAMERA_AGCHIGH] = { 64 };
 		break;
 	}
-
 	case fake_camera_type::uvc1_1:
 	{
 		g_camera.attr[CELL_CAMERA_DEVICEID] = { 0x5ca, 0x18d0 }; // KBCR-S01MU
@@ -463,20 +492,22 @@ error_code cellCameraInit()
 		g_camera.attr[CELL_CAMERA_NUMFRAME] = { 1 }; // Amount of supported resolutions
 		break;
 	}
-
 	default:
 		cellCamera.todo("Trying to init cellCamera with un-researched camera type.");
+		break;
 	}
 
 	// TODO: Some other default attributes? Need to check the actual behaviour on a real PS3.
 
-	g_camera.is_attached = true;
+	g_camera.is_attached = g_cfg.io.camera != camera_handler::null;
 	g_camera.init = 1;
 	return CELL_OK;
 }
 
-error_code cellCameraEnd()
+error_code cellCameraEnd(ppu_thread& ppu)
 {
+	ppu.state += cpu_flag::wait;
+
 	cellCamera.todo("cellCameraEnd()");
 
 	auto& g_camera = g_fxo->get<camera_thread>();
@@ -541,7 +572,7 @@ error_code cellCameraOpenAsync()
 	return CELL_OK;
 }
 
-error_code cellCameraOpenEx(s32 dev_num, vm::ptr<CellCameraInfoEx> info)
+error_code cellCameraOpenEx(ppu_thread& ppu, s32 dev_num, vm::ptr<CellCameraInfoEx> info)
 {
 	cellCamera.todo("cellCameraOpenEx(dev_num=%d, info=*0x%x)", dev_num, info);
 
@@ -592,6 +623,8 @@ error_code cellCameraOpenEx(s32 dev_num, vm::ptr<CellCameraInfoEx> info)
 
 	const auto vbuf_size = get_video_buffer_size(*info);
 
+	ppu.state += cpu_flag::wait;
+
 	std::lock_guard lock(g_camera.mutex);
 
 	// TODO: find out if the buffers are also checked for nullptr
@@ -637,8 +670,10 @@ error_code cellCameraOpenPost()
 	return CELL_OK;
 }
 
-error_code cellCameraClose(s32 dev_num)
+error_code cellCameraClose(ppu_thread& ppu, s32 dev_num)
 {
+	ppu.state += cpu_flag::wait;
+
 	cellCamera.notice("cellCameraClose(dev_num=%d)", dev_num);
 
 	if (error_code error = check_init_and_open(dev_num))
@@ -665,14 +700,19 @@ error_code cellCameraClose(s32 dev_num)
 	if (g_camera.info.buffer)
 	{
 		vm::dealloc(g_camera.info.buffer.addr(), vm::main);
+		g_camera.info.buffer = vm::null;
 	}
+
 	if (g_camera.info.pbuf[0])
 	{
 		vm::dealloc(g_camera.info.pbuf[0].addr(), vm::main);
+		g_camera.info.pbuf[0] = vm::null;
 	}
+
 	if (g_camera.info.pbuf[1])
 	{
 		vm::dealloc(g_camera.info.pbuf[1].addr(), vm::main);
+		g_camera.info.pbuf[1] = vm::null;
 	}
 
 	g_camera.close_camera();
@@ -816,8 +856,8 @@ s32 cellCameraIsAttached(s32 dev_num)
 		// normally should be attached immediately after event queue is registered, but just to be sure
 		if (!is_attached)
 		{
-			g_camera.send_attach_state(true);
-			is_attached = g_camera.is_attached;
+			g_camera.is_attached = is_attached = true;
+			g_camera.is_attached_dirty = true;
 		}
 	}
 
@@ -890,7 +930,7 @@ error_code cellCameraGetAttribute(s32 dev_num, s32 attrib, vm::ptr<u32> arg1, vm
 
 	if (!check_dev_num(dev_num))
 	{
-		return CELL_CAMERA_ERROR_PARAM;
+		return { CELL_CAMERA_ERROR_PARAM, "dev_num=%d", dev_num };
 	}
 
 	if (g_cfg.io.camera == camera_handler::null)
@@ -906,7 +946,7 @@ error_code cellCameraGetAttribute(s32 dev_num, s32 attrib, vm::ptr<u32> arg1, vm
 
 	if (!arg1)
 	{
-		return CELL_CAMERA_ERROR_PARAM;
+		return { CELL_CAMERA_ERROR_PARAM, "arg1=null" };
 	}
 
 	if (error_code error = check_resolution(dev_num))
@@ -923,7 +963,7 @@ error_code cellCameraGetAttribute(s32 dev_num, s32 attrib, vm::ptr<u32> arg1, vm
 
 	if (!attr_name) // invalid attributes don't have a name
 	{
-		return CELL_CAMERA_ERROR_PARAM;
+		return { CELL_CAMERA_ERROR_PARAM, "attrib=0x%x", attrib };
 	}
 
 	if (arg1)
@@ -954,7 +994,7 @@ error_code cellCameraSetAttribute(s32 dev_num, s32 attrib, u32 arg1, u32 arg2)
 
 	if (!check_dev_num(dev_num))
 	{
-		return CELL_CAMERA_ERROR_PARAM;
+		return { CELL_CAMERA_ERROR_PARAM, "dev_num=%d", dev_num };
 	}
 
 	if (g_cfg.io.camera == camera_handler::null)
@@ -975,7 +1015,7 @@ error_code cellCameraSetAttribute(s32 dev_num, s32 attrib, u32 arg1, u32 arg2)
 
 	if (!attr_name) // invalid attributes don't have a name
 	{
-		return CELL_CAMERA_ERROR_PARAM;
+		return { CELL_CAMERA_ERROR_PARAM, "attrib=0x%x", attrib };
 	}
 
 	g_camera.set_attr(attrib, arg1, arg2);
@@ -1110,8 +1150,10 @@ error_code cellCameraGetBufferInfo(s32 dev_num, vm::ptr<CellCameraInfo> info)
 	return CELL_OK;
 }
 
-error_code cellCameraGetBufferInfoEx(s32 dev_num, vm::ptr<CellCameraInfoEx> info)
+error_code cellCameraGetBufferInfoEx(ppu_thread& ppu, s32 dev_num, vm::ptr<CellCameraInfoEx> info)
 {
+	ppu.state += cpu_flag::wait;
+
 	cellCamera.notice("cellCameraGetBufferInfoEx(dev_num=%d, info=0x%x)", dev_num, info);
 
 	// calls cellCameraGetBufferInfo
@@ -1122,10 +1164,16 @@ error_code cellCameraGetBufferInfoEx(s32 dev_num, vm::ptr<CellCameraInfoEx> info
 	}
 
 	auto& g_camera = g_fxo->get<camera_thread>();
-	std::lock_guard lock(g_camera.mutex);
 
-	*info = g_camera.info;
+	CellCameraInfoEx info_out;
 
+	{
+		std::lock_guard lock(g_camera.mutex);
+
+		info_out = g_camera.info;
+	}
+
+	*info = info_out;
 	return CELL_OK;
 }
 
@@ -1606,9 +1654,15 @@ void camera_context::operator()()
 {
 	while (thread_ctrl::state() != thread_state::aborting && !Emu.IsStopped())
 	{
+		// send ATTACH event
+		if (init && is_attached_dirty && !Emu.IsPausedOrReady())
+		{
+			send_attach_state(is_attached);
+		}
+
 		const s32 fps = info.framerate;
 
-		if (!fps || Emu.IsPaused() || g_cfg.io.camera == camera_handler::null)
+		if (!init || !fps || Emu.IsPausedOrReady() || g_cfg.io.camera == camera_handler::null)
 		{
 			thread_ctrl::wait_for(1000); // hack
 			continue;
@@ -1662,20 +1716,20 @@ void camera_context::operator()()
 			{
 				if (auto queue = lv2_event_queue::find(key))
 				{
+					constexpr u64 camera_id = 0;
 					u64 data2 = 0;
 					u64 data3 = 0;
 
 					if (read_mode.load() == CELL_CAMERA_READ_DIRECT)
 					{
 						const u64 image_data_size = static_cast<u64>(info.bytesize);
-						const u64 camera_id = 0;
 
 						data2 = image_data_size << 32 | buffer_number << 16 | camera_id;
 						data3 = get_guest_system_time() - start_timestamp_us; // timestamp
 					}
 					else // CELL_CAMERA_READ_FUNCCALL, also default
 					{
-						data2 = 0; // device id (always 0)
+						data2 = camera_id;
 						data3 = 0; // unused
 					}
 
@@ -1783,6 +1837,7 @@ void camera_context::reset_state()
 	read_mode = CELL_CAMERA_READ_FUNCCALL;
 	is_streaming = false;
 	is_attached = false;
+	is_attached_dirty = false;
 	is_open = false;
 	info.framerate = 0;
 	std::memset(&attr, 0, sizeof(attr));
@@ -1797,14 +1852,19 @@ void camera_context::reset_state()
 	if (info.buffer)
 	{
 		vm::dealloc(info.buffer.addr(), vm::main);
+		info.buffer = vm::null;
 	}
+
 	if (info.pbuf[0])
 	{
 		vm::dealloc(info.pbuf[0].addr(), vm::main);
+		info.pbuf[0] = vm::null;
 	}
+
 	if (info.pbuf[1])
 	{
 		vm::dealloc(info.pbuf[1].addr(), vm::main);
+		info.pbuf[1] = vm::null;
 	}
 
 	std::scoped_lock lock(mutex_notify_data_map);
@@ -1828,6 +1888,7 @@ void camera_context::send_attach_state(bool attached)
 
 	// We're not expected to send any events for attaching/detaching
 	is_attached = attached;
+	is_attached_dirty = false;
 }
 
 void camera_context::set_attr(s32 attrib, u32 arg1, u32 arg2)
@@ -1862,15 +1923,13 @@ void camera_context::set_attr(s32 attrib, u32 arg1, u32 arg2)
 
 void camera_context::add_queue(u64 key, u64 source, u64 flag)
 {
-	std::lock_guard lock(mutex);
 	{
 		std::lock_guard lock_data_map(mutex_notify_data_map);
 
 		notify_data_map[key] = { source, flag };
 	}
 
-	// send ATTACH event - HACKY
-	send_attach_state(is_attached);
+	is_attached_dirty = true;
 }
 
 void camera_context::remove_queue(u64 key)
@@ -1897,7 +1956,8 @@ bool camera_context::on_handler_state(camera_handler_base::camera_handler_state 
 	{
 		if (is_attached)
 		{
-			send_attach_state(false);
+			is_attached = false;
+			is_attached_dirty = true;
 		}
 		if (handler)
 		{
@@ -1938,7 +1998,8 @@ bool camera_context::on_handler_state(camera_handler_base::camera_handler_state 
 		if (!is_attached)
 		{
 			cellCamera.warning("Camera handler not attached. Sending attach event...", static_cast<int>(state));
-			send_attach_state(true);
+			is_attached = true;
+			is_attached_dirty = true;
 		}
 		break;
 	}
